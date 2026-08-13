@@ -1,0 +1,11 @@
+# 构建输出
+/build/
+/vcpkg_installed/
+
+# IDE
+.vs/
+.vscode/
+
+# CMake
+CMakeUserPresets.json
+/tests/gen/

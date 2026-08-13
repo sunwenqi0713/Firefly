@@ -1,0 +1,90 @@
+cmake_minimum_required(VERSION 3.16)
+project(Firefly VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# 依赖：protobuf + nng（vcpkg manifest 模式，见 vcpkg.json）
+find_package(protobuf CONFIG REQUIRED)
+find_package(nng CONFIG REQUIRED)    # 网络传输层
+find_package(Threads REQUIRED)       # 提供 std::thread；Linux 上等价于 -pthread
+
+# 静态库：接口 + 运行时 + 注册中心实现
+add_library(firefly STATIC
+    firefly/init.cc
+    firefly/runtime.cc
+    firefly/discovery.cc
+    firefly/node/node.cc)
+add_library(firefly::firefly ALIAS firefly)
+target_include_directories(firefly PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+target_link_libraries(firefly PUBLIC
+    protobuf::libprotobuf
+    nng::nng
+    Threads::Threads)
+
+# 源码/头文件均以 UTF-8 编写，避免 MSVC 按 GBK 解析中文注释
+if(MSVC)
+  target_compile_options(firefly PUBLIC /utf-8 /EHsc)
+endif()
+
+# 头文件解析校验（不实例化尚未实现的 detail 工厂）
+enable_testing()
+add_executable(firefly_header_check tests/header_check.cpp)
+target_link_libraries(firefly_header_check PRIVATE firefly)
+add_test(NAME header_check COMMAND firefly_header_check)
+
+# 注册中心单元测试（主实例：注册/列表/订阅派发）
+add_executable(firefly_discovery_test tests/discovery_test.cpp)
+target_link_libraries(firefly_discovery_test PRIVATE firefly)
+add_test(NAME discovery_test COMMAND firefly_discovery_test)
+
+# 端到端测试：先由 protoc 生成测试消息代码
+set(TEST_MESSAGES_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_messages.proto")
+set(TEST_MESSAGES_OUT "${CMAKE_CURRENT_BINARY_DIR}/tests/gen")
+find_package(protobuf CONFIG REQUIRED)
+find_program(PROTOC_EXE protoc HINTS
+    "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/x64-windows/tools/protobuf")
+if(NOT PROTOC_EXE)
+  find_program(PROTOC_EXE NAMES protoc REQUIRED)
+endif()
+
+add_custom_command(
+    OUTPUT ${TEST_MESSAGES_OUT}/test_messages.pb.cc
+           ${TEST_MESSAGES_OUT}/test_messages.pb.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${TEST_MESSAGES_OUT}
+    COMMAND ${PROTOC_EXE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            --cpp_out=${TEST_MESSAGES_OUT} ${TEST_MESSAGES_PROTO}
+    DEPENDS ${TEST_MESSAGES_PROTO}
+    COMMENT "Protoc generating test_messages"
+    VERBATIM)
+
+add_library(test_messages STATIC
+    ${TEST_MESSAGES_OUT}/test_messages.pb.cc)
+target_include_directories(test_messages PUBLIC ${TEST_MESSAGES_OUT})
+target_link_libraries(test_messages PUBLIC protobuf::libprotobuf)
+
+add_executable(firefly_e2e_test tests/e2e_test.cpp)
+target_link_libraries(firefly_e2e_test PRIVATE firefly test_messages)
+add_test(NAME e2e_test COMMAND firefly_e2e_test)
+
+# Reader API 单元测试（Observe/回调/缓存深度/在线关系）
+add_executable(firefly_reader_test tests/reader_test.cpp)
+target_link_libraries(firefly_reader_test PRIVATE firefly test_messages)
+add_test(NAME reader_test COMMAND firefly_reader_test)
+
+# Service/Client 单元测试（就绪等待/同步/异步/超时失败路径）
+add_executable(firefly_client_test tests/client_test.cpp)
+target_link_libraries(firefly_client_test PRIVATE firefly test_messages)
+add_test(NAME client_test COMMAND firefly_client_test)
+
+# ---------------- 使用示例 ----------------
+
+# 发布 / 订阅示例：回调 + Observe 两种订阅模式
+add_executable(firefly_pubsub_example examples/pubsub_chat.cpp)
+target_link_libraries(firefly_pubsub_example PRIVATE firefly test_messages)
+
+# 服务 / 客户端示例：同步 / 异步请求
+add_executable(firefly_rpc_example examples/rpc_calculator.cpp)
+target_link_libraries(firefly_rpc_example PRIVATE firefly test_messages)
