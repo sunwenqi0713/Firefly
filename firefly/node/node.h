@@ -5,8 +5,10 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 
 #include "firefly/common/types.h"
+#include "firefly/init.h"
 #include "firefly/node/channel_config.h"
 #include "firefly/node/reader.h"
 #include "firefly/node/reader_base.h"
@@ -22,10 +24,72 @@ class Node;
 std::unique_ptr<Node> CreateNode(const std::string& node_name,
                                  const std::string& name_space = "");
 
+namespace detail {
+
+// ---------------------------------------------------------------------------
+// 名称与配置校验（阶段一：Create 前置校验，失败返回 kInvalidName/kInvalidConfig）
+// ---------------------------------------------------------------------------
+inline bool IsLegalEndpointName(const std::string& name) {
+  if (name.empty() || name.size() > 255) {
+    return false;
+  }
+  for (unsigned char c : name) {
+    if (c <= 0x20 || c == 0x7f) {  // 控制字符与空格一律非法
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool EndsWith(const std::string& s, const char* suffix) {
+  const std::string suf(suffix);
+  return s.size() >= suf.size() &&
+         s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+}
+
+// 通道名不得命中服务内部通道的后缀保留字
+inline ErrorCode ValidateChannelName(const std::string& name) {
+  if (!IsLegalEndpointName(name) || EndsWith(name, SRV_CHANNEL_REQ_SUFFIX) ||
+      EndsWith(name, SRV_CHANNEL_RES_SUFFIX)) {
+    return ErrorCode::kInvalidName;
+  }
+  return ErrorCode::kOk;
+}
+
+inline ErrorCode ValidateServiceName(const std::string& name) {
+  return IsLegalEndpointName(name) ? ErrorCode::kOk : ErrorCode::kInvalidName;
+}
+
+inline ErrorCode ValidateQos(const QosProfile& qos) {
+  if (qos.depth == 0) {
+    return ErrorCode::kInvalidConfig;  // depth==0 无意义，fail-fast
+  }
+  return ErrorCode::kOk;
+}
+
+// Impl 层未填 message 时兜底，保证任何失败路径 message 非空。
+inline std::string CreateFailMessage(const char* op, const std::string& key,
+                                     ErrorCode code,
+                                     const std::string& impl_message) {
+  std::string m = impl_message.empty() ? std::string("Init failed") : impl_message;
+  return std::string(op) + "[" + key + "]: " + m +
+         " (code=" + ErrorCodeToString(code) + ")";
+}
+
+}  // namespace detail
+
 /**
  * @class Node
  * @brief 通信的基本单元。一个模块通过 Node 定义读写者与/或服务客户端。
- * @warning 拓扑对象（节点、读写者、服务等）名称不允许重复。
+ *
+ * 名称唯一性契约（本阶段实际行为）：仅 Reader 执行"同节点同通道唯一"检查，
+ * 冲突返回 kDuplicate；Writer/Service/Client 不查重（阶段一 out-of-scope），
+ * 不会因重名返回错误。
+ *
+ * 四个 Create 工厂统一返回 Result：
+ *   - 成功：r.value 非空，r.code == kOk；
+ *   - 失败：r.value 为 nullptr，r.code 指明原因，r.message 必含定位线索；
+ *   - 调用方应使用 if (r) / if (!r) 判断，不要直接比较 code。
  */
 class Node {
  public:
@@ -41,21 +105,23 @@ class Node {
 
   // 创建发布者（按通道名，使用默认 QoS）
   template <typename MessageT>
-  std::shared_ptr<Writer<MessageT>> CreateWriter(const std::string& channel_name);
+  Result<std::shared_ptr<Writer<MessageT>>> CreateWriter(
+      const std::string& channel_name);
 
   // 创建发布者（按通道配置，可指定 QoS）
   template <typename MessageT>
-  std::shared_ptr<Writer<MessageT>> CreateWriter(const ChannelConfig& config);
+  Result<std::shared_ptr<Writer<MessageT>>> CreateWriter(
+      const ChannelConfig& config);
 
   // 创建订阅者（按通道名，使用默认配置；可传回调）
   template <typename MessageT>
-  std::shared_ptr<Reader<MessageT>> CreateReader(
+  Result<std::shared_ptr<Reader<MessageT>>> CreateReader(
       const std::string& channel_name,
       const CallbackFunc<MessageT>& reader_func = nullptr);
 
   // 创建订阅者（按 ReaderConfig 配置）
   template <typename MessageT>
-  std::shared_ptr<Reader<MessageT>> CreateReader(
+  Result<std::shared_ptr<Reader<MessageT>>> CreateReader(
       const ReaderConfig& config,
       const CallbackFunc<MessageT>& reader_func = nullptr);
 
@@ -75,13 +141,13 @@ class Node {
 
   // 创建服务（service_callback 处理请求并填充响应）
   template <typename Request, typename Response>
-  std::shared_ptr<Service<Request, Response>> CreateService(
+  Result<std::shared_ptr<Service<Request, Response>>> CreateService(
       const std::string& service_name,
       const typename Service<Request, Response>::ServiceCallback& service_callback);
 
   // 创建指向指定服务的客户端
   template <typename Request, typename Response>
-  std::shared_ptr<Client<Request, Response>> CreateClient(
+  Result<std::shared_ptr<Client<Request, Response>>> CreateClient(
       const std::string& service_name);
 
  private:
@@ -99,7 +165,7 @@ class Node {
 };
 
 template <typename MessageT>
-std::shared_ptr<Writer<MessageT>> Node::CreateWriter(
+Result<std::shared_ptr<Writer<MessageT>>> Node::CreateWriter(
     const std::string& channel_name) {
   ChannelConfig config;
   config.channel_name = channel_name;
@@ -107,16 +173,39 @@ std::shared_ptr<Writer<MessageT>> Node::CreateWriter(
 }
 
 template <typename MessageT>
-std::shared_ptr<Writer<MessageT>> Node::CreateWriter(const ChannelConfig& config) {
-  auto writer = std::make_shared<Writer<MessageT>>(config);
-  if (writer == nullptr || !writer->Init()) {
-    return nullptr;
+Result<std::shared_ptr<Writer<MessageT>>> Node::CreateWriter(
+    const ChannelConfig& config) {
+  using R = Result<std::shared_ptr<Writer<MessageT>>>;
+  if (!OK()) {
+    return R{nullptr, ErrorCode::kNotReady,
+             "CreateWriter: firefly::Init() has not been called (or Clear() "
+             "already ran)"};
   }
-  return writer;
+  if (ErrorCode ec = detail::ValidateChannelName(config.channel_name);
+      ec != ErrorCode::kOk) {
+    return R{nullptr, ec,
+             "CreateWriter[channel='" + config.channel_name +
+                 "']: invalid channel name (empty/illegal char/reserved "
+                 "__SRV__ suffix)"};
+  }
+  if (ErrorCode ec = detail::ValidateQos(config.qos_profile);
+      ec != ErrorCode::kOk) {
+    return R{nullptr, ec,
+             "CreateWriter[channel='" + config.channel_name +
+                 "']: invalid QoS (depth must be > 0)"};
+  }
+  auto writer = std::make_shared<Writer<MessageT>>(config);
+  if (!writer->Init()) {
+    const ErrorCode ec = writer->InitErrorCode();
+    return R{nullptr, ec,
+             detail::CreateFailMessage("CreateWriter", config.channel_name, ec,
+                                       writer->InitErrorMessage())};
+  }
+  return R{writer, ErrorCode::kOk, ""};
 }
 
 template <typename MessageT>
-std::shared_ptr<Reader<MessageT>> Node::CreateReader(
+Result<std::shared_ptr<Reader<MessageT>>> Node::CreateReader(
     const std::string& channel_name,
     const CallbackFunc<MessageT>& reader_func) {
   ReaderConfig config;
@@ -125,18 +214,48 @@ std::shared_ptr<Reader<MessageT>> Node::CreateReader(
 }
 
 template <typename MessageT>
-std::shared_ptr<Reader<MessageT>> Node::CreateReader(
+Result<std::shared_ptr<Reader<MessageT>>> Node::CreateReader(
     const ReaderConfig& config, const CallbackFunc<MessageT>& reader_func) {
+  using R = Result<std::shared_ptr<Reader<MessageT>>>;
+  if (!OK()) {
+    return R{nullptr, ErrorCode::kNotReady,
+             "CreateReader: firefly::Init() has not been called (or Clear() "
+             "already ran)"};
+  }
+  if (ErrorCode ec = detail::ValidateChannelName(config.channel_name);
+      ec != ErrorCode::kOk) {
+    return R{nullptr, ec,
+             "CreateReader[channel='" + config.channel_name +
+                 "']: invalid channel name (empty/illegal char/reserved "
+                 "__SRV__ suffix)"};
+  }
+  if (ErrorCode ec = detail::ValidateQos(config.qos_profile);
+      ec != ErrorCode::kOk) {
+    return R{nullptr, ec,
+             "CreateReader[channel='" + config.channel_name +
+                 "']: invalid QoS (depth must be > 0)"};
+  }
+  if (config.pending_queue_size == 0) {
+    return R{nullptr, ErrorCode::kInvalidConfig,
+             "CreateReader[channel='" + config.channel_name +
+                 "']: invalid QoS (pending_queue_size must be > 0)"};
+  }
+
   std::lock_guard<std::mutex> lg(readers_mutex_);
   if (readers_.find(config.channel_name) != readers_.end()) {
-    return nullptr;  // 同一节点不允许对同一通道创建多个 Reader
+    return R{nullptr, ErrorCode::kDuplicate,
+             "CreateReader[channel='" + config.channel_name + "', node='" +
+                 node_name_ + "']: a Reader already exists on this channel"};
   }
   auto reader = std::make_shared<Reader<MessageT>>(config, reader_func);
-  if (reader == nullptr || !reader->Init()) {
-    return nullptr;
+  if (!reader->Init()) {
+    const ErrorCode ec = reader->InitErrorCode();
+    return R{nullptr, ec,
+             detail::CreateFailMessage("CreateReader", config.channel_name, ec,
+                                       reader->InitErrorMessage())};
   }
   readers_.emplace(config.channel_name, reader);
-  return reader;
+  return R{reader, ErrorCode::kOk, ""};
 }
 
 template <typename MessageT>
@@ -151,26 +270,56 @@ std::shared_ptr<Reader<MessageT>> Node::GetReader(
 }
 
 template <typename Request, typename Response>
-std::shared_ptr<Service<Request, Response>> Node::CreateService(
+Result<std::shared_ptr<Service<Request, Response>>> Node::CreateService(
     const std::string& service_name,
     const typename Service<Request, Response>::ServiceCallback& service_callback) {
+  using R = Result<std::shared_ptr<Service<Request, Response>>>;
+  if (!OK()) {
+    return R{nullptr, ErrorCode::kNotReady,
+             "CreateService: firefly::Init() has not been called (or Clear() "
+             "already ran)"};
+  }
+  if (ErrorCode ec = detail::ValidateServiceName(service_name);
+      ec != ErrorCode::kOk) {
+    return R{nullptr, ec,
+             "CreateService[service='" + service_name +
+                 "']: invalid service name"};
+  }
   auto service = std::make_shared<Service<Request, Response>>(
       node_name_, service_name, service_callback);
-  if (service == nullptr || !service->Init()) {
-    return nullptr;
+  if (!service->Init()) {
+    const ErrorCode ec = service->InitErrorCode();
+    return R{nullptr, ec,
+             detail::CreateFailMessage("CreateService", service_name, ec,
+                                       service->InitErrorMessage())};
   }
-  return service;
+  return R{service, ErrorCode::kOk, ""};
 }
 
 template <typename Request, typename Response>
-std::shared_ptr<Client<Request, Response>> Node::CreateClient(
+Result<std::shared_ptr<Client<Request, Response>>> Node::CreateClient(
     const std::string& service_name) {
+  using R = Result<std::shared_ptr<Client<Request, Response>>>;
+  if (!OK()) {
+    return R{nullptr, ErrorCode::kNotReady,
+             "CreateClient: firefly::Init() has not been called (or Clear() "
+             "already ran)"};
+  }
+  if (ErrorCode ec = detail::ValidateServiceName(service_name);
+      ec != ErrorCode::kOk) {
+    return R{nullptr, ec,
+             "CreateClient[service='" + service_name +
+                 "']: invalid service name"};
+  }
   auto client =
       std::make_shared<Client<Request, Response>>(node_name_, service_name);
-  if (client == nullptr || !client->Init()) {
-    return nullptr;
+  if (!client->Init()) {
+    const ErrorCode ec = client->InitErrorCode();
+    return R{nullptr, ec,
+             detail::CreateFailMessage("CreateClient", service_name, ec,
+                                       client->InitErrorMessage())};
   }
-  return client;
+  return R{client, ErrorCode::kOk, ""};
 }
 
 }  // namespace firefly

@@ -176,11 +176,13 @@ struct ReaderImpl : public ReaderHandle {
 // ---------- 接口层声明对应的操作函数 ----------
 
 template <typename MessageT>
-std::shared_ptr<ReaderHandle> CreateReader(
+Result<std::shared_ptr<ReaderHandle>> CreateReader(
     const ReaderConfig& config,
     const std::function<void(const std::shared_ptr<MessageT>&)>& func) {
   static_assert(message::HasSerializer<MessageT>::value,
                 "MessageT must derive from google::protobuf::Message.");
+
+  const std::string where = "CreateReader[channel='" + config.channel_name + "']: ";
 
   auto impl = std::make_shared<ReaderImpl<MessageT>>();
   impl->config = config;
@@ -191,7 +193,8 @@ std::shared_ptr<ReaderHandle> CreateReader(
   if (r != 0) {
     FY_ERROR("reader[%s]: nng_sub0_open: %s", config.channel_name.c_str(),
              nng_strerror(r));
-    return nullptr;
+    return {nullptr, ErrorCode::kTransport,
+            where + "nng_sub0_open failed: " + nng_strerror(r)};
   }
   r = nng_setopt(impl->sub_sock_, NNG_OPT_SUB_SUBSCRIBE, "", size_t(0));
   if (r != 0) {
@@ -199,13 +202,14 @@ std::shared_ptr<ReaderHandle> CreateReader(
              nng_strerror(r));
     nng_close(impl->sub_sock_);
     impl->sub_sock_.id = 0;
-    return nullptr;
+    return {nullptr, ErrorCode::kTransport,
+            where + "SUB subscribe-all failed: " + nng_strerror(r)};
   }
 
   if (!impl->Init()) {
-    return nullptr;
+    return {nullptr, ErrorCode::kTransport, where + "ReaderImpl::Init failed"};
   }
-  return impl;
+  return {impl, ErrorCode::kOk, ""};
 }
 
 template <typename MessageT>

@@ -79,6 +79,28 @@ add_executable(firefly_client_test tests/client_test.cpp)
 target_link_libraries(firefly_client_test PRIVATE firefly test_messages)
 add_test(NAME client_test COMMAND firefly_client_test)
 
+# 阶段一验收：错误码 / Write 状态 / RPC 错误可传递 / 空消息契约
+add_executable(firefly_error_code_test tests/error_code_test.cpp)
+target_link_libraries(firefly_error_code_test PRIVATE firefly test_messages)
+add_test(NAME error_code_test COMMAND firefly_error_code_test)
+
+add_executable(firefly_write_status_test tests/write_status_test.cpp)
+target_link_libraries(firefly_write_status_test PRIVATE firefly test_messages)
+add_test(NAME write_status_test COMMAND firefly_write_status_test)
+
+add_executable(firefly_rpc_error_test tests/rpc_error_test.cpp)
+target_link_libraries(firefly_rpc_error_test PRIVATE firefly test_messages)
+add_test(NAME rpc_error_test COMMAND firefly_rpc_error_test)
+
+add_executable(firefly_empty_message_test tests/empty_message_test.cpp)
+target_link_libraries(firefly_empty_message_test PRIVATE firefly test_messages)
+add_test(NAME empty_message_test COMMAND firefly_empty_message_test)
+
+# 旧 API 灰度：deprecated 路径仍可编译
+add_executable(firefly_deprecated_compat_test tests/deprecated_compat_test.cpp)
+target_link_libraries(firefly_deprecated_compat_test PRIVATE firefly test_messages)
+add_test(NAME deprecated_compat_test COMMAND firefly_deprecated_compat_test)
+
 # ---------------- 使用示例 ----------------
 
 # 发布 / 订阅示例：回调 + Observe 两种订阅模式

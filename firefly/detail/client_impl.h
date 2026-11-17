@@ -6,14 +6,17 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include <nng/nng.h>
 #include <nng/protocol/reqrep0/req.h>
 
 #include "firefly/common/log.h"
 #include "firefly/detail/handles.h"
+#include "firefly/detail/rpc_frame.h"
 #include "firefly/discovery.h"
 #include "firefly/message/message_traits.h"
 
@@ -49,7 +52,6 @@ struct ClientImpl : public ClientHandle {
                nng_strerror(r));
       return false;
     }
-    // 客户端主动拨号到第一个可用服务端点
     nng_dialer d{NNG_DIALER_INITIALIZER};
     r = nng_dial(sock_, urls.front().c_str(), &d, 0);
     if (r != 0) {
@@ -66,8 +68,8 @@ struct ClientImpl : public ClientHandle {
 // ---------- 接口层声明对应的操作函数 ----------
 
 template <typename Request, typename Response>
-std::shared_ptr<ClientHandle> CreateClient(const std::string& node_name,
-                                           const std::string& service_name) {
+Result<std::shared_ptr<ClientHandle>> CreateClient(const std::string& node_name,
+                                                   const std::string& service_name) {
   static_assert(message::HasSerializer<Request>::value &&
                     message::HasSerializer<Response>::value,
                 "Request/Response must derive from protobuf::Message.");
@@ -75,7 +77,7 @@ std::shared_ptr<ClientHandle> CreateClient(const std::string& node_name,
   auto impl = std::make_shared<ClientImpl<Request, Response>>();
   impl->node_name = node_name;
   impl->service_name = service_name;
-  return impl;
+  return {impl, ErrorCode::kOk, ""};
 }
 
 template <typename Request, typename Response>
@@ -89,21 +91,27 @@ void ClientShutdown(ClientHandle* handle) {
 }
 
 template <typename Request, typename Response>
-std::shared_ptr<Response> ClientSendRequest(
-    ClientHandle* handle, const std::shared_ptr<Request>& request,
+ServiceResult<Response> ClientSendRequest(
+    ClientHandle* handle, const std::shared_ptr<const Request>& request,
     const std::chrono::milliseconds& timeout) {
+  using R = ServiceResult<Response>;
   auto* impl = static_cast<ClientImpl<Request, Response>*>(handle);
-  if (!impl || !request) return nullptr;
+  if (!impl || !request) {
+    return {ErrorCode::kSerialization, nullptr};
+  }
   std::lock_guard<std::mutex> lk(impl->io_mutex_);
 
   if (!impl->EnsureConnected()) {
+    const bool registered = discovery::Registry::instance().Has(
+        discovery::Kind::kService, impl->service_name);
     FY_WARN("client[%s]: no service endpoint", impl->service_name.c_str());
-    return nullptr;
+    return {registered ? ErrorCode::kTransport : ErrorCode::kServiceNotFound,
+            nullptr};
   }
 
   std::string bytes;
   if (!message::MessageTraits<Request>::Serialize(*request, &bytes)) {
-    return nullptr;
+    return {ErrorCode::kSerialization, nullptr};
   }
   nng_setopt_ms(impl->sock_, NNG_OPT_SENDTIMEO,
                 static_cast<int>(timeout.count()));
@@ -114,7 +122,7 @@ std::shared_ptr<Response> ClientSendRequest(
   if (r != 0) {
     FY_WARN("client[%s]: send: %s", impl->service_name.c_str(),
             nng_strerror(r));
-    return nullptr;
+    return {ErrorCode::kTransport, nullptr};
   }
   void* data = nullptr;
   size_t size = 0;
@@ -122,57 +130,89 @@ std::shared_ptr<Response> ClientSendRequest(
   if (r != 0) {
     FY_WARN("client[%s]: recv: %s", impl->service_name.c_str(),
             nng_strerror(r));
-    // REQ 协议在超时后 socket 状态可能不一致，关闭以重置
+    const ErrorCode ec =
+        (r == NNG_ETIMEDOUT) ? ErrorCode::kTimeout : ErrorCode::kTransport;
     if (r == NNG_ETIMEDOUT) {
+      // REQ 协议超时后 socket 状态可能不一致，关闭以重置
       nng_close(impl->sock_);
       impl->sock_.id = 0;
     }
-    return nullptr;
+    return {ec, nullptr};
   }
-  std::string resp_bytes(static_cast<char*>(data), size);
+  std::string frame(static_cast<char*>(data), size);
   nng_free(data, size);
 
-  if (resp_bytes.empty()) {
-    return nullptr;  // 服务端无响应（失败）
+  ErrorCode frame_code = ErrorCode::kSerialization;
+  std::string payload;
+  if (!DecodeResponse(frame, &frame_code, &payload)) {
+    FY_WARN("client[%s]: malformed response frame (%zu bytes)",
+            impl->service_name.c_str(), frame.size());
+    return {ErrorCode::kSerialization, nullptr};
   }
+  if (frame_code != ErrorCode::kOk) {
+    return {frame_code, nullptr};
+  }
+
   auto resp = std::make_shared<Response>();
-  if (!message::MessageTraits<Response>::Deserialize(resp_bytes, resp.get())) {
-    return nullptr;
+  if (!message::MessageTraits<Response>::Deserialize(payload, resp.get())) {
+    return {ErrorCode::kSerialization, nullptr};
   }
-  return resp;
+  return {ErrorCode::kOk, resp};
 }
 
+// 异步接口：失败以 FireflyException 在 future 中兑现。
+// 注意：detach 线程持有 handle 裸指针，Client 生命周期问题是已知缺陷
+// （client.h 头注释已标注，生命周期阶段修复）。
 template <typename Request, typename Response>
 std::shared_future<std::shared_ptr<Response>> ClientAsyncSendRequest(
-    ClientHandle* handle, const std::shared_ptr<Request>& request) {
+    ClientHandle* handle, const std::shared_ptr<const Request>& request) {
   using SharedResponse = std::shared_ptr<Response>;
   auto promise = std::make_shared<std::promise<SharedResponse>>();
   std::shared_future<SharedResponse> future = promise->get_future();
 
   std::thread([handle, request, promise]() mutable {
-    auto resp = ClientSendRequest<Request, Response>(
+    auto r = ClientSendRequest<Request, Response>(
         handle, request, std::chrono::milliseconds(5000));
-    promise->set_value(resp);
+    if (r.code != ErrorCode::kOk) {
+      auto* impl = static_cast<ClientImpl<Request, Response>*>(handle);
+      const std::string service =
+          impl ? impl->service_name : std::string("<unknown>");
+      const std::string msg = std::string("AsyncSendRequest[service='") +
+                              service + "']: " + ErrorCodeToString(r.code);
+      promise->set_exception(
+          std::make_exception_ptr(FireflyException(r.code, msg)));
+    } else {
+      promise->set_value(r.response);
+    }
   }).detach();
 
   return future;
 }
 
 template <typename Request, typename Response>
-std::shared_future<std::shared_ptr<Response>>
-ClientAsyncSendRequestWithCallback(
-    ClientHandle* handle, const std::shared_ptr<Request>& request,
+std::shared_future<std::shared_ptr<Response>> ClientAsyncSendRequestWithCallback(
+    ClientHandle* handle, const std::shared_ptr<const Request>& request,
     std::function<void(std::shared_future<std::shared_ptr<Response>>&)> cb) {
   using SharedResponse = std::shared_ptr<Response>;
   auto promise = std::make_shared<std::promise<SharedResponse>>();
   std::shared_future<SharedResponse> future = promise->get_future();
 
   std::thread([promise, future, cb, handle, request]() mutable {
-    auto resp = ClientSendRequest<Request, Response>(
+    auto r = ClientSendRequest<Request, Response>(
         handle, request, std::chrono::milliseconds(5000));
-    promise->set_value(resp);
+    if (r.code != ErrorCode::kOk) {
+      auto* impl = static_cast<ClientImpl<Request, Response>*>(handle);
+      const std::string service =
+          impl ? impl->service_name : std::string("<unknown>");
+      const std::string msg = std::string("AsyncSendRequest[service='") +
+                              service + "']: " + ErrorCodeToString(r.code);
+      promise->set_exception(
+          std::make_exception_ptr(FireflyException(r.code, msg)));
+    } else {
+      promise->set_value(r.response);
+    }
     if (cb) {
-      cb(future);
+      cb(future);  // 回调内 get() 会抛出上述异常，由业务方处理
     }
   }).detach();
 

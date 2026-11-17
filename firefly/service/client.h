@@ -1,6 +1,29 @@
 ﻿#ifndef FIREFLY_SERVICE_CLIENT_H_
 #define FIREFLY_SERVICE_CLIENT_H_
 
+// ===========================================================================
+// 客户端的错误语义（显式契约，阶段一）
+// ===========================================================================
+//
+// SendRequest 返回 ServiceResult<Response>，失败原因按 code 区分：
+//   kOk               response 非空，正常结果；
+//   kServiceNotFound  注册中心中不存在该服务（或无可连接端点）；
+//   kTimeout          已发出请求但等待响应超时（默认 5000ms）；
+//   kServiceFailed    服务端业务失败（由响应帧 status 字段带回）；
+//   kSerialization    请求序列化失败 / 响应帧非法 / 响应反序列化失败；
+//   kTransport        其他 nng 层错误。
+// 不再出现"所有失败都是 nullptr"的情形。
+//
+// AsyncSendRequest 的 future 在失败时抛 FireflyException(ErrorCode, message)，
+// 成功时返回 shared_ptr<Response>；同步接口不用异常。
+//
+// 已知缺陷（本阶段 out-of-scope，不修）:
+//   - AsyncSendRequest 无 timeout 参数，内部硬编码 5000ms；
+//   - 无 cancel 机制；Shutdown 与在途异步请求的交互未定义（见审查问题 2）；
+//   - 异步工作在 detach 线程，Client 过早析构可能与在途请求竞态。
+// 这些将在"生命周期与取消"阶段处理。
+// ===========================================================================
+
 #include <chrono>
 #include <functional>
 #include <future>
@@ -8,6 +31,7 @@
 #include <string>
 #include <utility>
 
+#include "firefly/common/types.h"
 #include "firefly/detail/handles.h"
 #include "firefly/service/client_base.h"
 
@@ -17,26 +41,25 @@ namespace detail {
 
 // 不透明实现句柄（定义于 detail/handles.h）
 
-// —— 以下工厂/操作函数为接口声明，实现待补充 ——
 template <typename Request, typename Response>
-std::shared_ptr<ClientHandle> CreateClient(const std::string& node_name,
-                                           const std::string& service_name);
+Result<std::shared_ptr<ClientHandle>> CreateClient(const std::string& node_name,
+                                                   const std::string& service_name);
 
 template <typename Request, typename Response>
 void ClientShutdown(ClientHandle* handle);
 
 template <typename Request, typename Response>
-std::shared_ptr<Response> ClientSendRequest(ClientHandle* handle,
-                                            const std::shared_ptr<Request>& request,
-                                            const std::chrono::milliseconds& timeout);
+ServiceResult<Response> ClientSendRequest(
+    ClientHandle* handle, const std::shared_ptr<const Request>& request,
+    const std::chrono::milliseconds& timeout);
 
 template <typename Request, typename Response>
 std::shared_future<std::shared_ptr<Response>> ClientAsyncSendRequest(
-    ClientHandle* handle, const std::shared_ptr<Request>& request);
+    ClientHandle* handle, const std::shared_ptr<const Request>& request);
 
 template <typename Request, typename Response>
 std::shared_future<std::shared_ptr<Response>> ClientAsyncSendRequestWithCallback(
-    ClientHandle* handle, const std::shared_ptr<Request>& request,
+    ClientHandle* handle, const std::shared_ptr<const Request>& request,
     std::function<void(std::shared_future<std::shared_ptr<Response>>&)> cb);
 
 template <typename Request, typename Response>
@@ -57,10 +80,12 @@ template <typename Request, typename Response>
 class Client : public ClientBase {
  public:
   using SharedRequest = std::shared_ptr<Request>;
+  using ConstSharedRequest = std::shared_ptr<const Request>;
   using SharedResponse = std::shared_ptr<Response>;
   using SharedPromise = std::shared_ptr<std::promise<SharedResponse>>;
   using SharedFuture = std::shared_future<SharedResponse>;
   using CallbackType = std::function<void(SharedFuture)>;
+  using ResultType = ServiceResult<Response>;
 
   Client(const std::string& node_name, const std::string& service_name)
       : ClientBase(service_name), node_name_(node_name) {}
@@ -70,10 +95,20 @@ class Client : public ClientBase {
     if (init_) {
       return true;
     }
-    impl_ = detail::CreateClient<Request, Response>(node_name_, service_name_);
-    init_ = impl_ != nullptr;
-    return init_;
+    auto r = detail::CreateClient<Request, Response>(node_name_, service_name_);
+    init_code_ = r.code;
+    init_message_ = std::move(r.message);
+    if (!r) {
+      return false;
+    }
+    impl_ = std::move(r.value);
+    init_ = true;
+    return true;
   }
+
+  // 供 Node::CreateClient 回填 Result 的诊断信息
+  ErrorCode InitErrorCode() const noexcept { return init_code_; }
+  const std::string& InitErrorMessage() const noexcept { return init_message_; }
 
   void Shutdown() override {
     detail::ClientShutdown<Request, Response>(impl_.get());
@@ -83,35 +118,34 @@ class Client : public ClientBase {
 
   // ---------- 同步请求 ----------
 
-  // 阻塞至收到响应或超时；超时返回 nullptr
-  SharedResponse SendRequest(
-      SharedRequest request,
+  // 阻塞至收到响应或超时；失败时 result.code 指明原因，不再返回 nullptr
+  ResultType SendRequest(
+      ConstSharedRequest request,
       const std::chrono::milliseconds& timeout = std::chrono::milliseconds(5000)) {
-    return detail::ClientSendRequest<Request, Response>(impl_.get(), request, timeout);
+    return detail::ClientSendRequest<Request, Response>(impl_.get(), request,
+                                                        timeout);
   }
 
-  SharedResponse SendRequest(
+  ResultType SendRequest(
       const Request& request,
       const std::chrono::milliseconds& timeout = std::chrono::milliseconds(5000)) {
-    auto ptr = std::make_shared<Request>(request);
-    return SendRequest(ptr, timeout);
+    return SendRequest(std::make_shared<Request>(request), timeout);
   }
 
   // ---------- 异步请求 ----------
 
-  SharedFuture AsyncSendRequest(SharedRequest request) {
+  // future.get() 成功返回 response；失败抛 FireflyException(ErrorCode, message)
+  SharedFuture AsyncSendRequest(ConstSharedRequest request) {
     return detail::ClientAsyncSendRequest<Request, Response>(impl_.get(), request);
   }
 
-  // 异步请求，收到响应后调用回调 cb
-  SharedFuture AsyncSendRequest(SharedRequest request, CallbackType&& cb) {
+  SharedFuture AsyncSendRequest(ConstSharedRequest request, CallbackType&& cb) {
     return detail::ClientAsyncSendRequestWithCallback<Request, Response>(
         impl_.get(), request, std::move(cb));
   }
 
   SharedFuture AsyncSendRequest(const Request& request) {
-    auto ptr = std::make_shared<Request>(request);
-    return AsyncSendRequest(ptr);
+    return AsyncSendRequest(std::make_shared<Request>(request));
   }
 
   // ---------- 服务可用性 ----------
@@ -132,6 +166,8 @@ class Client : public ClientBase {
   std::string node_name_;
   std::shared_ptr<detail::ClientHandle> impl_;
   bool init_ = false;
+  ErrorCode init_code_ = ErrorCode::kOk;
+  std::string init_message_;
 };
 
 }  // namespace firefly

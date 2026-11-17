@@ -32,12 +32,12 @@ int main() {
       [&](const std::shared_ptr<Chatter>& msg) {
         ++cb_count;
         cb_seq.store(msg->seq());
-      });
-  if (cb_reader == nullptr) return 10;
+      }).value;
+  if (!cb_reader) return 10;
   if (!cb_reader->IsInit()) return 11;
 
-  auto writer = node->CreateWriter<Chatter>("channel/callback");
-  if (writer == nullptr) return 12;
+  auto writer = node->CreateWriter<Chatter>("channel/callback").value;
+  if (!writer) return 12;
 
   SleepMs(500);  // 等订阅建立
   if (!cb_reader->HasWriter()) return 13;
@@ -56,11 +56,11 @@ int main() {
   firefly::ReaderConfig obs_cfg;
   obs_cfg.channel_name = "channel/observe";
   obs_cfg.pending_queue_size = 3;
-  auto obs_reader = node->CreateReader<Chatter>(obs_cfg, nullptr);
-  if (obs_reader == nullptr) return 20;
+  auto obs_reader = node->CreateReader<Chatter>(obs_cfg, nullptr).value;
+  if (!obs_reader) return 20;
 
-  auto writer2 = node->CreateWriter<Chatter>("channel/observe");
-  if (writer2 == nullptr) return 21;
+  auto writer2 = node->CreateWriter<Chatter>("channel/observe").value;
+  if (!writer2) return 21;
   SleepMs(500);
 
   for (int i = 1; i <= 5; ++i) {
@@ -99,8 +99,8 @@ int main() {
 
   // ---------- 同节点同通道重复创建 Reader 应失败 ----------
   auto dup = node->CreateReader<Chatter>(
-      "channel/observe", [](const std::shared_ptr<Chatter>&) {});
-  if (dup != nullptr) return 50;
+      "channel/observe", [](const std::shared_ptr<Chatter>&) {}).value;
+  if (dup) return 50;
 
   firefly::Clear();
   return 0;

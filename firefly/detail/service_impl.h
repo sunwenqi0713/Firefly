@@ -13,6 +13,7 @@
 #include "firefly/common/log.h"
 #include "firefly/detail/handles.h"
 #include "firefly/detail/net.h"
+#include "firefly/detail/rpc_frame.h"
 #include "firefly/discovery.h"
 #include "firefly/message/message_traits.h"
 
@@ -23,8 +24,7 @@ namespace detail {
 template <typename Request, typename Response>
 struct ServiceImpl : public ServiceHandle {
   using ServiceCallback =
-      std::function<void(const std::shared_ptr<Request>&,
-                         std::shared_ptr<Response>&)>;
+      std::function<ServiceResult<Response>(const std::shared_ptr<const Request>&)>;
 
   std::string node_name;
   std::string service_name;
@@ -76,32 +76,41 @@ struct ServiceImpl : public ServiceHandle {
       nng_free(data, size);
 
       auto req = std::make_shared<Request>();
-      std::shared_ptr<Response> resp;
-      if (message::MessageTraits<Request>::Deserialize(req_bytes, req.get())) {
-        try {
-          resp = std::make_shared<Response>();
-          callback(req, resp);
-        } catch (const std::exception& e) {
-          FY_ERROR("service[%s]: callback: %s", service_name.c_str(), e.what());
-          resp.reset();
-        } catch (...) {
-          FY_ERROR("service[%s]: callback threw", service_name.c_str());
-          resp.reset();
-        }
-      } else {
+      std::string resp_bytes;
+      if (!message::MessageTraits<Request>::Deserialize(req_bytes, req.get())) {
         FY_WARN("service[%s]: bad request (%zu bytes)", service_name.c_str(),
                 req_bytes.size());
-      }
-
-      std::string resp_bytes;
-      if (resp && message::MessageTraits<Response>::Serialize(*resp,
-                                                              &resp_bytes)) {
-        nng_send(sock_, const_cast<char*>(resp_bytes.data()),
-                 resp_bytes.size(), 0);
+        resp_bytes = EncodeResponse(ErrorCode::kSerialization, "");
       } else {
-        // 无响应：发送空消息表示失败
-        nng_send(sock_, nullptr, 0, 0);
+        ServiceResult<Response> result;
+        try {
+          result = callback(req);
+        } catch (const std::exception& e) {
+          FY_ERROR("service[%s]: callback: %s", service_name.c_str(), e.what());
+          result.code = ErrorCode::kServiceFailed;
+          result.response.reset();
+        } catch (...) {
+          FY_ERROR("service[%s]: callback threw", service_name.c_str());
+          result.code = ErrorCode::kServiceFailed;
+          result.response.reset();
+        }
+
+        std::string payload;
+        if (result.code == ErrorCode::kOk && result.response) {
+          if (!message::MessageTraits<Response>::Serialize(*result.response,
+                                                          &payload)) {
+            result.code = ErrorCode::kSerialization;
+            result.response.reset();
+            payload.clear();
+          }
+        } else if (result.code == ErrorCode::kOk && !result.response) {
+          // 回调声称成功却没给 response：按业务失败处理，不返回空帧
+          result.code = ErrorCode::kServiceFailed;
+        }
+        resp_bytes = EncodeResponse(result.code, payload);
       }
+      nng_send(sock_, const_cast<char*>(resp_bytes.data()),
+               resp_bytes.size(), 0);
     }
     FY_INFO("service[%s]: worker exit", service_name.c_str());
   }
@@ -110,13 +119,15 @@ struct ServiceImpl : public ServiceHandle {
 // ---------- 接口层声明对应的操作函数 ----------
 
 template <typename Request, typename Response>
-std::shared_ptr<ServiceHandle> CreateService(
+Result<std::shared_ptr<ServiceHandle>> CreateService(
     const std::string& node_name, const std::string& service_name,
-    const std::function<void(const std::shared_ptr<Request>&,
-                             std::shared_ptr<Response>&)>& callback) {
+    const std::function<ServiceResult<Response>(
+        const std::shared_ptr<const Request>&)>& callback) {
   static_assert(message::HasSerializer<Request>::value &&
                     message::HasSerializer<Response>::value,
                 "Request/Response must derive from protobuf::Message.");
+
+  const std::string where = "CreateService[service='" + service_name + "']: ";
 
   auto impl = std::make_shared<ServiceImpl<Request, Response>>();
   impl->node_name = node_name;
@@ -127,7 +138,8 @@ std::shared_ptr<ServiceHandle> CreateService(
   if (r != 0) {
     FY_ERROR("service[%s]: nng_rep0_open: %s", service_name.c_str(),
              nng_strerror(r));
-    return nullptr;
+    return {nullptr, ErrorCode::kTransport,
+            where + "nng_rep0_open failed: " + nng_strerror(r)};
   }
 
   nng_listener l{NNG_LISTENER_INITIALIZER};
@@ -135,7 +147,8 @@ std::shared_ptr<ServiceHandle> CreateService(
     FY_ERROR("service[%s]: bind ephemeral port failed", service_name.c_str());
     nng_close(impl->sock_);
     impl->sock_.id = 0;
-    return nullptr;
+    return {nullptr, ErrorCode::kTransport,
+            where + "bind ephemeral port failed (nng listener)"};
   }
 
   if (discovery::Registry::instance().Register(
@@ -144,7 +157,7 @@ std::shared_ptr<ServiceHandle> CreateService(
   }
   impl->Start();
   FY_INFO("service[%s] ok at %s", service_name.c_str(), impl->url.c_str());
-  return impl;
+  return {impl, ErrorCode::kOk, ""};
 }
 
 template <typename Request, typename Response>

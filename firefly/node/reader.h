@@ -5,8 +5,10 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "firefly/common/types.h"
 #include "firefly/detail/handles.h"
 #include "firefly/node/channel_config.h"
 #include "firefly/node/reader_base.h"
@@ -23,8 +25,8 @@ namespace detail {
 
 // —— 以下工厂与操作函数为接口声明，尚未实现 ——
 template <typename MessageT>
-std::shared_ptr<ReaderHandle> CreateReader(const ReaderConfig& config,
-                                           const CallbackFunc<MessageT>& func);
+Result<std::shared_ptr<ReaderHandle>> CreateReader(
+    const ReaderConfig& config, const CallbackFunc<MessageT>& func);
 
 template <typename MessageT>
 void ReaderShutdown(ReaderHandle* handle);
@@ -83,10 +85,20 @@ class Reader : public ReaderBase {
     if (init_) {
       return true;
     }
-    impl_ = detail::CreateReader<MessageT>(config_, func_);
-    init_ = impl_ != nullptr;
-    return init_;
+    auto r = detail::CreateReader<MessageT>(config_, func_);
+    init_code_ = r.code;
+    init_message_ = std::move(r.message);
+    if (!r) {
+      return false;
+    }
+    impl_ = std::move(r.value);
+    init_ = true;
+    return true;
   }
+
+  // 供 Node::CreateReader 回填 Result 的诊断信息
+  ErrorCode InitErrorCode() const noexcept { return init_code_; }
+  const std::string& InitErrorMessage() const noexcept { return init_message_; }
 
   void Shutdown() override {
     detail::ReaderShutdown<MessageT>(impl_.get());
@@ -147,6 +159,8 @@ class Reader : public ReaderBase {
   CallbackFunc<MessageT> func_;
   std::shared_ptr<detail::ReaderHandle> impl_;
   bool init_ = false;
+  ErrorCode init_code_ = ErrorCode::kOk;
+  std::string init_message_;
 };
 
 }  // namespace firefly

@@ -26,14 +26,16 @@ int main() {
   // ---- 服务：计算 a + b ----
   auto service = node->CreateService<CalcRequest, CalcResponse>(
       "calc",
-      [](const std::shared_ptr<CalcRequest>& req,
-         std::shared_ptr<CalcResponse>& resp) {
+      [](const std::shared_ptr<const CalcRequest>& req)
+          -> firefly::ServiceResult<CalcResponse> {
+        auto resp = std::make_shared<CalcResponse>();
         resp->set_sum(req->a() + req->b());
-      });
-  if (service == nullptr) return 10;
+        return {firefly::ErrorCode::kOk, resp};
+      }).value;
+  if (!service) return 10;
 
-  auto client = node->CreateClient<CalcRequest, CalcResponse>("calc");
-  if (client == nullptr) return 11;
+  auto client = node->CreateClient<CalcRequest, CalcResponse>("calc").value;
+  if (!client) return 11;
 
   // ---- 等待服务就绪 ----
   if (!client->WaitForService(std::chrono::seconds(2))) return 12;
@@ -44,7 +46,7 @@ int main() {
   req->set_a(10);
   req->set_b(32);
   auto resp = client->SendRequest(req, std::chrono::seconds(2));
-  if (resp == nullptr) return 13;
+  if (!resp || resp.code != firefly::ErrorCode::kOk) return 13;
   std::printf("sync 10 + 32 = %lld\n", static_cast<long long>(resp->sum()));
 
   // ---- 同步请求（值语义重载）----
@@ -52,7 +54,8 @@ int main() {
   req2.set_a(-5);
   req2.set_b(47);
   auto resp2 = client->SendRequest(req2, std::chrono::seconds(2));
-  if (resp2 == nullptr || resp2->sum() != 42) return 14;
+  if (!resp2 || resp2.code != firefly::ErrorCode::kOk ||
+      resp2->sum() != 42) return 14;
   std::printf("value (-5) + 47 = %lld\n",
               static_cast<long long>(resp2->sum()));
 

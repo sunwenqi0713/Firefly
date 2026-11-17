@@ -40,9 +40,11 @@ struct WriterImpl : public WriterHandle {
 };
 
 template <typename MessageT>
-std::shared_ptr<WriterHandle> CreateWriter(const ChannelConfig& config) {
+Result<std::shared_ptr<WriterHandle>> CreateWriter(const ChannelConfig& config) {
   static_assert(message::HasSerializer<MessageT>::value,
                 "MessageT must derive from google::protobuf::Message.");
+
+  const std::string where = "CreateWriter[channel='" + config.channel_name + "']: ";
 
   auto impl = std::make_shared<WriterImpl<MessageT>>();
   impl->config = config;
@@ -51,7 +53,8 @@ std::shared_ptr<WriterHandle> CreateWriter(const ChannelConfig& config) {
   if (r != 0) {
     FY_ERROR("writer[%s]: nng_pub0_open: %s", config.channel_name.c_str(),
              nng_strerror(r));
-    return nullptr;
+    return {nullptr, ErrorCode::kTransport,
+            where + "nng_pub0_open failed: " + nng_strerror(r)};
   }
 
   nng_listener l{NNG_LISTENER_INITIALIZER};
@@ -61,7 +64,8 @@ std::shared_ptr<WriterHandle> CreateWriter(const ChannelConfig& config) {
              config.channel_name.c_str());
     nng_close(impl->sock_);
     impl->sock_.id = 0;
-    return nullptr;
+    return {nullptr, ErrorCode::kTransport,
+            where + "bind ephemeral port failed (nng listener)"};
   }
   impl->pub_url = url;
 
@@ -71,27 +75,7 @@ std::shared_ptr<WriterHandle> CreateWriter(const ChannelConfig& config) {
     impl->registered_ = true;
   }
   FY_INFO("writer[%s] ok at %s", config.channel_name.c_str(), url.c_str());
-  return impl;
-}
-
-template <typename MessageT>
-bool WriterWrite(WriterHandle* handle, const std::shared_ptr<MessageT>& msg) {
-  auto* impl = static_cast<WriterImpl<MessageT>*>(handle);
-  if (impl == nullptr || impl->sock_.id == 0 || msg == nullptr) {
-    return false;
-  }
-  std::string bytes;
-  if (!message::MessageTraits<MessageT>::Serialize(*msg, &bytes)) {
-    FY_ERROR("writer[%s]: serialize failed", impl->config.channel_name.c_str());
-    return false;
-  }
-  int r = nng_send(impl->sock_, const_cast<char*>(bytes.data()), bytes.size(), 0);
-  if (r != 0) {
-    FY_WARN("writer[%s]: nng_send: %s", impl->config.channel_name.c_str(),
-            nng_strerror(r));
-    return false;
-  }
-  return true;
+  return {impl, ErrorCode::kOk, ""};
 }
 
 template <typename MessageT>
@@ -102,6 +86,39 @@ bool WriterHasReader(const WriterHandle* handle) {
   }
   return discovery::Registry::instance().Has(
       discovery::Kind::kReader, impl->config.channel_name);
+}
+
+// 写状态映射（供单测直接验证协议层错误→WriteStatus 的映射，不依赖真实拥塞）
+inline WriteStatus MapNngSendError(int r) noexcept {
+  if (r == 0) return WriteStatus::kAccepted;
+  if (r == NNG_EAGAIN) return WriteStatus::kQueueFull;
+  return WriteStatus::kTransportError;
+}
+
+template <typename MessageT>
+WriteStatus WriterWrite(WriterHandle* handle,
+                        const std::shared_ptr<const MessageT>& msg) {
+  auto* impl = static_cast<WriterImpl<MessageT>*>(handle);
+  if (impl == nullptr || impl->sock_.id == 0 || msg == nullptr) {
+    return WriteStatus::kTransportError;
+  }
+
+  // nng PUB 即使无订阅者也会 send 成功；必须显式检查注册中心以获得 kNoSubscriber
+  if (!WriterHasReader<MessageT>(handle)) {
+    return WriteStatus::kNoSubscriber;
+  }
+
+  std::string bytes;
+  if (!message::MessageTraits<MessageT>::Serialize(*msg, &bytes)) {
+    FY_ERROR("writer[%s]: serialize failed", impl->config.channel_name.c_str());
+    return WriteStatus::kSerializationError;
+  }
+  int r = nng_send(impl->sock_, const_cast<char*>(bytes.data()), bytes.size(), 0);
+  if (r != 0) {
+    FY_WARN("writer[%s]: nng_send: %s", impl->config.channel_name.c_str(),
+            nng_strerror(r));
+  }
+  return MapNngSendError(r);
 }
 
 }  // namespace detail

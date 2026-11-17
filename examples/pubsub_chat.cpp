@@ -37,8 +37,8 @@ int main() {
         std::printf("[callback] seq=%lld content=%s\n",
                     static_cast<long long>(msg->seq()),
                     msg->content().c_str());
-      });
-  if (cb_reader == nullptr) return 10;
+      }).value;
+  if (!cb_reader) return 10;
 
   // ---- Observe 模式订阅（缓存 3 条）----
   // 同一节点不允许对同一通道重复订阅，故使用第二个订阅者节点。
@@ -46,12 +46,12 @@ int main() {
   firefly::ReaderConfig obs_cfg;
   obs_cfg.channel_name = "channel/chat";
   obs_cfg.pending_queue_size = 3;
-  auto obs_reader = sub_node2->CreateReader<Chatter>(obs_cfg, nullptr);
-  if (obs_reader == nullptr) return 11;
+  auto obs_reader = sub_node2->CreateReader<Chatter>(obs_cfg, nullptr).value;
+  if (!obs_reader) return 11;
 
   // ---- 发布者 ----
-  auto writer = pub_node->CreateWriter<Chatter>("channel/chat");
-  if (writer == nullptr) return 12;
+  auto writer = pub_node->CreateWriter<Chatter>("channel/chat").value;
+  if (!writer) return 12;
 
   SleepMs(500);  // 等待订阅者完成拨号
   std::printf("reader->HasWriter() = %d, writer->HasReader() = %d\n",
