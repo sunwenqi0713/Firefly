@@ -14,12 +14,11 @@ struct ChannelConfig {
   QosProfile qos_profile;
 };
 
-// Reader 扩展配置：在通道配置基础上额外支持消息缓存队列深度
+// Reader 扩展配置（阶段三：缓存深度统一由 qos_profile.depth 决定）。
+// 原 pending_queue_size 已删除，避免两个字段竞争同一语义。
 struct ReaderConfig {
   std::string channel_name;
   QosProfile qos_profile;
-  // 收到消息后缓存队列的深度，超出后丢弃最旧消息
-  std::uint32_t pending_queue_size = 1;
 };
 
 }  // namespace firefly

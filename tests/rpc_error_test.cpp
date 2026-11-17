@@ -66,7 +66,7 @@ int main() {
   if (r_missing.code != ErrorCode::kServiceNotFound) return 31;
 
   // 5) kSerialization：malformed 响应帧（magic 不符）→ 客户端映射为 kSerialization。
-  // 直接验证帧解码层；client_impl.h 中 DecodeResponse 失败即返回该码。
+  // 直接验证帧解码层；client_core.cc 中 DecodeResponse 失败即返回该码。
   ErrorCode decoded = ErrorCode::kOk;
   std::string payload;
   if (firefly::detail::DecodeResponse("BAD!MAGIC!!!", &decoded, &payload)) return 40;

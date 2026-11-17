@@ -14,6 +14,12 @@ struct Node::Impl {};
 
 Result<std::unique_ptr<Node>> CreateNode(const std::string& node_name,
                                          const std::string& name_space) {
+  return CreateNode(node_name, name_space, nullptr);
+}
+
+Result<std::unique_ptr<Node>> CreateNode(
+    const std::string& node_name, const std::string& name_space,
+    const std::shared_ptr<detail::InjectionContext>& ctx) {
   using R = Result<std::unique_ptr<Node>>;
   if (detail::ValidateNodeName(node_name) != ErrorCode::kOk) {
     return R{nullptr, ErrorCode::kInvalidName,
@@ -25,12 +31,13 @@ Result<std::unique_ptr<Node>> CreateNode(const std::string& node_name,
              "CreateNode[node='" + node_name +
                  "']: a Node with this name already exists in this process"};
   }
-  return R{std::unique_ptr<Node>(new Node(node_name, name_space)),
+  return R{std::unique_ptr<Node>(new Node(node_name, name_space, ctx)),
            ErrorCode::kOk, ""};
 }
 
-Node::Node(const std::string& node_name, const std::string& name_space)
-    : node_name_(node_name), name_space_(name_space), impl_(new Impl) {
+Node::Node(const std::string& node_name, const std::string& name_space,
+           const std::shared_ptr<detail::InjectionContext>& ctx)
+    : node_name_(node_name), name_space_(name_space), ctx_(ctx), impl_(new Impl) {
   FY_INFO("node[%s] created", node_name_.c_str());
 }
 

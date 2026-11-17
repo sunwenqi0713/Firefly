@@ -4,9 +4,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace firefly {
 namespace runtime {
@@ -33,6 +37,12 @@ class ShutdownManager {
   // 带超时的等待：返回 true=已关停，false=超时。供优雅关停设置退出期限。
   bool WaitForShutdownFor(std::chrono::milliseconds timeout);
 
+  // 阶段三：端点在途回调等待点。core 用 weak_ptr<void> 登记自身与等待函数；
+  // 已释放的端点自动剔除。Clear() 会遍历当前存活的等待点并阻塞至返回。
+  void RegisterCallbackWaiter(std::weak_ptr<void> owner,
+                              std::function<void()> waiter);
+  void WaitForInFlightCallbacks();
+
   // 进程内节点名注册表（阶段二：CreateNode 查重，返回 kDuplicate）。
   // 复用本单例，避免第二套进程级状态机。true=名字此前未占用（已登记）。
   bool RegisterNode(const std::string& node_name);
@@ -49,6 +59,10 @@ class ShutdownManager {
 
   mutable std::mutex node_names_mutex_;
   std::set<std::string> node_names_;
+
+  mutable std::mutex callback_waiters_mutex_;
+  std::vector<std::pair<std::weak_ptr<void>, std::function<void()>>>
+      callback_waiters_;
 };
 
 }  // namespace runtime

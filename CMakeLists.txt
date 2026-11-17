@@ -14,7 +14,14 @@ find_package(Threads REQUIRED)       # 提供 std::thread；Linux 上等价于 -
 add_library(firefly STATIC
     firefly/init.cc
     firefly/runtime.cc
-    firefly/discovery.cc
+    firefly/common/log.cc
+    firefly/detail/endpoint_id.cc
+    firefly/detail/discovery.cc
+    firefly/detail/transport_nng.cc
+    firefly/detail/writer_core.cc
+    firefly/detail/reader_core.cc
+    firefly/detail/service_core.cc
+    firefly/detail/client_core.cc
     firefly/node/node.cc)
 add_library(firefly::firefly ALIAS firefly)
 target_include_directories(firefly PUBLIC
@@ -31,6 +38,15 @@ endif()
 
 # 头文件解析校验（不实例化尚未实现的 detail 工厂）
 enable_testing()
+
+# 零泄漏脚本化验收（阶段三）：公共头不得 include nng/*_impl.h/discovery
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME no_leak_check
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_leak.py
+                   ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
 add_executable(firefly_header_check tests/header_check.cpp)
 target_link_libraries(firefly_header_check PRIVATE firefly)
 add_test(NAME header_check COMMAND firefly_header_check)
@@ -121,6 +137,27 @@ add_test(NAME endpoint_lifecycle_test COMMAND firefly_endpoint_lifecycle_test)
 add_executable(firefly_callback_contract_test tests/callback_contract_test.cpp)
 target_link_libraries(firefly_callback_contract_test PRIVATE firefly test_messages)
 add_test(NAME callback_contract_test COMMAND firefly_callback_contract_test)
+
+# 阶段三验收：上下文回调 / 实时统计 / fake 注入 / Clear 等待 / schema 演进
+add_executable(firefly_callback_context_test tests/callback_context_test.cpp)
+target_link_libraries(firefly_callback_context_test PRIVATE firefly test_messages)
+add_test(NAME callback_context_test COMMAND firefly_callback_context_test)
+
+add_executable(firefly_stats_test tests/stats_test.cpp)
+target_link_libraries(firefly_stats_test PRIVATE firefly test_messages)
+add_test(NAME stats_test COMMAND firefly_stats_test)
+
+add_executable(firefly_fake_transport_test tests/fake_transport_test.cpp)
+target_link_libraries(firefly_fake_transport_test PRIVATE firefly test_messages)
+add_test(NAME fake_transport_test COMMAND firefly_fake_transport_test)
+
+add_executable(firefly_clear_wait_test tests/clear_wait_test.cpp)
+target_link_libraries(firefly_clear_wait_test PRIVATE firefly test_messages)
+add_test(NAME clear_wait_test COMMAND firefly_clear_wait_test)
+
+add_executable(firefly_message_traits_test tests/message_traits_test.cpp)
+target_link_libraries(firefly_message_traits_test PRIVATE firefly test_messages)
+add_test(NAME message_traits_test COMMAND firefly_message_traits_test)
 
 # ---------------- 使用示例 ----------------
 

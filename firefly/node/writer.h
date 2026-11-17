@@ -19,7 +19,7 @@
 //                无重传、无持久化；kAccepted 仅表示已交给本地传输层。
 //   kReliable  ：**本阶段与 kBestEffort 行为完全相同**。nng PUB/SUB 没有 ack，
 //                当前实现不提供任何重传/确认机制，kAccepted 同样是 at-most-once。
-//                TODO(phase2): 传输层可靠性增强后在此处更新契约；如需端到端确认，
+//                TODO(phase4): 传输层可靠性增强后在此处更新契约；如需端到端确认，
 //                现阶段请在应用层使用 Service/Client 的请求-响应模式并自行重发。
 //
 // 投递顺序保证：
@@ -30,6 +30,9 @@
 // 状态机约束：
 //   Write 只接受已 Init 且未 Shutdown 的 Writer；未初始化时返回 kTransportError。
 //   两种 Write 重载语义一致，仅入参所有权不同（值语义会拷贝一次消息）。
+//
+// 阶段三（任务 2）：本模板只做 protobuf 序列化 shim，nng 交互全部下沉到
+// detail/writer_core.cc；公共头不再包含任何 detail/*_impl.h 或 nng 头。
 // ===========================================================================
 
 #include <memory>
@@ -37,41 +40,12 @@
 #include <utility>
 
 #include "firefly/common/types.h"
-#include "firefly/detail/handles.h"
+#include "firefly/detail/endpoint_api.h"
+#include "firefly/message/message_traits.h"
 #include "firefly/node/channel_config.h"
 #include "firefly/node/writer_base.h"
 
 namespace firefly {
-
-// 写操作结果：单独枚举，不与 ErrorCode 混用（Write 不返回细粒度 code/message）。
-enum class WriteStatus {
-  kAccepted,
-  kNoSubscriber,
-  kQueueFull,
-  kSerializationError,
-  kTransportError
-};
-
-// 便于灰度迁移：旧代码 `if (!writer->Write(msg))` 继续可用（kAccepted 视为成功）。
-inline bool operator!(WriteStatus s) noexcept {
-  return s != WriteStatus::kAccepted;
-}
-
-namespace detail {
-
-// 不透明实现句柄：具体内容由底层传输层持有（定义于 detail/handles.h）
-
-template <typename MessageT>
-Result<std::shared_ptr<WriterHandle>> CreateWriter(const ChannelConfig& config);
-
-template <typename MessageT>
-WriteStatus WriterWrite(WriterHandle* handle,
-                        const std::shared_ptr<const MessageT>& msg);
-
-template <typename MessageT>
-bool WriterHasReader(const WriterHandle* handle);
-
-}  // namespace detail
 
 /**
  * @class Writer<MessageT>
@@ -82,14 +56,16 @@ bool WriterHasReader(const WriterHandle* handle);
 template <typename MessageT>
 class Writer : public WriterBase {
  public:
-  explicit Writer(const ChannelConfig& config) : config_(config) {}
+  explicit Writer(const ChannelConfig& config,
+                  const std::shared_ptr<detail::InjectionContext>& ctx = nullptr)
+      : config_(config), ctx_(ctx) {}
   ~Writer() override = default;
 
   bool Init() override {
     if (init_) {
       return true;
     }
-    auto r = detail::CreateWriter<MessageT>(config_);
+    auto r = detail::CreateWriterCore(config_, ctx_);
     init_code_ = r.code;
     init_message_ = std::move(r.message);
     if (!r) {
@@ -108,13 +84,13 @@ class Writer : public WriterBase {
   // （WriteStatus 无 kNotReady 码，按阶段一契约折叠为传输错误）、HasReader 返回 false。
   // 非幂等副作用：impl_ 被 reset；如需重建请由 Node::CreateWriter 新建。
   void Shutdown() override {
+    detail::WriterShutdown(impl_.get());
     impl_.reset();
     init_ = false;
   }
 
-  // @threadsafe 多个调用方可并发 Write：底层 nng_send 与注册中心 Has 查询
-  // 均无共享可变状态竞争（无锁但只读 config_/sock_）。契约：不得与同一
-  // Writer 的 Shutdown() 并发（Shutdown reset impl_，存在生命周期竞态）。
+  // @threadsafe 多个调用方可并发 Write：底层 socket 与注入的 Registry 查询
+  // 均无共享可变状态竞争。契约：不得与同一 Writer 的 Shutdown() 并发。
   /** @brief 发布一条消息（值语义，内部拷贝为 shared_ptr） */
   WriteStatus Write(const MessageT& msg) {
     auto msg_ptr = std::make_shared<MessageT>(msg);
@@ -124,14 +100,23 @@ class Writer : public WriterBase {
   /** @brief 发布一条消息（共享指针语义） */
   WriteStatus Write(const std::shared_ptr<const MessageT>& msg_ptr) {
     if (!init_ || !impl_) {
-      return WriteStatus::kTransportError;  // kNotReady 语义在 Write 阶段折叠为传输错误
+      return WriteStatus::kTransportError;  // kNotReady 语义折叠为传输错误
     }
-    return detail::WriterWrite<MessageT>(impl_.get(), msg_ptr);
+    if (!detail::WriterHasReader(impl_.get())) {
+      return WriteStatus::kNoSubscriber;
+    }
+    std::string bytes;
+    if (!message::MessageTraits<MessageT>::Serialize(*msg_ptr, &bytes)) {
+      return WriteStatus::kSerializationError;
+    }
+    return detail::WriterWriteBytes(impl_.get(), bytes);
   }
 
-  bool HasReader() override {
-    return detail::WriterHasReader<MessageT>(impl_.get());
-  }
+  // @threadsafe 累计计数由 core 内原子变量维护；queue_depth 对 Writer 恒为 0。
+  // 速率统计（mps）未实现，见 common/types.h EndpointStats 注释。
+  EndpointStats Stats() const { return detail::WriterStats(impl_.get()); }
+
+  bool HasReader() override { return detail::WriterHasReader(impl_.get()); }
 
   const std::string& GetChannelName() const override {
     return config_.channel_name;
@@ -141,6 +126,7 @@ class Writer : public WriterBase {
 
  private:
   ChannelConfig config_;
+  std::shared_ptr<detail::InjectionContext> ctx_;
   std::shared_ptr<detail::WriterHandle> impl_;
   bool init_ = false;
   ErrorCode init_code_ = ErrorCode::kOk;
@@ -148,7 +134,5 @@ class Writer : public WriterBase {
 };
 
 }  // namespace firefly
-
-#include "firefly/detail/writer_impl.h"
 
 #endif  // FIREFLY_NODE_WRITER_H_

@@ -100,6 +100,30 @@ bool ShutdownManager::HasNode(const std::string& node_name) const {
   return node_names_.count(node_name) != 0;
 }
 
+void ShutdownManager::RegisterCallbackWaiter(std::weak_ptr<void> owner,
+                                             std::function<void()> waiter) {
+  std::lock_guard<std::mutex> lock(callback_waiters_mutex_);
+  callback_waiters_.emplace_back(std::move(owner), std::move(waiter));
+}
+
+void ShutdownManager::WaitForInFlightCallbacks() {
+  std::vector<std::function<void()>> waiters;
+  {
+    std::lock_guard<std::mutex> lock(callback_waiters_mutex_);
+    auto out = callback_waiters_.begin();
+    for (auto it = callback_waiters_.begin(); it != callback_waiters_.end();
+         ++it) {
+      if (it->first.expired()) continue;
+      waiters.push_back(it->second);
+      *out++ = std::move(*it);
+    }
+    callback_waiters_.erase(out, callback_waiters_.end());
+  }
+  for (auto& waiter : waiters) {
+    if (waiter) waiter();
+  }
+}
+
 void ShutdownManager::Clear() {
   if (!inited_.exchange(false)) {
     return;

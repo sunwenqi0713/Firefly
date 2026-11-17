@@ -25,7 +25,10 @@
  *     writer->Write(msg);  // 返回 WriteStatus
  *
  *     auto reader_r = node->CreateReader<Chatter>("channel/chatter",
- *         [](const std::shared_ptr<Chatter>& msg) { ... });
+ *         [](const firefly::MessageContext&,
+ *            const std::shared_ptr<const Chatter>& msg) {
+ *           return firefly::CallbackResult::kOk;  // 或 kDropped
+ *         });
  *
  *     // 服务 / 客户端（回调返回 ServiceResult，SendRequest 返回 ServiceResult）
  *     auto service_r = node->CreateService<Req, Resp>("calc",

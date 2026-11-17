@@ -2,11 +2,16 @@
 #define FIREFLY_NODE_READER_H_
 
 // ===========================================================================
-// 回调执行模型与并发契约（阶段二：契约基线，签名未改）
+// 回调执行模型与并发契约（阶段二契约基线；阶段三签名升级为 MessageContext）
 // ===========================================================================
 //
-// 回调类型 CallbackFunc<M> = std::function<void(const std::shared_ptr<M>&)>。
-// 本阶段不改签名（带线程上下文/返回状态的 MessageContext 改造属第三阶段）。
+// 回调类型（阶段三）：
+//   CallbackFunc<M> = std::function<CallbackResult(
+//       const MessageContext&, std::shared_ptr<const M>)>
+// MessageContext 含 channel、sequence（本 Reader 从 1 递增）、receive_time；
+// 不含 executor 字段 —— 回调仍内联派发（见下）。
+// 消息指针改为 shared_ptr<const M>：堵死"回调内改消息"的未定义行为。
+// CallbackResult::kDropped 表示本条不消费，计入 Stats().dropped。
 //
 // 执行线程：回调在 Reader 专属的单个收线程（recv_thread_）内**内联派发**，
 //   不是独立线程池，也不在调用 CreateReader 的线程执行。
@@ -19,15 +24,17 @@
 //   - 禁止在回调内调用**本 Client** 的 Shutdown（对 RPC 回调同理，见 client.h）；
 //   - 回调抛出的异常不会传播到任何调用方：在收线程内被捕获，记录一条带
 //     channel 名的 ERROR 日志（std::exception 附 what()）后继续收下一条。
-//     "静默吞掉"是阶段一旧状，阶段二已改为显式日志，但仍不传播。
 // 回调与 Observe 互斥（契约缺失 3）：
 //   - 构造 Reader 时传入非空 CallbackFunc → 回调模式；回调模式下消息**只**
 //     派发给回调、不写入观察队列，因此 GetAllObserved()/GetLatestObserved()/
-//     GetOldestObserved() 恒为空 / nullptr，Empty() 恒为 true。这是设计行为，
-//     不是数据丢失；两种模式需在创建时二选一，不能运行期混用。
+//     GetOldestObserved() 恒为空 / nullptr，Empty() 恒为 true。
 //   - 构造时传 nullptr → Observe 模式；消息入队，回调不触发。
 //   - 之所以仅在文档声明而未加 kInvalidState 返回：GetAllObserved() 返回
-//     std::vector 而非 Result，加码需改签名，超出本阶段"不改回调签名"范围。
+//     std::vector 而非 Result，加码需改签名，超出范围。
+// Shutdown 与 Clear（阶段三收尾）：
+//   - Reader::Shutdown() 阻塞至在途回调返回（与 join 收线程配合）；
+//   - 全局 firefly::Clear() 遍历登记的存活 Reader/Service 等待点，阻塞至
+//     调用时刻在途的回调返回；不阻止端点未关闭时后续新回调。
 // ===========================================================================
 
 #include <cstdint>
@@ -37,8 +44,10 @@
 #include <utility>
 #include <vector>
 
+#include "firefly/common/log.h"
 #include "firefly/common/types.h"
-#include "firefly/detail/handles.h"
+#include "firefly/detail/endpoint_api.h"
+#include "firefly/message/message_traits.h"
 #include "firefly/node/channel_config.h"
 #include "firefly/node/reader_base.h"
 
@@ -46,55 +55,8 @@ namespace firefly {
 
 // 消息到达回调：收到消息后被调用（回调模式）
 template <typename M0>
-using CallbackFunc = std::function<void(const std::shared_ptr<M0>&)>;
-
-namespace detail {
-
-// 不透明实现句柄（定义于 detail/handles.h）
-
-// —— 以下工厂与操作函数为接口声明，尚未实现 ——
-template <typename MessageT>
-Result<std::shared_ptr<ReaderHandle>> CreateReader(
-    const ReaderConfig& config, const CallbackFunc<MessageT>& func);
-
-template <typename MessageT>
-void ReaderShutdown(ReaderHandle* handle);
-
-template <typename MessageT>
-void ReaderObserve(ReaderHandle* handle);
-
-template <typename MessageT>
-void ReaderClearData(ReaderHandle* handle);
-
-template <typename MessageT>
-bool ReaderEmpty(const ReaderHandle* handle);
-
-template <typename MessageT>
-bool ReaderHasReceived(const ReaderHandle* handle);
-
-template <typename MessageT>
-double ReaderGetDelaySec(const ReaderHandle* handle);
-
-template <typename MessageT>
-std::shared_ptr<MessageT> ReaderGetLatestObserved(const ReaderHandle* handle);
-
-template <typename MessageT>
-std::shared_ptr<MessageT> ReaderGetOldestObserved(const ReaderHandle* handle);
-
-template <typename MessageT>
-std::vector<std::shared_ptr<MessageT>> ReaderGetAllObserved(
-    const ReaderHandle* handle);
-
-template <typename MessageT>
-void ReaderSetHistoryDepth(ReaderHandle* handle, std::uint32_t depth);
-
-template <typename MessageT>
-std::uint32_t ReaderGetHistoryDepth(const ReaderHandle* handle);
-
-template <typename MessageT>
-bool ReaderHasWriter(const ReaderHandle* handle);
-
-}  // namespace detail
+using CallbackFunc = std::function<CallbackResult(
+    const MessageContext&, const std::shared_ptr<const M0>&)>;
 
 /**
  * @brief 订阅者：订阅一个通道。
@@ -106,15 +68,30 @@ bool ReaderHasWriter(const ReaderHandle* handle);
 template <typename MessageT>
 class Reader : public ReaderBase {
  public:
-  Reader(const ReaderConfig& config, const CallbackFunc<MessageT>& func = nullptr)
-      : config_(config), func_(func) {}
+  Reader(const ReaderConfig& config,
+         const CallbackFunc<MessageT>& func = nullptr,
+         const std::shared_ptr<detail::InjectionContext>& ctx = nullptr)
+      : config_(config), func_(func), ctx_(ctx) {}
   ~Reader() override = default;
 
   bool Init() override {
     if (init_) {
       return true;
     }
-    auto r = detail::CreateReader<MessageT>(config_, func_);
+    detail::OnBytesFunc on_bytes;
+    if (func_) {
+      on_bytes = [func = func_](const MessageContext& context,
+                                const std::string& bytes) -> CallbackResult {
+        auto msg = std::make_shared<MessageT>();
+        if (!message::MessageTraits<MessageT>::Deserialize(bytes, msg.get())) {
+          FY_WARN("reader[%s]: deserialize failed (%zu bytes)",
+                  context.channel.c_str(), bytes.size());
+          return CallbackResult::kDropped;
+        }
+        return func(context, msg);
+      };
+    }
+    auto r = detail::CreateReaderCore(config_, on_bytes, ctx_);
     init_code_ = r.code;
     init_message_ = std::move(r.message);
     if (!r) {
@@ -129,34 +106,32 @@ class Reader : public ReaderBase {
   ErrorCode InitErrorCode() const noexcept { return init_code_; }
   const std::string& InitErrorMessage() const noexcept { return init_message_; }
 
+  // @post 阻塞至在途回调返回并关闭收线程；调用后本 Reader 不可再用。
   void Shutdown() override {
-    detail::ReaderShutdown<MessageT>(impl_.get());
+    detail::ReaderShutdownCore(impl_.get());
     impl_.reset();
     init_ = false;
   }
 
-  // @threadsafe-if 在 impl_ 未被并发 Shutdown 的前提下线程安全：底层队列由
-  // queue_mutex_ 保护，但 Shutdown() 会 reset impl_，与读取 impl_.get() 存在
-  // 生命周期竞态。契约：不得与同一 Reader 的 Shutdown() 并发调用。
-  void Observe() override { detail::ReaderObserve<MessageT>(impl_.get()); }
-  void ClearData() override { detail::ReaderClearData<MessageT>(impl_.get()); }
+  // @threadsafe-if 在 impl_ 未被并发 Shutdown 的前提下线程安全。
+  // 契约：不得与同一 Reader 的 Shutdown() 并发调用。
+  void Observe() override {}  // Observe 模式下数据在收线程直接入队
+  void ClearData() override { detail::ReaderClearData(impl_.get()); }
 
-  bool Empty() const override {
-    return detail::ReaderEmpty<MessageT>(impl_.get());
-  }
+  bool Empty() const override { return detail::ReaderEmpty(impl_.get()); }
   bool HasReceived() const override {
-    return detail::ReaderHasReceived<MessageT>(impl_.get());
+    return detail::ReaderHasReceived(impl_.get());
   }
   double GetDelaySec() const override {
-    return detail::ReaderGetDelaySec<MessageT>(impl_.get());
-  }
-  std::uint32_t PendingQueueSize() const override {
-    return config_.pending_queue_size;
+    return detail::ReaderGetDelaySec(impl_.get());
   }
 
-  bool HasWriter() override {
-    return detail::ReaderHasWriter<MessageT>(impl_.get());
-  }
+  // 阶段三：实时积压由 Stats().queue_depth 提供；假 getter PendingQueueSize 已删除。
+  // @threadsafe 计数与队列深度均由 core 内锁/原子量维护。
+  // kDropped 回调与队列满丢弃合并计入 dropped；速率统计未实现（phase4）。
+  EndpointStats Stats() const { return detail::ReaderStats(impl_.get()); }
+
+  bool HasWriter() override { return detail::ReaderHasWriter(impl_.get()); }
 
   const std::string& GetChannelName() const override {
     return config_.channel_name;
@@ -165,31 +140,39 @@ class Reader : public ReaderBase {
 
   // ---------- Observe 模式 ----------
 
-  // 最新一条已观察消息（无则返回 nullptr）
-  std::shared_ptr<MessageT> GetLatestObserved() const {
-    return detail::ReaderGetLatestObserved<MessageT>(impl_.get());
-  }
-  // 最旧一条已观察消息（无则返回 nullptr）
-  std::shared_ptr<MessageT> GetOldestObserved() const {
-    return detail::ReaderGetOldestObserved<MessageT>(impl_.get());
-  }
-  // @threadsafe 队列由 queue_mutex_ 保护，可与收线程并发调用。
+  // @threadsafe 队列由 core 内 queue_mutex_ 保护，可与收线程并发调用。
   // @note 回调模式下恒返回空 vector（见文件头"回调与 Observe 互斥"）。
   std::vector<std::shared_ptr<MessageT>> GetAllObserved() const {
-    return detail::ReaderGetAllObserved<MessageT>(impl_.get());
+    std::vector<std::shared_ptr<MessageT>> out;
+    for (const auto& bytes : detail::ReaderGetAllBytes(impl_.get())) {
+      auto msg = std::make_shared<MessageT>();
+      if (message::MessageTraits<MessageT>::Deserialize(bytes, msg.get())) {
+        out.push_back(msg);
+      }
+    }
+    return out;
+  }
+  std::shared_ptr<MessageT> GetLatestObserved() const {
+    auto all = GetAllObserved();
+    return all.empty() ? nullptr : all.back();
+  }
+  std::shared_ptr<MessageT> GetOldestObserved() const {
+    auto all = GetAllObserved();
+    return all.empty() ? nullptr : all.front();
   }
 
-  // 设置/获取缓存深度
+  // 设置/获取缓存深度：与 QosProfile::depth 同源（阶段三统一）
   void SetHistoryDepth(std::uint32_t depth) {
-    detail::ReaderSetHistoryDepth<MessageT>(impl_.get(), depth);
+    detail::ReaderSetHistoryDepth(impl_.get(), depth);
   }
   std::uint32_t GetHistoryDepth() const {
-    return detail::ReaderGetHistoryDepth<MessageT>(impl_.get());
+    return detail::ReaderGetHistoryDepth(impl_.get());
   }
 
  private:
   ReaderConfig config_;
   CallbackFunc<MessageT> func_;
+  std::shared_ptr<detail::InjectionContext> ctx_;
   std::shared_ptr<detail::ReaderHandle> impl_;
   bool init_ = false;
   ErrorCode init_code_ = ErrorCode::kOk;
@@ -197,7 +180,5 @@ class Reader : public ReaderBase {
 };
 
 }  // namespace firefly
-
-#include "firefly/detail/reader_impl.h"
 
 #endif  // FIREFLY_NODE_READER_H_

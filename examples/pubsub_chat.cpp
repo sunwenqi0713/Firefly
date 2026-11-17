@@ -32,11 +32,13 @@ int main() {
   std::atomic<int> cb_count{0};
   auto cb_reader = sub_node->CreateReader<Chatter>(
       "channel/chat",
-      [&cb_count](const std::shared_ptr<Chatter>& msg) {
+      [&cb_count](const firefly::MessageContext&,
+                  const std::shared_ptr<const Chatter>& msg) {
         ++cb_count;
         std::printf("[callback] seq=%lld content=%s\n",
                     static_cast<long long>(msg->seq()),
                     msg->content().c_str());
+        return firefly::CallbackResult::kOk;
       }).value;
   if (!cb_reader) return 10;
 
@@ -45,7 +47,7 @@ int main() {
   auto sub_node2 = firefly::CreateNode("subscriber2").value;
   firefly::ReaderConfig obs_cfg;
   obs_cfg.channel_name = "channel/chat";
-  obs_cfg.pending_queue_size = 3;
+  obs_cfg.qos_profile.depth = 3;
   auto obs_reader = sub_node2->CreateReader<Chatter>(obs_cfg, nullptr).value;
   if (!obs_reader) return 11;
 

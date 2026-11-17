@@ -29,9 +29,11 @@ int main() {
   std::atomic<long long> cb_seq{-1};
   auto cb_reader = node->CreateReader<Chatter>(
       "channel/callback",
-      [&](const std::shared_ptr<Chatter>& msg) {
+      [&](const firefly::MessageContext&,
+          const std::shared_ptr<const Chatter>& msg) {
         ++cb_count;
         cb_seq.store(msg->seq());
+        return firefly::CallbackResult::kOk;
       }).value;
   if (!cb_reader) return 10;
   if (!cb_reader->IsInit()) return 11;
@@ -55,7 +57,7 @@ int main() {
   // ---------- Observe 模式：历史深度 / 拉取 ----------
   firefly::ReaderConfig obs_cfg;
   obs_cfg.channel_name = "channel/observe";
-  obs_cfg.pending_queue_size = 3;
+  obs_cfg.qos_profile.depth = 3;
   auto obs_reader = node->CreateReader<Chatter>(obs_cfg, nullptr).value;
   if (!obs_reader) return 20;
 
@@ -99,7 +101,11 @@ int main() {
 
   // ---------- 同节点同通道重复创建 Reader 应失败 ----------
   auto dup = node->CreateReader<Chatter>(
-      "channel/observe", [](const std::shared_ptr<Chatter>&) {}).value;
+      "channel/observe",
+      [](const firefly::MessageContext&,
+         const std::shared_ptr<const Chatter>&) {
+        return firefly::CallbackResult::kOk;
+      }).value;
   if (dup) return 50;
 
   firefly::Clear();

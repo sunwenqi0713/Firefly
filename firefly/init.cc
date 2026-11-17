@@ -1,7 +1,7 @@
 #include "firefly/init.h"
 
 #include "firefly/common/log.h"
-#include "firefly/discovery.h"
+#include "firefly/detail/discovery.h"
 #include "firefly/runtime.h"
 
 namespace firefly {
@@ -33,6 +33,9 @@ bool WaitForShutdownFor(std::chrono::milliseconds timeout) {
 
 void Clear() {
   discovery::Registry::instance().Stop();
+  // 阶段三：等待此刻仍在途的端点回调返回（Reader/Service），再清全局状态。
+  // 注意：全局关停不关闭端点线程，Clear 返回后新消息仍可能触发新回调。
+  runtime::ShutdownManager::instance().WaitForInFlightCallbacks();
   runtime::ShutdownManager::instance().Clear();
   FY_INFO("firefly runtime cleared");
 }

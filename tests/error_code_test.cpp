@@ -38,7 +38,7 @@ int main() {
   auto reserved = node->CreateWriter<Chatter>("foo__SRV__REQUEST");
   if (int e = Check(!reserved && reserved.code == ErrorCode::kInvalidName, 41)) return e;
 
-  // kInvalidConfig：depth==0 / pending_queue_size==0
+  // kInvalidConfig：depth==0（Reader/Writer 统一由 QosProfile::depth 校验）
   firefly::ChannelConfig bad_cfg;
   bad_cfg.channel_name = "ch_bad_qos";
   bad_cfg.qos_profile.depth = 0;
@@ -47,7 +47,7 @@ int main() {
 
   firefly::ReaderConfig bad_rcfg;
   bad_rcfg.channel_name = "ch_bad_rqos";
-  bad_rcfg.pending_queue_size = 0;
+  bad_rcfg.qos_profile.depth = 0;
   auto bad_rqos = node->CreateReader<Chatter>(bad_rcfg);
   if (int e = Check(!bad_rqos && bad_rqos.code == ErrorCode::kInvalidConfig, 51)) return e;
 
@@ -66,7 +66,7 @@ int main() {
   if (int e = Check(writer->Write(msg) == firefly::WriteStatus::kNoSubscriber, 71)) return e;
 
   // kQueueFull：协议层错误映射（真实 EAGAIN 需构造拥塞，本阶段验证映射函数）
-  if (int e = Check(firefly::detail::MapNngSendError(NNG_EAGAIN) ==
+  if (int e = Check(firefly::detail::MapSendError(firefly::detail::kIoQueueFull) ==
                         firefly::WriteStatus::kQueueFull, 80)) return e;
 
   // kTransport：未 Init 的 Writer 写操作走传输错误分支

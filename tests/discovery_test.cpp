@@ -1,5 +1,5 @@
 // discovery 注册中心单元测试：验证主实例的注册/查询/订阅派发逻辑。
-#include "firefly/discovery.h"
+#include "firefly/detail/discovery.h"
 
 #include <atomic>
 #include <chrono>

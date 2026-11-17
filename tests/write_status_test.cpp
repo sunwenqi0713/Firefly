@@ -31,7 +31,7 @@ int main() {
   if (no_sub_writer->Write(msg) != WriteStatus::kAccepted) return 22;
 
   // kQueueFull：协议层 EAGAIN 映射为 kQueueFull，与另两态严格区分
-  if (firefly::detail::MapNngSendError(NNG_EAGAIN) != WriteStatus::kQueueFull) return 30;
+  if (firefly::detail::MapSendError(firefly::detail::kIoQueueFull) != WriteStatus::kQueueFull) return 30;
   if (WriteStatus::kQueueFull == WriteStatus::kAccepted) return 31;
 
   // depth=1 灌 2 条：当前实现的实际行为是"收端保留最新一条"，
@@ -39,7 +39,7 @@ int main() {
   // 这一现状如实记录在 writer.h 头注释中。
   firefly::ReaderConfig cfg;
   cfg.channel_name = "ch_depth_one";
-  cfg.pending_queue_size = 1;
+  cfg.qos_profile.depth = 1;
   auto depth_reader = node->CreateReader<Chatter>(cfg).value;
   auto depth_writer = node->CreateWriter<Chatter>("ch_depth_one").value;
   if (!depth_reader || !depth_writer) return 40;

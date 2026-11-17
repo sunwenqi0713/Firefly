@@ -28,9 +28,11 @@ int main() {
   const char* log_path = "callback_contract_stderr.log";
   std::atomic<int> delivered{0};
   {
-    auto cb = [&delivered](const std::shared_ptr<Chatter>&) {
+    auto cb = [&delivered](const firefly::MessageContext&,
+                           const std::shared_ptr<const Chatter>&) {
       ++delivered;
       throw std::runtime_error("boom-from-callback");
+      return firefly::CallbackResult::kOk;
     };
     auto reader = node->CreateReader<Chatter>("cb_throw_ch", cb).value;
     auto writer = node->CreateWriter<Chatter>("cb_throw_ch").value;
@@ -69,7 +71,12 @@ int main() {
   {
     std::atomic<int> cb2{0};
     auto cb_reader = node->CreateReader<Chatter>(
-        "cb_observe_ch", [&cb2](const std::shared_ptr<Chatter>&) { ++cb2; }).value;
+        "cb_observe_ch",
+        [&cb2](const firefly::MessageContext&,
+               const std::shared_ptr<const Chatter>&) {
+          ++cb2;
+          return firefly::CallbackResult::kOk;
+        }).value;
     auto writer = node->CreateWriter<Chatter>("cb_observe_ch").value;
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     for (int i = 1; i <= 3; ++i) {
@@ -86,7 +93,7 @@ int main() {
   {
     firefly::ReaderConfig cfg;
     cfg.channel_name = "observe_only_ch";
-    cfg.pending_queue_size = 5;
+    cfg.qos_profile.depth = 5;
     auto obs_reader = node->CreateReader<Chatter>(cfg, nullptr).value;
     auto writer = node->CreateWriter<Chatter>("observe_only_ch").value;
     std::this_thread::sleep_for(std::chrono::milliseconds(200));

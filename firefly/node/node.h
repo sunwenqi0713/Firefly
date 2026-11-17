@@ -21,11 +21,22 @@ namespace firefly {
 
 class Node;
 
+namespace detail {
+struct InjectionContext;  // 定义于 detail/interfaces.h（注入点，阶段三）
+}
+
 // 创建节点（节点是通信的载体：读写者、服务/客户端都在节点上创建）。
 // 阶段二：返回 Result —— 进程内节点名重复时返回 ErrorCode::kDuplicate。
 // 合法性（空名/非法字符）返回 kInvalidName；成功时 value 非空。
 Result<std::unique_ptr<Node>> CreateNode(const std::string& node_name,
                                          const std::string& name_space = "");
+
+// 阶段三：带注入点的工厂重载。fake 注入发生在 CreateXxx 工厂层；端点仍由
+// 外部 shared_ptr 独立持有（阶段二方案 b），Node 生命周期不控制端点存亡。
+// ctx 为空时所有端点退化为默认 nng 传输 + 默认 Registry，行为完全不变。
+Result<std::unique_ptr<Node>> CreateNode(
+    const std::string& node_name, const std::string& name_space,
+    const std::shared_ptr<detail::InjectionContext>& ctx);
 
 namespace detail {
 
@@ -112,6 +123,9 @@ class Node {
  public:
   friend Result<std::unique_ptr<Node>> CreateNode(const std::string&,
                                                   const std::string&);
+  friend Result<std::unique_ptr<Node>> CreateNode(
+      const std::string&, const std::string&,
+      const std::shared_ptr<detail::InjectionContext>&);
 
   // 定义于 node.cc（实现阶段补充），以保证唯一指针 impl_ 在完整类型处析构
   virtual ~Node();
@@ -178,10 +192,12 @@ class Node {
       const std::string& service_name);
 
  private:
-  Node(const std::string& node_name, const std::string& name_space = "");
+  Node(const std::string& node_name, const std::string& name_space = "",
+       const std::shared_ptr<detail::InjectionContext>& ctx = nullptr);
 
   std::string node_name_;
   std::string name_space_;
+  std::shared_ptr<detail::InjectionContext> ctx_;
 
   std::mutex readers_mutex_;
   std::map<std::string, std::shared_ptr<ReaderBase>> readers_;
@@ -240,7 +256,7 @@ Result<std::shared_ptr<Writer<MessageT>>> Node::CreateWriter(
              "CreateWriter[channel='" + config.channel_name +
                  "']: invalid QoS (depth must be > 0)"};
   }
-  auto writer = std::make_shared<Writer<MessageT>>(config);
+  auto writer = std::make_shared<Writer<MessageT>>(config, ctx_);
   if (!writer->Init()) {
     const ErrorCode ec = writer->InitErrorCode();
     return R{nullptr, ec,
@@ -285,19 +301,13 @@ Result<std::shared_ptr<Reader<MessageT>>> Node::CreateReader(
              "CreateReader[channel='" + config.channel_name +
                  "']: invalid QoS (depth must be > 0)"};
   }
-  if (config.pending_queue_size == 0) {
-    return R{nullptr, ErrorCode::kInvalidConfig,
-             "CreateReader[channel='" + config.channel_name +
-                 "']: invalid QoS (pending_queue_size must be > 0)"};
-  }
-
   std::lock_guard<std::mutex> lg(readers_mutex_);
   if (readers_.find(config.channel_name) != readers_.end()) {
     return R{nullptr, ErrorCode::kDuplicate,
              "CreateReader[channel='" + config.channel_name + "', node='" +
                  node_name_ + "']: a Reader already exists on this channel"};
   }
-  auto reader = std::make_shared<Reader<MessageT>>(config, reader_func);
+  auto reader = std::make_shared<Reader<MessageT>>(config, reader_func, ctx_);
   if (!reader->Init()) {
     const ErrorCode ec = reader->InitErrorCode();
     return R{nullptr, ec,
@@ -346,7 +356,7 @@ Result<std::shared_ptr<Service<Request, Response>>> Node::CreateService(
                  "']: invalid service name"};
   }
   auto service = std::make_shared<Service<Request, Response>>(
-      node_name_, service_name, service_callback);
+      node_name_, service_name, service_callback, ctx_);
   if (!service->Init()) {
     const ErrorCode ec = service->InitErrorCode();
     return R{nullptr, ec,
@@ -386,7 +396,7 @@ Result<std::shared_ptr<Client<Request, Response>>> Node::CreateClient(
                  "']: invalid service name"};
   }
   auto client =
-      std::make_shared<Client<Request, Response>>(node_name_, service_name);
+      std::make_shared<Client<Request, Response>>(node_name_, service_name, ctx_);
   if (!client->Init()) {
     const ErrorCode ec = client->InitErrorCode();
     return R{nullptr, ec,

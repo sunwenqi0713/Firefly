@@ -13,7 +13,11 @@ int main() {
   if (!writer) return 10;
 
   auto reader = node->CreateReader<firefly::test::Chatter>(
-      "channel/chatter", [](const std::shared_ptr<firefly::test::Chatter>&) {}).value;
+      "channel/chatter",
+      [](const firefly::MessageContext&,
+         const std::shared_ptr<const firefly::test::Chatter>&) {
+        return firefly::CallbackResult::kOk;
+      }).value;
   if (!reader) return 11;
 
   std::this_thread::sleep_for(std::chrono::milliseconds(300));  // 绛夎闃呭缓绔?

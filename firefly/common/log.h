@@ -1,64 +1,46 @@
 #ifndef FIREFLY_COMMON_LOG_H_
 #define FIREFLY_COMMON_LOG_H_
 
-#include <cstdarg>
-#include <cstdio>
-#include <ctime>
-#include <mutex>
+// 极简日志设施（阶段三：sink 可替换）。
+// 默认 sink 仍为 fprintf(stderr)，线程安全；用户可调用 SetLogSink 注入自定义
+// sink（例如转发到业务日志系统）。sink 不得回调 Firefly 日志（会自锁）。
+// LogWrite 的协议：调用方给出 tag/file/line/格式化串，实现负责时间戳、格式化
+// 与串行派发；默认输出 [HH:MM:SS] [TAG] file:line | message。
+
+#include <functional>
 
 namespace firefly {
+
+enum class LogLevel { kInfo, kWarn, kError };
+using LogSink = std::function<void(LogLevel level, const char* message)>;
+
+// 注入自定义 sink；传 nullptr 恢复默认 stderr 输出。线程安全（@threadsafe）。
+void SetLogSink(LogSink sink);
+
 namespace internal {
 
-// 极简日志：带时间戳输出到 stderr，线程安全。
-inline void LogWrite(const char* tag, const char* file, int line,
-                     const char* fmt, ...) {
-  static std::mutex g_log_mutex;
-  std::lock_guard<std::mutex> lock(g_log_mutex);
+void LogWrite(const char* tag, const char* file, int line, const char* fmt, ...);
 
-  char ts[32] = {0};
-  std::time_t now = std::time(nullptr);
-  std::tm tm_buf{};
-#if defined(_WIN32)
-  localtime_s(&tm_buf, &now);
-#else
-  localtime_r(&now, &tm_buf);
-#endif
-  std::strftime(ts, sizeof(ts), "%H:%M:%S", &tm_buf);
-
-  char msg[1024] = {0};
-  va_list ap;
-  va_start(ap, fmt);
-  std::vsnprintf(msg, sizeof(msg), fmt, ap);
-  va_end(ap);
-
-  std::fprintf(stderr, "%s [%s] %s:%d | %s\n", ts, tag, file, line, msg);
-  std::fflush(stderr);
-}
-
-}  // namespace internal
-}  // namespace firefly
-
-// 供 nngpp 异常打印的辅助函数
-namespace firefly {
-namespace internal {
+// 供 nngpp 异常打印的辅助函数（保留旧签名）
 inline const char* ErrToString(const char* who, int err) {
   (void)who;
   (void)err;
   return nullptr;
 }
+
 }  // namespace internal
 }  // namespace firefly
 
 #define FY_INFO(fmt, ...)                                    \
-  ::firefly::internal::LogWrite("INFO", __FILE__, __LINE__,\
+  ::firefly::internal::LogWrite("INFO", __FILE__, __LINE__,  \
                                 fmt, ##__VA_ARGS__)
 
-#define FY_WARN(fmt, ...)                                   \
-  ::firefly::internal::LogWrite("WARN", __FILE__, __LINE__, \
+#define FY_WARN(fmt, ...)                                    \
+  ::firefly::internal::LogWrite("WARN", __FILE__, __LINE__,  \
                                 fmt, ##__VA_ARGS__)
 
-#define FY_ERROR(fmt, ...)                                    \
-  ::firefly::internal::LogWrite("ERROR", __FILE__, __LINE__,  \
+#define FY_ERROR(fmt, ...)                                   \
+  ::firefly::internal::LogWrite("ERROR", __FILE__, __LINE__, \
                                 fmt, ##__VA_ARGS__)
 
 #endif  // FIREFLY_COMMON_LOG_H_

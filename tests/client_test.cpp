@@ -44,7 +44,7 @@ int main() {
   if (!client) return 20;
 
   if (!client->WaitForService(kWaitReady)) return 21;  // 限时等待
-  if (!client->WaitForService(std::chrono::seconds(-1))) return 22;  // 无限等待
+  if (!client->WaitForService(std::nullopt)) return 22;  // nullopt=无限等待
   if (!client->ServiceIsReady()) return 23;
   auto quick = client->SendRequest(MakeReq(1, 1), std::chrono::milliseconds(100));
   if (!quick || quick.code != firefly::ErrorCode::kOk) {

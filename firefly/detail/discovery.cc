@@ -1,6 +1,6 @@
-#include "firefly/discovery.h"
+#include "firefly/detail/discovery.h"
 
-#include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -149,7 +149,8 @@ void NotifyLocal(Registry::Impl& impl, const Event& ev) {
 void Broadcast(Registry::Impl& impl, const Event& ev) {
   if (impl.pub_sock_.id == 0) return;
   std::string note = std::string(ev.added ? "A|" : "R|") + KindToString(ev.kind) +
-                     "|" + ev.name + "|" + ev.url;
+                     "|" + ev.name + "|" +
+                     (ev.endpoint ? ev.endpoint->Url() : std::string());
   SendRaw(impl.pub_sock_, note);
 }
 
@@ -167,7 +168,7 @@ std::string Execute(Registry::Impl& impl, const std::string& req) {
     if (!KindFromString(kind, &k)) return "ERR bad kind\n";
     if (name.empty()) return "ERR bad name\n";
 
-    Event ev{k, name, url, cmd == "REG"};
+    Event ev{k, name, MakeEndpointId(url), cmd == "REG"};
     {
       std::lock_guard<std::mutex> lock(impl.data_mutex_);
       auto key = Key(k, name);
@@ -239,7 +240,7 @@ void RunSubLoop(Registry::Impl& impl) {
     std::getline(in, url, '|');
     Kind k;
     if (!KindFromString(kind, &k)) continue;
-    NotifyLocal(impl, Event{k, name, url, tag == "A"});
+    NotifyLocal(impl, Event{k, name, MakeEndpointId(url), tag == "A"});
   }
   FY_INFO("registry: follower loop exit");
 }

@@ -18,17 +18,20 @@
 //   - 业务失败的详细原因无法自动传递（ServiceResult 无 message 字段）；
 //     如需细节，业务方应把错误信息编码进 response。
 //
-// 回调执行模型与并发契约（阶段二：契约基线，签名未改）：
+// 回调执行模型与并发契约（阶段二：契约基线，阶段三保持）：
 //   - ServiceCallback 在 Service 专属的单个工作线程（worker_）内**内联派发**，
-//     不是线程池；同一 Service 内请求严格串行（工作线程逐条处理），不同
-//     Service 各有工作线程、彼此并行。
+//     不是线程池；同一 Service 内请求严格串行，不同 Service 彼此并行。
 //   - 禁止在回调内调用本 Service 的 Shutdown()：Shutdown 会 join worker_，
 //     而回调正运行在该线程上 → 自连接死锁。
 //   - 回调抛出的异常不传播：工作线程捕获 std::exception（附 what()）或
 //     catch(...)，统一映射为 ServiceResult{ErrorCode::kServiceFailed} 并
 //     记录带 service 名的 ERROR 日志，响应帧携带该码回到客户端。
 //   - 回调返回值约束：code==kOk 必须给非空 response，否则框架改判为
-//     kServiceFailed（见 service_impl.h WorkerLoop）。
+//     kServiceFailed（见 service_core.cc）。
+//   - Service::Shutdown() 与全局 Clear() 都会等待在途回调返回。
+//
+// 阶段三（任务 2）：本模板只做 protobuf 序列化 shim，nng 交互全部下沉到
+// detail/service_core.cc；公共头不再包含 detail/*_impl.h 或 nng 头。
 // ===========================================================================
 
 #include <functional>
@@ -36,26 +39,13 @@
 #include <string>
 #include <utility>
 
+#include "firefly/common/log.h"
 #include "firefly/common/types.h"
-#include "firefly/detail/handles.h"
+#include "firefly/detail/endpoint_api.h"
+#include "firefly/message/message_traits.h"
 #include "firefly/service/service_base.h"
 
 namespace firefly {
-
-namespace detail {
-
-// 不透明实现句柄（定义于 detail/handles.h）
-
-template <typename Request, typename Response>
-Result<std::shared_ptr<ServiceHandle>> CreateService(
-    const std::string& node_name, const std::string& service_name,
-    const std::function<ServiceResult<Response>(
-        const std::shared_ptr<const Request>&)>& callback);
-
-template <typename Request, typename Response>
-void ServiceShutdown(ServiceHandle* handle);
-
-}  // namespace detail
 
 /**
  * @brief 服务：接收 Client 的 Request，调用用户回调产出 Response 并返回。
@@ -73,18 +63,56 @@ class Service : public ServiceBase {
       std::function<ServiceResult(const std::shared_ptr<const Request>&)>;
 
   Service(const std::string& node_name, const std::string& service_name,
-          const ServiceCallback& service_callback)
+          const ServiceCallback& service_callback,
+          const std::shared_ptr<detail::InjectionContext>& ctx = nullptr)
       : ServiceBase(service_name),
         node_name_(node_name),
-        service_callback_(service_callback) {}
+        service_callback_(service_callback),
+        ctx_(ctx) {}
   ~Service() override = default;
 
   bool Init() override {
     if (init_) {
       return true;
     }
-    auto r = detail::CreateService<Request, Response>(node_name_, service_name_,
-                                                      service_callback_);
+    detail::OnRequestFunc on_request =
+        [callback = service_callback_](const std::string& req_bytes,
+                                       ErrorCode* code) -> std::string {
+      auto request = std::make_shared<Request>();
+      if (!message::MessageTraits<Request>::Deserialize(req_bytes,
+                                                        request.get())) {
+        *code = ErrorCode::kSerialization;
+        return "";
+      }
+      ServiceResult result;
+      try {
+        result = callback(request);
+      } catch (const std::exception& e) {
+        // 与 service_core.cc 的兜底一致：what() 进日志，业务失败码回客户端。
+        FY_ERROR("service: callback threw: %s", e.what());
+        *code = ErrorCode::kServiceFailed;
+        return "";
+      } catch (...) {
+        FY_ERROR("service: callback threw (non-std exception)");
+        *code = ErrorCode::kServiceFailed;
+        return "";
+      }
+      if (result.code == ErrorCode::kOk && !result.response) {
+        result.code = ErrorCode::kServiceFailed;
+      }
+      std::string payload;
+      if (result.code == ErrorCode::kOk &&
+          !message::MessageTraits<Response>::Serialize(*result.response,
+                                                       &payload)) {
+        *code = ErrorCode::kSerialization;
+        return "";
+      }
+      *code = result.code;
+      return payload;
+    };
+
+    auto r = detail::CreateServiceCore(node_name_, service_name_, on_request,
+                                       ctx_);
     init_code_ = r.code;
     init_message_ = std::move(r.message);
     if (!r) {
@@ -99,18 +127,20 @@ class Service : public ServiceBase {
   ErrorCode InitErrorCode() const noexcept { return init_code_; }
   const std::string& InitErrorMessage() const noexcept { return init_message_; }
 
-  // @post 调用后本 Service 不可再用；工作线程已 join、socket 已关闭、注册已注销。
-  // 再次调用 Shutdown() 无副作用（ServiceImpl::Shutdown 早退）。Service 无对外
-  // 业务方法，客户端在注册中心查不到后 ServiceIsReady/WaitForService 返回 false。
+  // @post 工作线程已 join、socket 已关闭、在途回调已返回、注册已注销。
   void Shutdown() override {
-    detail::ServiceShutdown<Request, Response>(impl_.get());
+    detail::ServiceShutdownCore(impl_.get());
     impl_.reset();
     init_ = false;
   }
 
+  // @threadsafe 累计计数由 core 内原子量维护；queue_depth 对 Service 恒为 0。
+  EndpointStats Stats() const { return detail::ServiceStats(impl_.get()); }
+
  private:
   std::string node_name_;
   ServiceCallback service_callback_;
+  std::shared_ptr<detail::InjectionContext> ctx_;
   std::shared_ptr<detail::ServiceHandle> impl_;
   bool init_ = false;
   ErrorCode init_code_ = ErrorCode::kOk;
@@ -118,7 +148,5 @@ class Service : public ServiceBase {
 };
 
 }  // namespace firefly
-
-#include "firefly/detail/service_impl.h"
 
 #endif  // FIREFLY_SERVICE_SERVICE_H_

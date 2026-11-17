@@ -27,14 +27,14 @@ namespace firefly {
 //        shutdown_，故回调**仍会继续触发**，直到该端点被单独 Shutdown/析构。
 //        Registry 的 REP/SUB 线程例外：其循环检查 IsShutdown()，会退出。
 //        结论：全局 Shutdown() 不是"停止所有通信"，调用方须自行 Shutdown
-//        或析构各端点。TODO(phase3): 全局关停级联关闭所有端点。
+//        或析构各端点。全局关停级联关闭所有端点仍属未来机制，不在本阶段范围。
 // WaitForShutdownFor(timeout)：带期限等待，false=超时仍未关停。
 // Clear()：调用 Registry::Stop() 并置 inited_=false（间接 RequestShutdown）。
-//   - 与在途回调：Registry::Stop() 会 join 注册中心线程，但**不**遍历端点、
-//     **不**等待任何 Reader/Service 回调返回；端点回调可能在 Clear() 返回后
-//     继续触发。这是已知风险：回调若访问已 Clear 的全局资源可能悬空。
-//     TODO(phase3): 端点的集中关停与在途回调等待（本次不实现，属生命周期阶段
-//     的下一步）。
+//   - 与在途回调：Clear() 先停 Registry，再遍历所有存活端点登记的等待点，
+//     阻塞至**调用时刻已在途**的 Reader/Service 回调返回（阶段三已实现）。
+//     边界：全局关停并不关闭端点线程，Clear() 返回后新到达的消息仍可能触发
+//     新回调；调用方若要彻底停止回调，需单独 Shutdown/析构对应端点。
+//     Service 回调等待同样通过等待点登记；Reader::Shutdown() 自身也会等待。
 //   - Clear() 后可再次 Init()：state 机为 inited_/shutdown_ 两原子位，Clear()
 //     将 inited_ 置 false 并 RequestShutdown()；再次 Init() 把 inited_ 置回
 //     true、shutdown_ 置回 false（见 runtime.cc Init）。注册中心为惰性启动，

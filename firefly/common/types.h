@@ -1,9 +1,11 @@
 ﻿#ifndef FIREFLY_COMMON_TYPES_H_
 #define FIREFLY_COMMON_TYPES_H_
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -140,6 +142,47 @@ class FireflyException : public std::runtime_error {
   ErrorCode code_;
 };
 
+// 消息回调上下文（阶段三任务 3）。
+// sequence 是**本 Reader** 收到的序号，从 1 递增；不是全局序，不在进程间
+// 保持单调。receive_time 用 steady_clock，仅用于测量相对耗时。
+// 本阶段不引入 executor 字段：回调仍在执行线程内联派发（见 reader.h）。
+struct MessageContext {
+  std::string channel;
+  std::uint64_t sequence = 0;
+  std::chrono::steady_clock::time_point receive_time{};
+};
+
+// 回调返回值：只区分消费/丢弃，不引入重试/限流语义。
+// kDropped 计入 EndpointStats::dropped（与队列满丢弃合并统计）。
+enum class CallbackResult : int { kOk = 0, kDropped = 1 };
+
+// 写操作结果：单独枚举，不与 ErrorCode 混用（Write 不返回细粒度 code/message）。
+// 精确送达语义见 node/writer.h 文件头。
+enum class WriteStatus {
+  kAccepted,
+  kNoSubscriber,
+  kQueueFull,
+  kSerializationError,
+  kTransportError
+};
+
+// 便于灰度迁移：旧代码 `if (!writer->Write(msg))` 继续可用（kAccepted 视为成功）。
+inline bool operator!(WriteStatus s) noexcept {
+  return s != WriteStatus::kAccepted;
+}
+
+// 端点实时统计（阶段三任务 4）。@threadsafe 由各端点内部锁保护读取。
+// dropped = 发送队列满丢弃 + 回调返回 kDropped；不含序列化/传输错误。
+// queue_depth 是 Observe 队列的**实时积压条数**，不是配置值；
+// Writer/Service/Client 无 Observe 队列，该字段恒为 0。
+// 速率统计（mps 限流）未实现，属 phase4 缺口；本结构只做累计计数。
+struct EndpointStats {
+  std::uint64_t sent = 0;
+  std::uint64_t recv = 0;
+  std::uint64_t dropped = 0;
+  std::uint64_t queue_depth = 0;
+};
+
 // 描述节点/读写者之间的物理关系
 enum Relation : std::uint8_t {
   NO_RELATION = 0,  // 无关系（不同主机）
@@ -151,9 +194,11 @@ enum Relation : std::uint8_t {
 // QoS 策略（参考 DDS/RTPS 语义）
 //
 // 注意：策略名与"本实现实际行为"并不完全一致，逐字段如实标注：
-//   history / depth   : 当前仅 ReaderConfig::pending_queue_size 生效（收端保留样本数）；
-//                       QosProfile::depth 本阶段未参与行为，TODO(phase2) 接入。
-//   mps               : 声明每秒最大样本数，但本阶段无限流/背压实现，不生效。
+//   history / depth   : 阶段三起以 QosProfile::depth 为唯一生效值：Reader 的
+//                       Observe 队列保留最近 depth 条（超出丢弃最旧）。
+//                       ReaderConfig::pending_queue_size 已删除，避免双重定义。
+//   mps               : 声明每秒最大样本数，但本阶段无限流/背压实现；
+//                       EndpointStats 仅提供累计计数，速率统计为 phase4 缺口。
 //   reliability       : kBestEffort 是当前 nng PUB/SUB 的实际行为（at-most-once）；
 //                       kReliable 本阶段不提供 ack/重传，行为与 kBestEffort 相同。
 //                       TODO(phase2): 传输层可靠性增强。
@@ -167,7 +212,7 @@ enum class QosDurabilityPolicy : std::uint8_t { kVolatile, kTransientLocal };
 // 通道 QoS 配置（字段实际生效情况见上方注释）
 struct QosProfile {
   QosHistoryPolicy history = QosHistoryPolicy::kKeepLast;
-  std::uint32_t depth = 1;    // KEEP_LAST 保留样本数；本阶段未生效，见上方注释
+  std::uint32_t depth = 1;    // KEEP_LAST 保留样本数；Reader Observe 队列生效值
   std::uint32_t mps = 0;      // 每秒最大样本数，0 不限；本阶段无限流实现
   QosReliabilityPolicy reliability = QosReliabilityPolicy::kReliable;
   QosDurabilityPolicy durability = QosDurabilityPolicy::kVolatile;

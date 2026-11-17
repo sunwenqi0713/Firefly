@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <string>
 
+#include "firefly/common/types.h"
+
 namespace firefly {
 
 /**
@@ -29,8 +31,9 @@ class ReaderBase {
   virtual bool HasReceived() const = 0;
   // 距最近一次收到消息的时间间隔（秒），未收到过返回 -1
   virtual double GetDelaySec() const = 0;
-  // 缓存队列深度配置
-  virtual std::uint32_t PendingQueueSize() const = 0;
+  // 实时积压统计由 Stats().queue_depth 提供（阶段三：删除假 getter
+  // PendingQueueSize，原实现返回配置值而非实际队列长度）。
+  virtual EndpointStats Stats() const = 0;
 
   // 是否有 Writer 在发布本订阅通道
   virtual bool HasWriter() { return false; }
