@@ -19,8 +19,16 @@ bool OK() { return runtime::ShutdownManager::instance().OK(); }
 
 bool IsShutdown() { return runtime::ShutdownManager::instance().IsShutdown(); }
 
+void Shutdown() {
+  runtime::ShutdownManager::instance().RequestShutdown();
+}
+
 void WaitForShutdown() {
   runtime::ShutdownManager::instance().WaitForShutdown();
+}
+
+bool WaitForShutdownFor(std::chrono::milliseconds timeout) {
+  return runtime::ShutdownManager::instance().WaitForShutdownFor(timeout);
 }
 
 void Clear() {

@@ -47,7 +47,11 @@ inline bool DecodeResponse(const std::string& frame, ErrorCode* code,
   }
   std::uint32_t status = 0;
   std::memcpy(&status, frame.data() + 4, sizeof(status));
-  if (status > static_cast<std::uint32_t>(ErrorCode::kTransport)) {
+  // 应答帧 status 的合法上界固定为 kTransport（ErrorCode 枚举序中的位置）。
+  // kCancelled 是本地取消码、不进协议帧，故不随其加入而放宽上界。
+  constexpr std::uint32_t kMaxWireStatus =
+      static_cast<std::uint32_t>(ErrorCode::kTransport);
+  if (status > kMaxWireStatus) {
     return false;
   }
   *code = static_cast<ErrorCode>(status);

@@ -101,6 +101,27 @@ add_executable(firefly_deprecated_compat_test tests/deprecated_compat_test.cpp)
 target_link_libraries(firefly_deprecated_compat_test PRIVATE firefly test_messages)
 add_test(NAME deprecated_compat_test COMMAND firefly_deprecated_compat_test)
 
+# 阶段二验收：关停 / 取消 / 查重 / 端点生命周期 / 回调契约
+add_executable(firefly_shutdown_test tests/shutdown_test.cpp)
+target_link_libraries(firefly_shutdown_test PRIVATE firefly test_messages)
+add_test(NAME shutdown_test COMMAND firefly_shutdown_test)
+
+add_executable(firefly_request_cancel_test tests/request_cancel_test.cpp)
+target_link_libraries(firefly_request_cancel_test PRIVATE firefly test_messages)
+add_test(NAME request_cancel_test COMMAND firefly_request_cancel_test)
+
+add_executable(firefly_duplicate_test tests/duplicate_test.cpp)
+target_link_libraries(firefly_duplicate_test PRIVATE firefly test_messages)
+add_test(NAME duplicate_test COMMAND firefly_duplicate_test)
+
+add_executable(firefly_endpoint_lifecycle_test tests/endpoint_lifecycle_test.cpp)
+target_link_libraries(firefly_endpoint_lifecycle_test PRIVATE firefly test_messages)
+add_test(NAME endpoint_lifecycle_test COMMAND firefly_endpoint_lifecycle_test)
+
+add_executable(firefly_callback_contract_test tests/callback_contract_test.cpp)
+target_link_libraries(firefly_callback_contract_test PRIVATE firefly test_messages)
+add_test(NAME callback_contract_test COMMAND firefly_callback_contract_test)
+
 # ---------------- 使用示例 ----------------
 
 # 发布 / 订阅示例：回调 + Observe 两种订阅模式

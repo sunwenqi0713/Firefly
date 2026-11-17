@@ -25,6 +25,14 @@ struct Event {
 // 轻量注册中心客户端（进程单例）。
 // - 第一个成功 bind 的进程为主注册中心（REP 服务端 + PUB 广播）；
 // - 其余进程为从实例（REQ 查询/注册 + SUB 接收广播）。
+//
+// 线程安全契约（阶段二，按实现现状标注，未新增锁）：
+//   - Start/Stop 由 start_mutex_ 保护；Register/Unregister/List/Has 经
+//     data_mutex_（主）或 req_mutex_（从）串行化；Subscribe/Unsubscribe
+//     由 sub_mutex_ 保护。上述公共方法均可从多线程并发调用（@threadsafe）。
+//   - 订阅回调在 sub_mutex_ 持有期间派发（NotifyLocal）。契约：禁止在订阅
+//     回调内调用 Subscribe/Unsubscribe/Stop —— 会自锁死锁。派发回调不得抛出，
+//     否则异常穿透到注册中心的 REP/广播线程。
 // 实现见 discovery.cc（基于 NNG）。
 class Registry {
  public:

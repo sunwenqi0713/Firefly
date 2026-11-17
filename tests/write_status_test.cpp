@@ -11,7 +11,7 @@ using firefly::test::Chatter;
 
 int main() {
   firefly::Init("write_status_test");
-  auto node = firefly::CreateNode("write_status_node");
+  auto node = firefly::CreateNode("write_status_node").value;
   if (!node) return 1;
 
   Chatter msg;

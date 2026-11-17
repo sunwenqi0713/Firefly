@@ -17,7 +17,18 @@
 // 已知约束（本阶段如实记录，不在范围内修复）：
 //   - 业务失败的详细原因无法自动传递（ServiceResult 无 message 字段）；
 //     如需细节，业务方应把错误信息编码进 response。
-//   - 回调执行线程与并发模型见后续阶段契约；当前回调在服务端工作线程执行。
+//
+// 回调执行模型与并发契约（阶段二：契约基线，签名未改）：
+//   - ServiceCallback 在 Service 专属的单个工作线程（worker_）内**内联派发**，
+//     不是线程池；同一 Service 内请求严格串行（工作线程逐条处理），不同
+//     Service 各有工作线程、彼此并行。
+//   - 禁止在回调内调用本 Service 的 Shutdown()：Shutdown 会 join worker_，
+//     而回调正运行在该线程上 → 自连接死锁。
+//   - 回调抛出的异常不传播：工作线程捕获 std::exception（附 what()）或
+//     catch(...)，统一映射为 ServiceResult{ErrorCode::kServiceFailed} 并
+//     记录带 service 名的 ERROR 日志，响应帧携带该码回到客户端。
+//   - 回调返回值约束：code==kOk 必须给非空 response，否则框架改判为
+//     kServiceFailed（见 service_impl.h WorkerLoop）。
 // ===========================================================================
 
 #include <functional>
@@ -88,6 +99,9 @@ class Service : public ServiceBase {
   ErrorCode InitErrorCode() const noexcept { return init_code_; }
   const std::string& InitErrorMessage() const noexcept { return init_message_; }
 
+  // @post 调用后本 Service 不可再用；工作线程已 join、socket 已关闭、注册已注销。
+  // 再次调用 Shutdown() 无副作用（ServiceImpl::Shutdown 早退）。Service 无对外
+  // 业务方法，客户端在注册中心查不到后 ServiceIsReady/WaitForService 返回 false。
   void Shutdown() override {
     detail::ServiceShutdown<Request, Response>(impl_.get());
     impl_.reset();

@@ -18,13 +18,13 @@ static int Check(bool cond, int line) {
 int main() {
   // kNotReady：Init 之前调用 Create 必须失败且带诊断信息
   {
-    auto node = firefly::CreateNode("pre_init_node");
+    auto node = firefly::CreateNode("pre_init_node").value;
     auto r = node->CreateWriter<Chatter>("ch_not_ready");
     if (int e = Check(!r && r.code == ErrorCode::kNotReady && !r.message.empty(), 10)) return e;
   }
 
   firefly::Init("error_code_test");
-  auto node = firefly::CreateNode("error_code_node");
+  auto node = firefly::CreateNode("error_code_node").value;
   if (!node) return 20;
 
   // kOk
@@ -99,6 +99,13 @@ int main() {
   firefly::Result<int> tm{0, ErrorCode::kTypeMismatch, "GetReader: type mismatch"};
   if (int e = Check(!tm && std::string(firefly::ErrorCodeToString(tm.code)) ==
                                 "kTypeMismatch", 140)) return e;
+
+  // kCancelled（阶段二）：真实触发路径见 request_cancel_test.cpp；此处验证码值
+  // 与可读名已被纳入公共契约（ErrorCode 新增后 rpc_frame.h 的 status 上界不变）。
+  firefly::Result<int> cc{0, ErrorCode::kCancelled,
+                          "AsyncSendRequest[service='s']: cancelled"};
+  if (int e = Check(!cc && std::string(firefly::ErrorCodeToString(cc.code)) ==
+                                "kCancelled", 150)) return e;
 
   firefly::Clear();
   return 0;

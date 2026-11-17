@@ -19,7 +19,7 @@ int main() {
   (void)old_rc;
 
   firefly::Init("deprecated_compat_test");
-  auto node = firefly::CreateNode("compat_node");
+  auto node = firefly::CreateNode("compat_node").value;
 
   // 旧写法：用 == nullptr / != nullptr 判断 Create 结果
   auto writer_r = node->CreateWriter<Chatter>("ch_compat");

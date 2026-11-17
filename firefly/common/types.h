@@ -37,7 +37,8 @@ enum class ErrorCode {
   kServiceNotFound,    // 服务端不存在（注册中心无该服务）
   kServiceFailed,      // 服务端业务失败（与前两者严格区分）
   kNotReady,           // Init 未调用 / 端点已 Shutdown
-  kTransport           // nng 层错误，底层码写入 Result::message
+  kTransport,          // nng 层错误，底层码写入 Result::message
+  kCancelled           // 请求被显式 Cancel（阶段二：RequestHandle::Cancel）
 };
 
 // ErrorCode 可读名，供 Result::message 与 FireflyException 拼装定位线索。
@@ -56,6 +57,7 @@ inline const char* ErrorCodeToString(ErrorCode code) noexcept {
     case ErrorCode::kServiceFailed:   return "kServiceFailed";
     case ErrorCode::kNotReady:        return "kNotReady";
     case ErrorCode::kTransport:       return "kTransport";
+    case ErrorCode::kCancelled:       return "kCancelled";
   }
   return "kUnknown";
 }
@@ -85,6 +87,20 @@ struct Result {
   // 源码级灰度：旧写法 `if (create_result == nullptr)` 仍可编译（仅比较 code）。
   // 注意：二进制 ABI 不兼容（返回类型由 shared_ptr 改为 Result），故同时提供
   // 源码兼容与返回码兼容，真正二进制灰度需靠版本号/独立 soname，见交付说明。
+  [[deprecated("compare Result via operator bool: if (!r)")]]
+  bool operator==(std::nullptr_t) const noexcept { return code != ErrorCode::kOk; }
+  [[deprecated("compare Result via operator bool: if (r)")]]
+  bool operator!=(std::nullptr_t) const noexcept { return code == ErrorCode::kOk; }
+};
+
+// void 特化：用于无返回值的操作（如 DeleteXxx）。只保留 code/message 与 bool 判定。
+template <>
+struct Result<void> {
+  ErrorCode code = ErrorCode::kOk;
+  std::string message;
+
+  explicit operator bool() const noexcept { return code == ErrorCode::kOk; }
+
   [[deprecated("compare Result via operator bool: if (!r)")]]
   bool operator==(std::nullptr_t) const noexcept { return code != ErrorCode::kOk; }
   [[deprecated("compare Result via operator bool: if (r)")]]

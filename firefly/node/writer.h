@@ -104,11 +104,17 @@ class Writer : public WriterBase {
   ErrorCode InitErrorCode() const noexcept { return init_code_; }
   const std::string& InitErrorMessage() const noexcept { return init_message_; }
 
+  // @post 调用后本 Writer 不可再用；后续 Write 返回 kTransportError
+  // （WriteStatus 无 kNotReady 码，按阶段一契约折叠为传输错误）、HasReader 返回 false。
+  // 非幂等副作用：impl_ 被 reset；如需重建请由 Node::CreateWriter 新建。
   void Shutdown() override {
     impl_.reset();
     init_ = false;
   }
 
+  // @threadsafe 多个调用方可并发 Write：底层 nng_send 与注册中心 Has 查询
+  // 均无共享可变状态竞争（无锁但只读 config_/sock_）。契约：不得与同一
+  // Writer 的 Shutdown() 并发（Shutdown reset impl_，存在生命周期竞态）。
   /** @brief 发布一条消息（值语义，内部拷贝为 shared_ptr） */
   WriteStatus Write(const MessageT& msg) {
     auto msg_ptr = std::make_shared<MessageT>(msg);

@@ -80,6 +80,26 @@ void ShutdownManager::WaitForShutdown() {
   cv_.wait(lock, [this] { return shutdown_.load(); });
 }
 
+bool ShutdownManager::WaitForShutdownFor(std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(cv_mutex_);
+  return cv_.wait_for(lock, timeout, [this] { return shutdown_.load(); });
+}
+
+bool ShutdownManager::RegisterNode(const std::string& node_name) {
+  std::lock_guard<std::mutex> lock(node_names_mutex_);
+  return node_names_.insert(node_name).second;
+}
+
+void ShutdownManager::UnregisterNode(const std::string& node_name) {
+  std::lock_guard<std::mutex> lock(node_names_mutex_);
+  node_names_.erase(node_name);
+}
+
+bool ShutdownManager::HasNode(const std::string& node_name) const {
+  std::lock_guard<std::mutex> lock(node_names_mutex_);
+  return node_names_.count(node_name) != 0;
+}
+
 void ShutdownManager::Clear() {
   if (!inited_.exchange(false)) {
     return;

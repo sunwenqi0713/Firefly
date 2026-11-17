@@ -24,7 +24,7 @@ static std::shared_ptr<CalcRequest> Req(long long a, long long b) {
 
 int main() {
   firefly::Init("rpc_error_test");
-  auto node = firefly::CreateNode("rpc_error_node");
+  auto node = firefly::CreateNode("rpc_error_node").value;
   if (!node) return 1;
 
   // 服务端：a==1 模拟慢处理（触发客户端 timeout）；a==2 返回业务失败
@@ -90,7 +90,7 @@ int main() {
   auto fut = ghost->AsyncSendRequest(Req(1, 1));
   bool threw = false;
   try {
-    (void)fut.get();
+    (void)fut.future.get();
   } catch (const firefly::FireflyException& e) {
     threw = e.code() == ErrorCode::kServiceNotFound && std::string(e.what()).find("ghost_svc") != std::string::npos;
   }

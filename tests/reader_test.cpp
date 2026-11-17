@@ -22,7 +22,7 @@ void SleepMs(int ms) {
 
 int main() {
   firefly::Init("reader_test");
-  auto node = firefly::CreateNode("reader_test_node");
+  auto node = firefly::CreateNode("reader_test_node").value;
 
   // ---------- 回调模式 ----------
   std::atomic<int> cb_count{0};

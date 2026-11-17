@@ -21,7 +21,7 @@ using firefly::test::CalcResponse;
 
 int main() {
   firefly::Init("rpc_calculator_example");
-  auto node = firefly::CreateNode("calc_node");
+  auto node = firefly::CreateNode("calc_node").value;
 
   // ---- 服务：计算 a + b ----
   auto service = node->CreateService<CalcRequest, CalcResponse>(
@@ -61,7 +61,7 @@ int main() {
 
   // ---- 异步请求：future 等待 ----
   auto fut = client->AsyncSendRequest(req);
-  auto async_resp = fut.get();
+  auto async_resp = fut.future.get();
   if (async_resp == nullptr) return 15;
   std::printf("async 10 + 32 = %lld\n",
               static_cast<long long>(async_resp->sum()));

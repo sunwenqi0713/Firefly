@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -20,9 +21,11 @@ namespace firefly {
 
 class Node;
 
-// 创建节点（节点是通信的载体：读写者、服务/客户端都在节点上创建）
-std::unique_ptr<Node> CreateNode(const std::string& node_name,
-                                 const std::string& name_space = "");
+// 创建节点（节点是通信的载体：读写者、服务/客户端都在节点上创建）。
+// 阶段二：返回 Result —— 进程内节点名重复时返回 ErrorCode::kDuplicate。
+// 合法性（空名/非法字符）返回 kInvalidName；成功时 value 非空。
+Result<std::unique_ptr<Node>> CreateNode(const std::string& node_name,
+                                         const std::string& name_space = "");
 
 namespace detail {
 
@@ -60,6 +63,11 @@ inline ErrorCode ValidateServiceName(const std::string& name) {
   return IsLegalEndpointName(name) ? ErrorCode::kOk : ErrorCode::kInvalidName;
 }
 
+// 节点名校验：阶段二 CreateNode 进程内查重前置校验（与服务名同一套合法性）
+inline ErrorCode ValidateNodeName(const std::string& name) {
+  return IsLegalEndpointName(name) ? ErrorCode::kOk : ErrorCode::kInvalidName;
+}
+
 inline ErrorCode ValidateQos(const QosProfile& qos) {
   if (qos.depth == 0) {
     return ErrorCode::kInvalidConfig;  // depth==0 无意义，fail-fast
@@ -82,9 +90,18 @@ inline std::string CreateFailMessage(const char* op, const std::string& key,
  * @class Node
  * @brief 通信的基本单元。一个模块通过 Node 定义读写者与/或服务客户端。
  *
- * 名称唯一性契约（本阶段实际行为）：仅 Reader 执行"同节点同通道唯一"检查，
- * 冲突返回 kDuplicate；Writer/Service/Client 不查重（阶段一 out-of-scope），
- * 不会因重名返回错误。
+ * 名称唯一性契约（阶段二起，精确描述每类对象的查重范围）：
+ *   - Node      ：进程内唯一（复用 ShutdownManager 注册表），重复返回 kDuplicate；
+ *                 节点析构时释放名字。不同进程间同名节点互不冲突。
+ *   - Reader    ：单 Node 内同一通道唯一，重复返回 kDuplicate（阶段一已有）。
+ *   - Writer    ：单 Node 内同一通道唯一（按 channel_name），重复返回 kDuplicate。
+ *   - Service   ：单 Node 内服务名唯一，重复返回 kDuplicate。
+ *   - Client    ：单 Node 内同一服务名唯一，重复返回 kDuplicate。
+ *   跨进程同名：发现协议不处理名字冲突；不同进程的 Writer/Service 可以同名
+ *   静默共存（订阅方/客户端会看到多个端点，选择其中一个连接）。这是已知缺口，
+ *   需要发现协议扩展才能拦截，本阶段不修。
+ *   "单 Node 内查重"仅比较仍存活（weak_ptr 未过期）的端点；端点被外部释放或
+ *   DeleteXxx 后名字可回收再建。
  *
  * 四个 Create 工厂统一返回 Result：
  *   - 成功：r.value 非空，r.code == kOk；
@@ -93,7 +110,8 @@ inline std::string CreateFailMessage(const char* op, const std::string& key,
  */
 class Node {
  public:
-  friend std::unique_ptr<Node> CreateNode(const std::string&, const std::string&);
+  friend Result<std::unique_ptr<Node>> CreateNode(const std::string&,
+                                                  const std::string&);
 
   // 定义于 node.cc（实现阶段补充），以保证唯一指针 impl_ 在完整类型处析构
   virtual ~Node();
@@ -125,14 +143,23 @@ class Node {
       const ReaderConfig& config,
       const CallbackFunc<MessageT>& reader_func = nullptr);
 
-  // 删除订阅者（同一节点重复删除会失败）
+  // 删除订阅者（不存在返回 false）
   bool DeleteReader(const std::string& channel_name);
+
+  // 删除发布者 / 服务 / 客户端（阶段二，返回 Result<void>）：
+  //   成功 → kOk 并对该端点调用 Shutdown；不存在（或外部已释放）→ kNotReady。
+  // 删除后 Node 不再持有该名字；同名可重新创建。
+  Result<void> DeleteWriter(const std::string& channel_name);
+  Result<void> DeleteService(const std::string& service_name);
+  Result<void> DeleteClient(const std::string& service_name);
 
   // 获取已创建的 Reader，不存在或类型不符返回 nullptr
   template <typename MessageT>
   std::shared_ptr<Reader<MessageT>> GetReader(const std::string& channel_name);
 
   // 把节点下所有 Reader 的新消息拉取到已观察缓存
+  // @threadsafe readers_ 由 readers_mutex_ 保护；逐个调用 Reader::Observe()
+  // （收线程内已由 queue_mutex_ 保护），可并发调用。
   void Observe();
   // 清空节点下所有 Reader 的缓存数据
   void ClearData();
@@ -159,6 +186,15 @@ class Node {
   std::mutex readers_mutex_;
   std::map<std::string, std::shared_ptr<ReaderBase>> readers_;
 
+  // 阶段二：Writer/Service/Client 的弱引用注册表，仅用于单 Node 查重与
+  // DeleteXxx 定位。弱引用不改变"端点由外部 shared_ptr 持有、独立存活"的
+  // 所有权现状；析构时如需关闭端点遵循下面的 Node 契约。
+  // key 编码为 "W:"+channel / "S:"+service / "C:"+service（类型隔离命名空间）。
+  mutable std::mutex endpoints_mutex_;
+  std::map<std::string, std::weak_ptr<WriterBase>> writers_;
+  std::map<std::string, std::weak_ptr<ServiceBase>> services_;
+  std::map<std::string, std::weak_ptr<ClientBase>> clients_;
+
   // 内部实现（拓扑注册、服务发现等），实现阶段补充
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -176,6 +212,16 @@ template <typename MessageT>
 Result<std::shared_ptr<Writer<MessageT>>> Node::CreateWriter(
     const ChannelConfig& config) {
   using R = Result<std::shared_ptr<Writer<MessageT>>>;
+  const std::string key = "W:" + config.channel_name;
+  {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    auto it = writers_.find(key);
+    if (it != writers_.end() && !it->second.expired()) {
+      return R{nullptr, ErrorCode::kDuplicate,
+               "CreateWriter[channel='" + config.channel_name + "', node='" +
+                   node_name_ + "']: a Writer already exists on this channel"};
+    }
+  }
   if (!OK()) {
     return R{nullptr, ErrorCode::kNotReady,
              "CreateWriter: firefly::Init() has not been called (or Clear() "
@@ -200,6 +246,10 @@ Result<std::shared_ptr<Writer<MessageT>>> Node::CreateWriter(
     return R{nullptr, ec,
              detail::CreateFailMessage("CreateWriter", config.channel_name, ec,
                                        writer->InitErrorMessage())};
+  }
+  {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    writers_[key] = writer;
   }
   return R{writer, ErrorCode::kOk, ""};
 }
@@ -274,6 +324,16 @@ Result<std::shared_ptr<Service<Request, Response>>> Node::CreateService(
     const std::string& service_name,
     const typename Service<Request, Response>::ServiceCallback& service_callback) {
   using R = Result<std::shared_ptr<Service<Request, Response>>>;
+  const std::string key = "S:" + service_name;
+  {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    auto it = services_.find(key);
+    if (it != services_.end() && !it->second.expired()) {
+      return R{nullptr, ErrorCode::kDuplicate,
+               "CreateService[service='" + service_name + "', node='" +
+                   node_name_ + "']: a Service already exists with this name"};
+    }
+  }
   if (!OK()) {
     return R{nullptr, ErrorCode::kNotReady,
              "CreateService: firefly::Init() has not been called (or Clear() "
@@ -293,6 +353,10 @@ Result<std::shared_ptr<Service<Request, Response>>> Node::CreateService(
              detail::CreateFailMessage("CreateService", service_name, ec,
                                        service->InitErrorMessage())};
   }
+  {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    services_[key] = service;
+  }
   return R{service, ErrorCode::kOk, ""};
 }
 
@@ -300,6 +364,16 @@ template <typename Request, typename Response>
 Result<std::shared_ptr<Client<Request, Response>>> Node::CreateClient(
     const std::string& service_name) {
   using R = Result<std::shared_ptr<Client<Request, Response>>>;
+  const std::string key = "C:" + service_name;
+  {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    auto it = clients_.find(key);
+    if (it != clients_.end() && !it->second.expired()) {
+      return R{nullptr, ErrorCode::kDuplicate,
+               "CreateClient[service='" + service_name + "', node='" +
+                   node_name_ + "']: a Client already exists for this service"};
+    }
+  }
   if (!OK()) {
     return R{nullptr, ErrorCode::kNotReady,
              "CreateClient: firefly::Init() has not been called (or Clear() "
@@ -319,7 +393,63 @@ Result<std::shared_ptr<Client<Request, Response>>> Node::CreateClient(
              detail::CreateFailMessage("CreateClient", service_name, ec,
                                        client->InitErrorMessage())};
   }
+  {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    clients_[key] = client;
+  }
   return R{client, ErrorCode::kOk, ""};
+}
+
+// DeleteXxx 实现（按名字定位弱引用，成功后 Shutdown 并移除表项）
+inline Result<void> Node::DeleteService(const std::string& service_name) {
+  const std::string key = "S:" + service_name;
+  std::shared_ptr<ServiceBase> sp;
+  {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    auto it = services_.find(key);
+    if (it == services_.end()) {
+      return {ErrorCode::kNotReady,
+              "DeleteService[service='" + service_name + "']: not found"};
+    }
+    sp = it->second.lock();
+    services_.erase(it);
+  }
+  if (sp) sp->Shutdown();
+  return {ErrorCode::kOk, ""};
+}
+
+inline Result<void> Node::DeleteClient(const std::string& service_name) {
+  const std::string key = "C:" + service_name;
+  std::shared_ptr<ClientBase> sp;
+  {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    auto it = clients_.find(key);
+    if (it == clients_.end()) {
+      return {ErrorCode::kNotReady,
+              "DeleteClient[service='" + service_name + "']: not found"};
+    }
+    sp = it->second.lock();
+    clients_.erase(it);
+  }
+  if (sp) sp->Shutdown();
+  return {ErrorCode::kOk, ""};
+}
+
+inline Result<void> Node::DeleteWriter(const std::string& channel_name) {
+  const std::string key = "W:" + channel_name;
+  std::shared_ptr<WriterBase> sp;
+  {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    auto it = writers_.find(key);
+    if (it == writers_.end()) {
+      return {ErrorCode::kNotReady,
+              "DeleteWriter[channel='" + channel_name + "']: not found"};
+    }
+    sp = it->second.lock();
+    writers_.erase(it);
+  }
+  if (sp) sp->Shutdown();
+  return {ErrorCode::kOk, ""};
 }
 
 }  // namespace firefly

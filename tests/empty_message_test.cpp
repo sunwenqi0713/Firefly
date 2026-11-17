@@ -23,7 +23,7 @@ int main() {
   if (decoded.seq() != 0 || !decoded.content().empty()) return 4;
 
   firefly::Init("empty_message_test");
-  auto node = firefly::CreateNode("empty_message_node");
+  auto node = firefly::CreateNode("empty_message_node").value;
   if (!node) return 10;
 
   auto writer = node->CreateWriter<Chatter>("ch_empty").value;

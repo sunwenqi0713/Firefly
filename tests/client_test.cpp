@@ -26,7 +26,7 @@ std::shared_ptr<CalcRequest> MakeReq(long long a, long long b) {
 
 int main() {
   firefly::Init("client_test");
-  auto node = firefly::CreateNode("client_test_node");
+  auto node = firefly::CreateNode("client_test_node").value;
 
   // ---------- 服务端 ----------
   auto service = node->CreateService<CalcRequest, CalcResponse>(
@@ -63,7 +63,7 @@ int main() {
 
   // ---------- 异步请求 ----------
   auto fut = client->AsyncSendRequest(MakeReq(7, 8));
-  auto async_resp = fut.get();
+  auto async_resp = fut.future.get();
   if (async_resp == nullptr || async_resp->sum() != 15) return 40;
 
   // ---------- 异步请求 + 回调 ----------
@@ -90,9 +90,13 @@ int main() {
   // ---------- 服务 Shutdown 后不可用 ----------
   service->Shutdown();
   if (client->WaitForService(std::chrono::milliseconds(300))) return 70;
-  if (!node->CreateClient<CalcRequest, CalcResponse>("calc")) {
-    return 71;
-  }
+  // 阶段二：同名 Client 在单 Node 内查重，重复创建返回 kDuplicate；
+  // DeleteClient 回收名字后可重建（新契约，见 duplicate/endpoint_lifecycle 测试）。
+  auto dup_client = node->CreateClient<CalcRequest, CalcResponse>("calc");
+  if (dup_client || dup_client.code != firefly::ErrorCode::kDuplicate) return 71;
+  if (!node->DeleteClient("calc")) return 72;
+  auto recreated = node->CreateClient<CalcRequest, CalcResponse>("calc");
+  if (!recreated) return 73;
 
   firefly::Clear();
   return 0;

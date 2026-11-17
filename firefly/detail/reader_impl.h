@@ -151,8 +151,14 @@ struct ReaderImpl : public ReaderHandle {
       if (callback) {
         try {
           callback(msg);
+        } catch (const std::exception& e) {
+          // 修正①（阶段二）：异常不再静默折叠为固定串，记录 what() 与 channel。
+          // 仍不向调用方传播——回调在收线程内联派发，传播会杀死收线程。
+          FY_ERROR("reader[%s]: callback threw: %s",
+                   config.channel_name.c_str(), e.what());
         } catch (...) {
-          FY_ERROR("reader[%s]: callback threw", config.channel_name.c_str());
+          FY_ERROR("reader[%s]: callback threw (non-std exception)",
+                   config.channel_name.c_str());
         }
         continue;  // 回调模式不缓存
       }

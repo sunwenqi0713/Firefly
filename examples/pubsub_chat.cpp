@@ -25,8 +25,8 @@ static void SleepMs(int ms) {
 
 int main() {
   firefly::Init("pubsub_chat_example");
-  auto pub_node = firefly::CreateNode("publisher");
-  auto sub_node = firefly::CreateNode("subscriber");
+  auto pub_node = firefly::CreateNode("publisher").value;
+  auto sub_node = firefly::CreateNode("subscriber").value;
 
   // ---- 回调模式订阅 ----
   std::atomic<int> cb_count{0};
@@ -42,7 +42,7 @@ int main() {
 
   // ---- Observe 模式订阅（缓存 3 条）----
   // 同一节点不允许对同一通道重复订阅，故使用第二个订阅者节点。
-  auto sub_node2 = firefly::CreateNode("subscriber2");
+  auto sub_node2 = firefly::CreateNode("subscriber2").value;
   firefly::ReaderConfig obs_cfg;
   obs_cfg.channel_name = "channel/chat";
   obs_cfg.pending_queue_size = 3;

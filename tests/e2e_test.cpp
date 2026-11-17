@@ -1,4 +1,4 @@
-﻿// 绔埌绔祴璇?鍚屼竴杩涚▼鍐?Writer/Reader 鍏ㄩ摼璺?+ Service/Client銆?// 鍏变韩鍚屼竴涓敞鍐屼富瀹炰緥锛岄獙璇?PUB/SUB 涓?REQ/REP 鏀跺彂銆?#include <chrono>
+// 绔埌绔祴璇?鍚屼竴杩涚▼鍐?Writer/Reader 鍏ㄩ摼璺?+ Service/Client銆?// 鍏变韩鍚屼竴涓敞鍐屼富瀹炰緥锛岄獙璇?PUB/SUB 涓?REQ/REP 鏀跺彂銆?#include <chrono>
 #include <thread>
 
 #include "firefly/firefly.h"
@@ -6,7 +6,7 @@
 
 int main() {
   firefly::Init("firefly_e2e_test");
-  auto node = firefly::CreateNode("test_node");
+  auto node = firefly::CreateNode("test_node").value;
 
   // ---------- 鍙戝竷 / 璁㈤槄 ----------
   auto writer = node->CreateWriter<firefly::test::Chatter>("channel/chatter").value;
@@ -50,7 +50,7 @@ int main() {
 
   // 寮傛璇锋眰
   auto fut = client->AsyncSendRequest(req);
-  if (fut.get() == nullptr || fut.get()->sum() != 42) return 18;
+  if (fut.future.get() == nullptr || fut.future.get()->sum() != 42) return 18;
 
   firefly::Clear();
   return 0;
