@@ -159,6 +159,25 @@ add_executable(firefly_message_traits_test tests/message_traits_test.cpp)
 target_link_libraries(firefly_message_traits_test PRIVATE firefly test_messages)
 add_test(NAME message_traits_test COMMAND firefly_message_traits_test)
 
+# 审查回归：7 项缺陷的公开 API 复现测试
+add_executable(firefly_review_regression_test tests/review_regression_test.cpp)
+target_link_libraries(firefly_review_regression_test PRIVATE firefly test_messages)
+add_test(NAME review_regression_test COMMAND firefly_review_regression_test)
+
+# ---------------------------------------------------------------------------
+# 端口隔离（审查验证结果）：发现中心使用固定端口 37221/37222，多个测试进程
+# 并行启动时会争抢主/从角色，导致注册请求超时（discovery_test/clear_wait_test
+# 等在 -j N 下随机失败）。用 CTest RESOURCE_LOCK 让所有依赖注册中心的测试
+# 串行执行；纯脚本/纯描述测试无需加锁。
+# ---------------------------------------------------------------------------
+set_tests_properties(
+    discovery_test e2e_test reader_test client_test
+    error_code_test write_status_test rpc_error_test empty_message_test
+    deprecated_compat_test shutdown_test request_cancel_test duplicate_test
+    endpoint_lifecycle_test callback_contract_test callback_context_test
+    stats_test fake_transport_test clear_wait_test review_regression_test
+    PROPERTIES RESOURCE_LOCK firefly_registry_port)
+
 # ---------------- 使用示例 ----------------
 
 # 发布 / 订阅示例：回调 + Observe 两种订阅模式

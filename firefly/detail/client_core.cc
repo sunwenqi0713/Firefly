@@ -75,18 +75,43 @@ struct ClientCore final : ClientHandle {
     return true;
   }
 
-  WireResponse SendBytes(const std::string& bytes,
-                         std::chrono::milliseconds timeout) {
+  using Deadline = std::chrono::steady_clock::time_point;
+
+  static int RemainingMs(Deadline deadline) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return 0;
+    return static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                deadline - now).count());
+  }
+
+  // deadline 在请求进入客户端时计算，覆盖排队等待 io_mutex_ 的时间；
+  // should_cancel 在拿到 io_mutex_ 后、真正 Send 前复查，杜绝"已取消仍发送"。
+  WireResponse SendBytes(const std::string& bytes, Deadline deadline,
+                         const std::function<bool()>& should_cancel) {
     std::lock_guard<std::mutex> lock(io_mutex_);  // REQ 单在途
     WireResponse out;
+    // 排队已耗尽预算：尚未发送，按超时兑现（不触碰连接状态机）。
+    if (RemainingMs(deadline) <= 0) {
+      out.code = ErrorCode::kTimeout;
+      return out;
+    }
+    // 取消可能发生在排队等待锁期间；拿锁后必须复查（审查 P1）。
+    if (should_cancel && should_cancel()) {
+      out.code = ErrorCode::kCancelled;
+      return out;
+    }
     if (!EnsureConnected()) {
       const bool registered =
           registry->Has(RegistryKind::kService, service_name);
       out.code = registered ? ErrorCode::kTransport : ErrorCode::kServiceNotFound;
       return out;
     }
-    socket->SetSendTimeout(static_cast<int>(timeout.count()));
-    socket->SetRecvTimeout(static_cast<int>(timeout.count()));
+    int send_ms = RemainingMs(deadline);
+    if (send_ms <= 0) {
+      out.code = ErrorCode::kTimeout;
+      return out;
+    }
+    socket->SetSendTimeout(send_ms);
     int r = socket->Send(bytes);
     if (r != 0) {
       FY_WARN("client[%s]: send: %d", service_name.c_str(), r);
@@ -95,8 +120,17 @@ struct ClientCore final : ClientHandle {
     }
     sent_count_.fetch_add(1, std::memory_order_relaxed);
 
+    // 接收预算 = 截止时间减去排队 + 发送已耗时间（不再各用一份完整预算）。
+    int recv_ms = RemainingMs(deadline);
+    if (recv_ms <= 0) {
+      out.code = ErrorCode::kTimeout;
+      socket->Close();
+      socket.reset();
+      return out;
+    }
+    socket->SetRecvTimeout(recv_ms);
     std::string frame;
-    r = socket->Recv(&frame, static_cast<int>(timeout.count()));
+    r = socket->Recv(&frame, recv_ms);
     if (r != kIoOk) {
       FY_WARN("client[%s]: recv: %d", service_name.c_str(), r);
       out.code = (r == kIoTimeout) ? ErrorCode::kTimeout : ErrorCode::kTransport;
@@ -157,7 +191,10 @@ WireResponse ClientSendBytes(ClientHandle* handle, const std::string& bytes,
                              std::chrono::milliseconds timeout) {
   auto* core = static_cast<ClientCore*>(handle);
   if (!core) return {ErrorCode::kNotReady, ""};
-  return core->SendBytes(bytes, timeout);
+  // deadline 在请求进入客户端时确定，排队时间计入总预算。
+  const auto deadline =
+      std::chrono::steady_clock::now() + timeout;
+  return core->SendBytes(bytes, deadline, nullptr);
 }
 
 std::uint64_t ClientAsyncSendBytes(ClientHandle* handle,
@@ -182,13 +219,16 @@ std::uint64_t ClientAsyncSendBytes(ClientHandle* handle,
     ++core->in_flight_;
   }
 
+  // deadline 在此刻（请求提交时）确定；should_cancel 在拿到 io_mutex_ 后复查。
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
   const std::string service = core->service_name;
-  std::thread([core, bytes, timeout, id, pending, service]() {
+  std::thread([core, bytes, deadline, id, pending, service]() {
     WireResponse response;
     if (pending->cancelled.load()) {
       response.code = ErrorCode::kCancelled;
     } else {
-      response = core->SendBytes(bytes, timeout);
+      response = core->SendBytes(bytes, deadline,
+                                 [pending]() { return pending->cancelled.load(); });
       if (pending->cancelled.load()) {
         FY_WARN("client[%s]: late response for cancelled request %llu dropped",
                 service.c_str(), static_cast<unsigned long long>(id));

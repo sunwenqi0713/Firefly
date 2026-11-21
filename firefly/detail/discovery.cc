@@ -68,6 +68,9 @@ struct Registry::Impl {
 
   std::mutex data_mutex_;
   std::map<std::string, std::set<std::string>> table_;
+  // 空 URL 占位注册（Reader 用）的引用计数。多个同通道 Reader 各自登记一次，
+  // 不能用 set<string> 合并（否则删一个就把整条记录清空，审查 P1）。
+  std::map<std::string, int> empty_url_refs_;
 
   std::mutex sub_mutex_;
   std::vector<Sub> subs_;
@@ -173,12 +176,24 @@ std::string Execute(Registry::Impl& impl, const std::string& req) {
       std::lock_guard<std::mutex> lock(impl.data_mutex_);
       auto key = Key(k, name);
       if (ev.added) {
-        impl.table_[key].insert(url);
+        if (url.empty()) {
+          // 占位注册：按引用计数，多个同通道 Reader 互不覆盖。
+          ++impl.empty_url_refs_[key];
+        } else {
+          impl.table_[key].insert(url);
+        }
       } else {
-        auto it = impl.table_.find(key);
-        if (it != impl.table_.end()) {
-          it->second.erase(url);
-          if (it->second.empty()) impl.table_.erase(it);
+        if (url.empty()) {
+          auto rit = impl.empty_url_refs_.find(key);
+          if (rit != impl.empty_url_refs_.end() && --rit->second <= 0) {
+            impl.empty_url_refs_.erase(rit);
+          }
+        } else {
+          auto it = impl.table_.find(key);
+          if (it != impl.table_.end()) {
+            it->second.erase(url);
+            if (it->second.empty()) impl.table_.erase(it);
+          }
         }
       }
     }
@@ -195,11 +210,15 @@ std::string Execute(Registry::Impl& impl, const std::string& req) {
     bool has = false;
     {
       std::lock_guard<std::mutex> lock(impl.data_mutex_);
-      auto it = impl.table_.find(Key(k, name));
+      const auto key = Key(k, name);
+      auto it = impl.table_.find(key);
       if (it != impl.table_.end()) {
         if (cmd == "LIST") urls.assign(it->second.begin(), it->second.end());
         has = !it->second.empty();
       }
+      // 空 URL 占位注册（Reader）也算"存在"，但不作为可 dial 的地址返回。
+      auto rit = impl.empty_url_refs_.find(key);
+      if (rit != impl.empty_url_refs_.end() && rit->second > 0) has = true;
     }
     if (cmd == "LIST") {
       std::ostringstream out;
@@ -359,6 +378,17 @@ void Registry::Stop() {
   CloseSocket(impl_->pub_sock_);
   CloseSocket(impl_->req_sock_);
   CloseSocket(impl_->sub_sock_);
+  // Clear/重启语义：发现表与订阅表必须清空，否则 Clear() 后旧端点析构时
+  // 的 Unregister 会因 stopped 被跳过，重启后残留幽灵记录（审查 P2）。
+  {
+    std::lock_guard<std::mutex> lock(impl_->data_mutex_);
+    impl_->table_.clear();
+    impl_->empty_url_refs_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(impl_->sub_mutex_);
+    impl_->subs_.clear();
+  }
 }
 
 bool Registry::Register(Kind kind, const std::string& name,

@@ -22,7 +22,12 @@ struct ReaderCore final : ReaderHandle {
   explicit ReaderCore(std::shared_ptr<IRegistry> reg, OnBytesFunc cb)
       : registry(std::move(reg)), on_bytes(std::move(cb)) {}
 
-  ~ReaderCore() override { Shutdown(); }
+  ~ReaderCore() override {
+    Shutdown();
+    // 兜底：若在收线程内析构（无法 join 自身），detach 避免 thread 析构
+    // terminate；running_=false 已保证循环在本次回调后退出。
+    if (recv_thread_.joinable()) recv_thread_.detach();
+  }
 
   // 登记到全局等待点：Clear() 会阻塞至当前在途回调返回。
   void RegisterWaiter(const std::shared_ptr<ReaderCore>& self) {
@@ -103,10 +108,15 @@ struct ReaderCore final : ReaderHandle {
     FY_INFO("reader[%s]: recv loop exit", config.channel_name.c_str());
   }
 
+  // 幂等：显式 Shutdown 与 ~ReaderCore() 兜底都走这里。
   void Shutdown() {
-    if (!running_.load(std::memory_order_acquire) && !socket) return;
+    if (shutdown_done_.exchange(true)) return;
     running_.store(false, std::memory_order_release);
-    if (recv_thread_.joinable()) recv_thread_.join();
+    // 若在收线程内触发（回调里释放最后一个 Reader 引用），join/wait 自身
+    // 会死锁；running_=false 已保证循环在本次回调结束后退出。
+    const bool on_recv = recv_thread_.joinable() &&
+                         recv_thread_.get_id() == std::this_thread::get_id();
+    if (!on_recv && recv_thread_.joinable()) recv_thread_.join();
     if (subscription_id_ != 0) {
       registry->Unsubscribe(subscription_id_);
       subscription_id_ = 0;
@@ -118,7 +128,7 @@ struct ReaderCore final : ReaderHandle {
     if (socket) {
       socket->Close();
     }
-    WaitForCallbacks();
+    if (!on_recv) WaitForCallbacks();
   }
 
   static double NowSec() {
@@ -134,6 +144,7 @@ struct ReaderCore final : ReaderHandle {
   int subscription_id_ = 0;
   bool registered_ = false;
 
+  std::atomic<bool> shutdown_done_{false};
   std::atomic<bool> running_{false};
   std::thread recv_thread_;
   std::uint64_t sequence_ = 1;  // 只由收线程访问
@@ -193,7 +204,12 @@ Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
   for (const auto& url : urls) core->DialWriter(url);
 
   core->running_.store(true, std::memory_order_release);
-  core->recv_thread_ = std::thread([core]() { core->RecvLoop(); });
+  // 收线程只持有 weak_ptr：释放最后一个外部 shared_ptr 时 core 能析构，
+  // ~ReaderCore() 中 join 收线程并注销（修复自引用环）。
+  std::weak_ptr<ReaderCore> weak = core;
+  core->recv_thread_ = std::thread([weak]() {
+    if (auto self = weak.lock()) self->RecvLoop();
+  });
   core->RegisterWaiter(core);
   FY_INFO("reader[%s] ok, writers found: %zu", config.channel_name.c_str(),
           urls.size());

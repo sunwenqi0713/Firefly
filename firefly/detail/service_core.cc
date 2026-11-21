@@ -20,7 +20,12 @@ struct ServiceCore final : ServiceHandle {
   ServiceCore(std::shared_ptr<IRegistry> reg, OnRequestFunc cb)
       : registry(std::move(reg)), on_request(std::move(cb)) {}
 
-  ~ServiceCore() override { Shutdown(); }
+  ~ServiceCore() override {
+    Shutdown();
+    // 兜底：若在 worker 线程内析构（无法 join 自身），detach 避免 thread
+    // 析构 terminate。running_=false 已保证循环在本次回调后退出。
+    if (worker_.joinable()) worker_.detach();
+  }
 
   void RegisterWaiter(const std::shared_ptr<ServiceCore>& self) {
     std::weak_ptr<ServiceCore> weak(self);
@@ -81,16 +86,23 @@ struct ServiceCore final : ServiceHandle {
     FY_INFO("service[%s]: worker exit", service_name.c_str());
   }
 
+  // 幂等：Service::~Service() 显式 Shutdown 与 ~ServiceCore() 兜底 Shutdown
+  // 都会走这里；exchange 保证只 join/注销一次。
   void Shutdown() {
-    if (!running_.load(std::memory_order_acquire) && !socket) return;
+    if (shutdown_done_.exchange(true)) return;
     running_.store(false, std::memory_order_release);
-    if (worker_.joinable()) worker_.join();
+    // 若在 worker 线程内触发（回调里释放最后一个 Service 引用），join 自身
+    // 会抛 system_error，WaitForCallbacks 会等当前回调自己返回而自锁。
+    // 此时 running_=false 已保证循环在本次回调结束后退出，跳过这两步。
+    const bool on_worker = worker_.joinable() &&
+                           worker_.get_id() == std::this_thread::get_id();
+    if (!on_worker && worker_.joinable()) worker_.join();
     if (registered_) {
       registry->Unregister(RegistryKind::kService, service_name, url);
       registered_ = false;
     }
     if (socket) socket->Close();
-    WaitForCallbacks();
+    if (!on_worker) WaitForCallbacks();
   }
 
   std::string node_name;
@@ -101,6 +113,7 @@ struct ServiceCore final : ServiceHandle {
 
   std::unique_ptr<ISocket> socket;
   bool registered_ = false;
+  std::atomic<bool> shutdown_done_{false};
   std::atomic<bool> running_{false};
   std::thread worker_;
 
@@ -141,7 +154,12 @@ Result<std::shared_ptr<ServiceHandle>> CreateServiceCore(
     core->registered_ = true;
   }
   core->running_.store(true, std::memory_order_release);
-  core->worker_ = std::thread([core]() { core->WorkerLoop(); });
+  // 工作线程只持有 weak_ptr：Service 释放最后一个外部 shared_ptr 时，core
+  // 能正常析构并在 ~ServiceCore() 中 join 线程、注销服务（修复自引用环）。
+  std::weak_ptr<ServiceCore> weak = core;
+  core->worker_ = std::thread([weak]() {
+    if (auto self = weak.lock()) self->WorkerLoop();
+  });
   core->RegisterWaiter(core);
   FY_INFO("service[%s] ok at %s", service_name.c_str(), core->url.c_str());
   return {core, ErrorCode::kOk, ""};

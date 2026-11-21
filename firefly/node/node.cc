@@ -54,13 +54,20 @@ Node::~Node() {
 }
 
 bool Node::DeleteReader(const std::string& channel_name) {
-  std::lock_guard<std::mutex> lg(readers_mutex_);
-  auto it = readers_.find(channel_name);
-  if (it == readers_.end()) {
-    return false;  // 不存在
+  // 先在锁内摘出指针并从表移除，再在锁外 Shutdown：
+  // Shutdown 会 join 收线程并等待在途回调，回调内可能调用 GetReader/Observe
+  // 需要 readers_mutex_；若持锁等待将自锁死锁（审查 P1）。
+  std::shared_ptr<ReaderBase> victim;
+  {
+    std::lock_guard<std::mutex> lg(readers_mutex_);
+    auto it = readers_.find(channel_name);
+    if (it == readers_.end()) {
+      return false;  // 不存在
+    }
+    victim = it->second;
+    readers_.erase(it);
   }
-  it->second->Shutdown();
-  readers_.erase(it);
+  victim->Shutdown();
   return true;
 }
 

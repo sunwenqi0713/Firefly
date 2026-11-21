@@ -189,9 +189,14 @@ class Client : public ClientBase {
     };
     handle.id =
         detail::ClientAsyncSendBytes(impl_.get(), bytes, timeout, on_settled);
-    handle.cancel_fn_ = [this](std::uint64_t rid) {
-      if (!impl_) return false;
-      return detail::ClientCancelRequestCore(impl_.get(), rid);
+    // 句柄绑定 core 的弱引用而非裸 this：Client 析构后只要请求仍在途
+    // （core 被后台线程持有），Cancel 依然安全；core 释放后返回 false。
+    // 修复"保留句柄、释放客户端、再 Cancel 访问悬空指针"（审查 P1）。
+    std::weak_ptr<detail::ClientHandle> weak_impl = impl_;
+    handle.cancel_fn_ = [weak_impl](std::uint64_t rid) {
+      auto impl = weak_impl.lock();
+      if (!impl) return false;
+      return detail::ClientCancelRequestCore(impl.get(), rid);
     };
     return handle;
   }

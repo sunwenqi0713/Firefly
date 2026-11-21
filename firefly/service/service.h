@@ -69,7 +69,9 @@ class Service : public ServiceBase {
         node_name_(node_name),
         service_callback_(service_callback),
         ctx_(ctx) {}
-  ~Service() override = default;
+  // 释放最后一个外部引用即停服：显式 Shutdown 关闭 worker、注销服务，
+  // 避免工作线程持有 core 导致"reset 后服务仍在运行"（审查 P1）。
+  ~Service() override { Shutdown(); }
 
   bool Init() override {
     if (init_) {
