@@ -175,3 +175,62 @@ NNG 实现源文件：`firefly/detail/transport_nng.cc`、
 - [x] 共享契约覆盖取消、截止时间、`Close()` 唤醒/幂等、响应对应、回调顺序、独立注册。
 - [x] 跨进程覆盖发现、Pub/Sub、RPC，独立地址，并行 CTest 稳定。
 - [x] 前三批测试与示例仍通过；公共 API 签名、线协议不变。
+
+## 6. 如何验证（第 5 批收尾）
+
+### 一条命令
+
+```bash
+bash scripts/verify.sh
+```
+
+脚本把第 4 批的手工验证固化为 CI 流程，在干净检出上一次跑完四条路径：
+
+1. **默认 ON（NNG）**：配置（vcpkg toolchain，`NNG backend ENABLED`）+ 构建 +
+   全量 `ctest -j6`（30 个用例，含共享契约双实例与 4 组跨进程用例）。
+2. **跨进程确认**：从全量 `ctest` 日志核对 4/4 `cross_*` 通过，不重复启动两进程，
+   避免重复执行时的端口/时序抖动。
+3. **无 NNG 独立依赖前缀**：从 ON 的 `vcpkg_installed` **只复制非 NNG 内容**
+   到独立前缀（全程不删除），断言前缀中不存在任何 `*nng*` 头/库/包配置。
+4. **OFF（内存）**：不使用 vcpkg 工具链、配置日志确认
+   `NNG backend DISABLED (in-memory backend selected)`，构建 + 全量 `ctest`
+   （24 个用例）。OFF 构建目录与依赖前缀绑定，避免同一目录在不同
+   `CMAKE_PREFIX_PATH` 间反复重配导致链接产物混用。
+
+成功时打印两条构建目录与依赖前缀；任一阶段失败即非 0，日志保留在
+`build/configure-on.log`、`build/ctest-on.log`、`build-no-nng/configure-off.log`。
+
+### 前置
+
+CMake ≥ 3.16、Ninja、MSVC 2022 + Windows 10 SDK、Python 3（仅标准库）、
+vcpkg（manifest 含 protobuf / nng）。首次 ON 配置会由 vcpkg 安装依赖，需要网络
+或已缓存的二进制。脚本直接注入 MSVC `INCLUDE` / `LIB` / `PATH`，
+不调用 `vcvars64.bat`（受限 shell 中该脚本会触发 `reg.exe` 拦截）。
+
+### 环境变量与可选项
+
+| 变量 / 选项 | 默认 | 用途 |
+| --- | --- | --- |
+| `VCPKG_ROOT` | `D:/vcpkg` | vcpkg toolchain 与 ninja 位置 |
+| `VCPKG_TRIPLET` | `x64-windows` | 安装的 triplet |
+| `MSVC_TOOLS` | 本机 14.44.35207 | VC/Tools/MSVC/<版本> 目录 |
+| `WINSDK_ROOT` / `WINSDK_VER` | 本机 10.0.26100.0 | Windows SDK 目录与版本 |
+| `NINJA` | vcpkg 自带 ninja | `CMAKE_MAKE_PROGRAM` |
+| `JOBS` | `6` | 构建与 `ctest` 并行度 |
+| `FIREFLY_SKIP_MSVC_ENV=1` | 未设置 | 已在 VS 开发环境中，跳过环境注入 |
+| `FIREFLY_DEPS_DIR=<path>` | `build-no-nng/deps` | 在全新目录验证「从零构造前缀」路径 |
+| `--skip-on` / `--skip-off` / `--skip-interop` | 未设置 | 单跑某条路径 |
+
+### 已知限制
+
+- **L10 跨进程偶发**：并行高负载下 legacy 进程的 registry follower 可能 3 秒
+  REQ 超时。脚本仅对这类失败做最多 3 次有限重试并留日志；其他失败立即报错。
+- **L11 OFF 构建目录重配**：同一构建目录切换 `CMAKE_PREFIX_PATH` 会让静态库
+  归档与 exe 来自不同轮次产物，脚本通过「前缀绑定构建目录」规避。
+- 详见 `docs/acceptance-matrix.md` 第 5 节。
+
+### 与既有构建方式的关系
+
+`CMakePresets.json`（`cmake --preset default`）与 `scripts/build.ps1` 仍可用于
+日常开发；`scripts/verify.sh` 是**验收入口**，额外覆盖无 NNG 环境与跨进程用例，
+不改变 `firefly::firefly` target 拓扑或任何公共 API。
