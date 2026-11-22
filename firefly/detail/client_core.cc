@@ -23,10 +23,24 @@ namespace firefly {
 namespace detail {
 namespace {
 
-using Deadline = std::chrono::steady_clock::time_point;
-
 // 有界请求队列：同步与异步共用，队列满时直接以现有错误码 kQueueFull 失败。
 constexpr std::size_t kMaxQueuedRequests = 64;
+
+ErrorCode MapExchangeStatus(TransferStatus status) noexcept {
+  switch (status) {
+    case TransferStatus::kTimeout:
+      return ErrorCode::kTimeout;
+    case TransferStatus::kClosed:
+      return ErrorCode::kNotReady;
+    case TransferStatus::kWouldBlock:
+      return ErrorCode::kQueueFull;
+    case TransferStatus::kIoError:
+    case TransferStatus::kInvalidArgument:
+    case TransferStatus::kOk:
+      return ErrorCode::kTransport;
+  }
+  return ErrorCode::kTransport;
+}
 
 // 请求状态机（stage 与 on_settled 由同一把锁保护）：
 //   kQueued --TryStartSending--> kSending --> kDone（Settle）
@@ -81,9 +95,9 @@ struct QueuedCall {
 };
 
 struct ClientCore final : ClientHandle {
-  ClientCore(std::shared_ptr<ITransportFactory> factory,
+  ClientCore(std::unique_ptr<RpcRequester> requester,
              std::shared_ptr<IRegistry> reg)
-      : transport(std::move(factory)), registry(std::move(reg)) {}
+      : requester(std::move(requester)), registry(std::move(reg)) {}
 
   ~ClientCore() override {
     ShutdownInternal();
@@ -100,90 +114,41 @@ struct ClientCore final : ClientHandle {
                                 deadline - now).count());
   }
 
-  // 服务查询与连接也受同一绝对截止时间约束；返回 nullptr 时通过 code 区分
-  // kTimeout / kServiceNotFound / kTransport / kNotReady。
-  std::shared_ptr<ISocket> EnsureConnected(Deadline deadline, ErrorCode* code) {
-    {
-      std::lock_guard<std::mutex> lock(socket_mutex_);
-      if (socket && socket->Valid()) return socket;
-    }
-    if (RemainingMs(deadline) <= 0) {
-      *code = ErrorCode::kTimeout;
-      return nullptr;
-    }
-    auto urls = registry->List(RegistryKind::kService, service_name);
-    if (RemainingMs(deadline) <= 0) {
-      *code = ErrorCode::kTimeout;
-      return nullptr;
-    }
-    if (urls.empty()) {
-      *code = ErrorCode::kServiceNotFound;
-      return nullptr;
-    }
-    if (shutdown_requested_.load(std::memory_order_acquire)) {
-      *code = ErrorCode::kNotReady;
-      return nullptr;
-    }
-    std::shared_ptr<ISocket> fresh = transport->Create(TransportKind::kReq);
-    if (!fresh) {
-      *code = ErrorCode::kTransport;
-      return nullptr;
-    }
-    // nng_dial 非阻塞，仍按预算复查，避免短超时请求挂起。
-    if (RemainingMs(deadline) <= 0 || fresh->Dial(urls.front()) != 0) {
-      *code = RemainingMs(deadline) <= 0 ? ErrorCode::kTimeout
-                                         : ErrorCode::kTransport;
-      return nullptr;
-    }
-    std::lock_guard<std::mutex> lock(socket_mutex_);
-    socket = fresh;
-    return fresh;
-  }
-
-  // 执行者内的唯一 I/O 路径：发送与接收共用剩余预算，超时后关闭连接以重置
-  // REQ 状态机。socket 用 shared_ptr 局部副本，关停线程可安全唤醒 Recv。
+  // 一次请求的 Core 侧 I/O 路径：服务查询与整体预算在 Core，连接/重连/
+  // 发送/接收以及各步剩余预算在 RpcRequester 适配器内。PendingCall 的取消
+  // 裁决仍在 IoLoop 中完成，适配器完全不感知取消状态。
   WireResponse Exchange(const std::string& bytes, Deadline deadline) {
     WireResponse out;
-    std::lock_guard<std::mutex> io_lock(io_mutex_);  // REQ 单在途
     if (shutdown_requested_.load(std::memory_order_acquire)) {
       out.code = ErrorCode::kNotReady;
       return out;
     }
-    ErrorCode conn_code = ErrorCode::kOk;
-    auto sock = EnsureConnected(deadline, &conn_code);
-    if (!sock) {
-      out.code = conn_code;
-      return out;
-    }
-    int left = RemainingMs(deadline);
-    if (left <= 0) {
+    if (RemainingMs(deadline) <= 0) {
       out.code = ErrorCode::kTimeout;
       return out;
     }
-    sock->SetSendTimeout(left);
-    if (sock->Send(bytes) != 0) {
-      FY_WARN("client[%s]: send failed (remaining %d ms)",
-              service_name.c_str(), left);
-      out.code = ErrorCode::kTransport;
+    auto urls = registry->List(RegistryKind::kService, service_name);
+    if (RemainingMs(deadline) <= 0) {
+      out.code = ErrorCode::kTimeout;
+      return out;
+    }
+    if (urls.empty()) {
+      out.code = ErrorCode::kServiceNotFound;
+      return out;
+    }
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
+      out.code = ErrorCode::kNotReady;
+      return out;
+    }
+    std::string frame;
+    TransferStatus status =
+        requester->Exchange(urls.front(), bytes, deadline, &frame);
+    if (status != TransferStatus::kOk) {
+      out.code = MapExchangeStatus(status);
       return out;
     }
     sent_count_.fetch_add(1, std::memory_order_relaxed);
 
-    left = RemainingMs(deadline);
-    if (left <= 0) {
-      out.code = ErrorCode::kTimeout;
-      sock->Close();
-      return out;
-    }
-    sock->SetRecvTimeout(left);
-    std::string frame;
-    const int r = sock->Recv(&frame, left);
-    if (r != kIoOk) {
-      FY_WARN("client[%s]: recv: %d", service_name.c_str(), r);
-      out.code = (r == kIoTimeout) ? ErrorCode::kTimeout : ErrorCode::kTransport;
-      if (r == kIoTimeout) sock->Close();  // REQ 超时后状态机可能失配
-      return out;
-    }
     ErrorCode frame_code = ErrorCode::kSerialization;
     std::string payload;
     if (!DecodeResponse(frame, &frame_code, &payload)) {
@@ -294,17 +259,15 @@ struct ClientCore final : ClientHandle {
     if (!on_io) {
       std::unique_lock<std::mutex> lock(pending_mutex_);
       idle_cv_.wait(lock, [this] { return in_flight_ == 0; });
+      // 关停契约：先等在途请求自然兑现，再关闭适配器并唤醒任何残留 I/O。
+      if (requester) requester->Close();
     }
   }
 
   std::string node_name;
   std::string service_name;
-  std::shared_ptr<ITransportFactory> transport;
+  std::unique_ptr<RpcRequester> requester;
   std::shared_ptr<IRegistry> registry;
-
-  std::mutex socket_mutex_;
-  std::shared_ptr<ISocket> socket;
-  std::mutex io_mutex_;
 
   // 同步与异步共用的有界队列 + 单一 I/O 执行者。
   std::mutex queue_mutex_;
@@ -330,11 +293,16 @@ Result<std::shared_ptr<ClientHandle>> CreateClientCore(
     const std::string& node_name, const std::string& service_name,
     const std::shared_ptr<InjectionContext>& ctx) {
   auto injection = ctx ? ctx : DefaultInjection();
-  auto transport = injection->transport ? injection->transport
-                                        : DefaultTransportFactory();
+  auto endpoints = injection->endpoints ? injection->endpoints
+                                       : DefaultEndpointFactory();
   auto registry =
       injection->registry ? injection->registry : DefaultRegistry();
-  auto core = std::make_shared<ClientCore>(transport, registry);
+  auto requester = endpoints->CreateRequester();
+  if (!requester) {
+    return {nullptr, ErrorCode::kTransport,
+            "CreateClient: endpoint create(RpcRequester) failed"};
+  }
+  auto core = std::make_shared<ClientCore>(std::move(requester), registry);
   core->node_name = node_name;
   core->service_name = service_name;
   core->StartIo();

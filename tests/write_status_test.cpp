@@ -3,6 +3,7 @@
 #include <memory>
 #include <thread>
 
+#include "firefly/detail/endpoint_api.h"
 #include "firefly/firefly.h"
 #include "test_messages.pb.h"
 
@@ -31,7 +32,9 @@ int main() {
   if (no_sub_writer->Write(msg) != WriteStatus::kAccepted) return 22;
 
   // kQueueFull：协议层 EAGAIN 映射为 kQueueFull，与另两态严格区分
-  if (firefly::detail::MapSendError(firefly::detail::kIoQueueFull) != WriteStatus::kQueueFull) return 30;
+  if (firefly::detail::MapSendError(
+          firefly::detail::TransferStatus::kWouldBlock) !=
+      WriteStatus::kQueueFull) return 30;
   if (WriteStatus::kQueueFull == WriteStatus::kAccepted) return 31;
 
   // depth=1 灌 2 条：当前实现的实际行为是"收端保留最新一条"，

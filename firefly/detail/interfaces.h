@@ -11,6 +11,7 @@
 // 默认实现由 transport_nng.cc 提供，行为与阶段二完全一致。
 // ===========================================================================
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -20,35 +21,73 @@
 namespace firefly {
 namespace detail {
 
-enum class TransportKind { kPub, kSub, kReq, kRep };
+// 角色接口的统一 I/O 状态：NNG 常量不进入 Core，所有后端错误在此收口。
+// 语义表见 endpoint_api.h 顶部注释。
+enum class TransferStatus {
+  kOk,
+  kTimeout,
+  kClosed,
+  kWouldBlock,
+  kIoError,
+  kInvalidArgument,
+};
 
-// I/O 返回码：0=成功；负值由接口统一定义，避免 nng 错误码外泄。
-constexpr int kIoOk = 0;
-constexpr int kIoTimeout = -1001;
-constexpr int kIoClosed = -1002;
-constexpr int kIoQueueFull = -1003;
+using Deadline = std::chrono::steady_clock::time_point;
 
-class ISocket {
+// 不透明应答句柄：Core 只回传，不解析内容（见 endpoint_api.h 契约表）。
+class ReplyToken {
  public:
-  virtual ~ISocket() = default;
+  virtual ~ReplyToken() = default;
+};
 
-  virtual TransportKind Kind() const = 0;
-  // 绑定临时端口，成功写回 url（tcp://...）；非 0 为传输层错误码。
-  virtual int BindEphemeral(std::string* url) = 0;
-  virtual int Dial(const std::string& url) = 0;
-  virtual int Send(const std::string& bytes) = 0;
-  // 成功返回 kIoOk 并写回 bytes；超时 kIoTimeout；已关闭 kIoClosed。
-  virtual int Recv(std::string* bytes, int timeout_ms) = 0;
-  virtual int SetRecvTimeout(int ms) = 0;
-  virtual int SetSendTimeout(int ms) = 0;
-  virtual bool Valid() const = 0;
+// ---------------- 数据传输的四个角色接口 ----------------
+
+class Publisher {
+ public:
+  virtual ~Publisher() = default;
+  virtual TransferStatus Bind(std::string* endpoint) = 0;
+  virtual TransferStatus Send(const std::string& bytes) = 0;
   virtual void Close() = 0;
 };
 
-class ITransportFactory {
+class Subscriber {
  public:
-  virtual ~ITransportFactory() = default;
-  virtual std::unique_ptr<ISocket> Create(TransportKind kind) = 0;
+  virtual ~Subscriber() = default;
+  virtual TransferStatus Connect(const std::string& endpoint) = 0;
+  virtual TransferStatus Receive(std::string* bytes, Deadline deadline) = 0;
+  virtual void Close() = 0;
+};
+
+class RpcRequester {
+ public:
+  virtual ~RpcRequester() = default;
+  // deadline 为绝对时间点；连接/发送/接收各阻塞点前必须重算剩余预算。
+  virtual TransferStatus Exchange(const std::string& endpoint,
+                                  const std::string& request, Deadline deadline,
+                                  std::string* response) = 0;
+  virtual void Close() = 0;
+};
+
+class RpcResponder {
+ public:
+  virtual ~RpcResponder() = default;
+  virtual TransferStatus Bind(std::string* endpoint) = 0;
+  virtual TransferStatus Receive(std::string* request,
+                                 std::unique_ptr<ReplyToken>* token,
+                                 Deadline deadline) = 0;
+  virtual TransferStatus Reply(std::unique_ptr<ReplyToken> token,
+                               const std::string& frame, Deadline deadline) = 0;
+  virtual void Close() = 0;
+};
+
+// 内部工厂：数据传输的唯一注入点；Registry 仍由 InjectionContext::registry
+class IEndpointFactory {
+ public:
+  virtual ~IEndpointFactory() = default;
+  virtual std::unique_ptr<Publisher> CreatePublisher() = 0;
+  virtual std::unique_ptr<Subscriber> CreateSubscriber() = 0;
+  virtual std::unique_ptr<RpcRequester> CreateRequester() = 0;
+  virtual std::unique_ptr<RpcResponder> CreateResponder() = 0;
 };
 
 // 注册对象类型：writer(发布者)/reader(订阅者)/service(服务)。
@@ -95,11 +134,12 @@ class IRegistry {
 
 // 注入载体。任一字段为空时对应实现退化为默认实现。
 struct InjectionContext {
-  std::shared_ptr<ITransportFactory> transport;
+  // 第 2 批注入点；为空时退化为 DefaultEndpointFactory()。
+  std::shared_ptr<IEndpointFactory> endpoints;
   std::shared_ptr<IRegistry> registry;
 };
 
-std::shared_ptr<ITransportFactory> DefaultTransportFactory();
+std::shared_ptr<IEndpointFactory> DefaultEndpointFactory();
 std::shared_ptr<IRegistry> DefaultRegistry();
 std::shared_ptr<InjectionContext> DefaultInjection();
 

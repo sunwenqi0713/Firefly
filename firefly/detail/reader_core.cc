@@ -46,22 +46,30 @@ struct ReaderCore final : ReaderHandle {
 
   void DialWriter(const std::string& url) {
     if (url.empty()) return;
-    int r = socket->Dial(url);
-    if (r != 0) {
-      FY_WARN("reader[%s]: dial: %d", config.channel_name.c_str(), r);
+    TransferStatus r = subscriber->Connect(url);
+    if (r != TransferStatus::kOk) {
+      FY_WARN("reader[%s]: connect: %d", config.channel_name.c_str(),
+              static_cast<int>(r));
       return;
     }
-    FY_INFO("reader[%s]: dialed %s", config.channel_name.c_str(), url.c_str());
+    FY_INFO("reader[%s]: connected %s", config.channel_name.c_str(), url.c_str());
   }
 
   void RecvLoop() {
     while (running_.load(std::memory_order_acquire)) {
+      // 绝对截止时间由本轮阻塞开始时确定；适配器内部每次轮询都重算剩余。
+      const Deadline deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
       std::string bytes;
-      int r = socket->Recv(&bytes, 200);
-      if (r == kIoTimeout) continue;
-      if (r == kIoClosed) break;
-      if (r != kIoOk) {
-        FY_WARN("reader[%s]: recv: %d", config.channel_name.c_str(), r);
+      TransferStatus status = subscriber->Receive(&bytes, deadline);
+      if (status == TransferStatus::kTimeout ||
+          status == TransferStatus::kWouldBlock) {
+        continue;
+      }
+      if (status == TransferStatus::kClosed) break;
+      if (status != TransferStatus::kOk) {
+        FY_WARN("reader[%s]: recv: %d", config.channel_name.c_str(),
+                static_cast<int>(status));
         continue;
       }
       received_.store(true, std::memory_order_relaxed);
@@ -108,12 +116,12 @@ struct ReaderCore final : ReaderHandle {
     FY_INFO("reader[%s]: recv loop exit", config.channel_name.c_str());
   }
 
-  // 幂等：Node/公开对象显式 Shutdown、全局关停兜底、~ReaderCore() 都走这里。
-  // 固定顺序：停止接收 → join 收线程（回调线程内触发时跳过 self-join）→
-  // 退订/注销 → 关闭 socket → 等待在途回调 → 释放自保活引用。
+  // 固定顺序：停止接收 → 唤醒阻塞 I/O → join 收线程（回调线程内触发时跳过
+  // self-join）→ 退订/注销 → 等待在途回调 → 释放自保活引用。
   void Shutdown() {
     if (shutdown_done_.exchange(true)) return;
     running_.store(false, std::memory_order_release);
+    if (subscriber) subscriber->Close();  // 幂等，跨线程唤醒 Receive
     // 若在收线程内触发（回调里释放最后一个 Reader 引用），join/wait 自身
     // 会死锁；running_=false 已保证循环在本次回调结束后退出。
     const bool on_recv = recv_thread_.joinable() &&
@@ -126,9 +134,6 @@ struct ReaderCore final : ReaderHandle {
     if (registered_) {
       registry->Unregister(RegistryKind::kReader, config.channel_name, "");
       registered_ = false;
-    }
-    if (socket) {
-      socket->Close();
     }
     if (!on_recv) WaitForCallbacks();
     // 与 ServiceCore 同理：join/wait 完成后才释放自保活引用，避免 core 在
@@ -145,7 +150,7 @@ struct ReaderCore final : ReaderHandle {
   std::shared_ptr<IRegistry> registry;
   OnBytesFunc on_bytes;
 
-  std::unique_ptr<ISocket> socket;
+  std::unique_ptr<Subscriber> subscriber;
   // 运行期自保活，由 Shutdown 在 join/等待完成后释放。
   std::shared_ptr<ReaderCore> self_keepalive_;
   int subscription_id_ = 0;
@@ -177,8 +182,8 @@ Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
     const std::shared_ptr<InjectionContext>& ctx) {
   const std::string where = "CreateReader[channel='" + config.channel_name + "']: ";
   auto injection = ctx ? ctx : DefaultInjection();
-  auto transport = injection->transport ? injection->transport
-                                        : DefaultTransportFactory();
+  auto endpoints = injection->endpoints ? injection->endpoints
+                                       : DefaultEndpointFactory();
   auto registry =
       injection->registry ? injection->registry : DefaultRegistry();
 
@@ -188,10 +193,10 @@ Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
   core->history_depth_.store(config.qos_profile.depth,
                              std::memory_order_relaxed);
 
-  core->socket = transport->Create(TransportKind::kSub);
-  if (!core->socket) {
+  core->subscriber = endpoints->CreateSubscriber();
+  if (!core->subscriber) {
     return {nullptr, ErrorCode::kTransport,
-            where + "transport create(kSub) failed"};
+            where + "endpoint create(Subscriber) failed"};
   }
 
   // 注册 reader 占位（url 为空），供 writer 的 HasReader 感知

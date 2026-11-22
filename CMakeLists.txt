@@ -169,6 +169,10 @@ add_executable(firefly_batch1_contract_test tests/batch1_contract_test.cpp)
 target_link_libraries(firefly_batch1_contract_test PRIVATE firefly test_messages)
 add_test(NAME batch1_contract_test COMMAND firefly_batch1_contract_test)
 
+# 旧版 raw-NNG 进程与新版公开 API 进程的线兼容辅助程序（手工互测入口）
+add_executable(firefly_interop_helper tests/interop_helper.cpp)
+target_link_libraries(firefly_interop_helper PRIVATE firefly test_messages)
+
 # ---------------------------------------------------------------------------
 # 端口隔离（审查验证结果）：发现中心使用固定端口 37221/37222，多个测试进程
 # 并行启动时会争抢主/从角色，导致注册请求超时（discovery_test/clear_wait_test

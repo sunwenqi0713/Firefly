@@ -5,8 +5,6 @@
 #include <string>
 #include <utility>
 
-#include <nng/nng.h>
-
 #include "firefly/common/log.h"
 
 namespace firefly {
@@ -24,18 +22,28 @@ struct WriterCore final : WriterHandle {
 
   ChannelConfig config;
   std::string url;
-  std::unique_ptr<ISocket> socket;
+  std::unique_ptr<Publisher> publisher;
   std::shared_ptr<IRegistry> registry;
   bool registered = false;
+  std::atomic<bool> closed_{false};
   std::atomic<std::uint64_t> sent{0};
   std::atomic<std::uint64_t> dropped{0};
 };
 
 }  // namespace
 
-WriteStatus MapSendError(int r) noexcept {
-  if (r == 0) return WriteStatus::kAccepted;
-  if (r == NNG_EAGAIN || r == kIoQueueFull) return WriteStatus::kQueueFull;
+WriteStatus MapSendError(TransferStatus status) noexcept {
+  switch (status) {
+    case TransferStatus::kOk:
+      return WriteStatus::kAccepted;
+    case TransferStatus::kWouldBlock:
+      return WriteStatus::kQueueFull;
+    case TransferStatus::kClosed:
+    case TransferStatus::kTimeout:
+    case TransferStatus::kIoError:
+    case TransferStatus::kInvalidArgument:
+      return WriteStatus::kTransportError;
+  }
   return WriteStatus::kTransportError;
 }
 
@@ -43,20 +51,20 @@ Result<std::shared_ptr<WriterHandle>> CreateWriterCore(
     const ChannelConfig& config, const std::shared_ptr<InjectionContext>& ctx) {
   const std::string where = "CreateWriter[channel='" + config.channel_name + "']: ";
   auto injection = ctx ? ctx : DefaultInjection();
-  auto transport = injection->transport ? injection->transport
-                                        : DefaultTransportFactory();
+  auto endpoints = injection->endpoints ? injection->endpoints
+                                       : DefaultEndpointFactory();
   auto registry =
       injection->registry ? injection->registry : DefaultRegistry();
 
   auto core = std::make_shared<WriterCore>(registry);
   core->config = config;
-  core->socket = transport->Create(TransportKind::kPub);
-  if (!core->socket) {
+  core->publisher = endpoints->CreatePublisher();
+  if (!core->publisher) {
     return {nullptr, ErrorCode::kTransport,
-            where + "transport create(kPub) failed"};
+            where + "endpoint create(Publisher) failed"};
   }
-  int r = core->socket->BindEphemeral(&core->url);
-  if (r != 0) {
+  TransferStatus bound = core->publisher->Bind(&core->url);
+  if (bound != TransferStatus::kOk) {
     FY_ERROR("writer[%s]: bind ephemeral port failed", config.channel_name.c_str());
     return {nullptr, ErrorCode::kTransport,
             where + "bind ephemeral port failed"};
@@ -71,27 +79,30 @@ Result<std::shared_ptr<WriterHandle>> CreateWriterCore(
 
 bool WriterHasReader(const WriterHandle* handle) {
   auto* core = static_cast<const WriterCore*>(handle);
-  if (!core || !core->socket || !core->socket->Valid()) return false;
-  // nng PUB 即使无订阅者也会 send 成功；显式查注册中心以获得 kNoSubscriber。
+  if (!core || core->closed_.load(std::memory_order_acquire) || !core->publisher) {
+    return false;
+  }
+  // PUB 即使无订阅者也会 send 成功；显式查注册中心以获得 kNoSubscriber。
   return core->registry->Has(RegistryKind::kReader, core->config.channel_name);
 }
 
 WriteStatus WriterWriteBytes(WriterHandle* handle, const std::string& bytes) {
   auto* core = static_cast<WriterCore*>(handle);
-  if (!core || !core->socket || !core->socket->Valid()) {
+  if (!core || core->closed_.load(std::memory_order_acquire) || !core->publisher) {
     return WriteStatus::kTransportError;
   }
-  int r = core->socket->Send(bytes);
-  WriteStatus status = MapSendError(r);
-  if (status == WriteStatus::kAccepted) {
+  TransferStatus status = core->publisher->Send(bytes);
+  WriteStatus result = MapSendError(status);
+  if (result == WriteStatus::kAccepted) {
     core->sent.fetch_add(1, std::memory_order_relaxed);
-  } else if (status == WriteStatus::kQueueFull) {
+  } else if (result == WriteStatus::kQueueFull) {
     core->dropped.fetch_add(1, std::memory_order_relaxed);
   }
-  if (r != 0) {
-    FY_WARN("writer[%s]: send: %d", core->config.channel_name.c_str(), r);
+  if (status != TransferStatus::kOk) {
+    FY_WARN("writer[%s]: send status=%d", core->config.channel_name.c_str(),
+            static_cast<int>(status));
   }
-  return status;
+  return result;
 }
 
 EndpointStats WriterStats(const WriterHandle* handle) {
@@ -105,8 +116,8 @@ EndpointStats WriterStats(const WriterHandle* handle) {
 
 void WriterShutdown(WriterHandle* handle) {
   auto* core = static_cast<WriterCore*>(handle);
-  if (!core) return;
-  if (core->socket) core->socket->Close();
+  if (!core || core->closed_.exchange(true)) return;
+  if (core->publisher) core->publisher->Close();
 }
 
 }  // namespace detail

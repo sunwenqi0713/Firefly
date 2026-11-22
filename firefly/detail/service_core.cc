@@ -1,6 +1,7 @@
 #include "firefly/detail/endpoint_api.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -43,12 +44,20 @@ struct ServiceCore final : ServiceHandle {
 
   void WorkerLoop() {
     while (running_.load(std::memory_order_acquire)) {
+      // 绝对截止时间每轮重算；适配器内部在每个阻塞点前再重算剩余预算。
+      const Deadline deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
       std::string req_bytes;
-      int r = socket->Recv(&req_bytes, 200);
-      if (r == kIoTimeout) continue;
-      if (r == kIoClosed) break;
-      if (r != kIoOk) {
-        FY_WARN("service[%s]: recv: %d", service_name.c_str(), r);
+      std::unique_ptr<ReplyToken> token;
+      TransferStatus status = responder->Receive(&req_bytes, &token, deadline);
+      if (status == TransferStatus::kTimeout ||
+          status == TransferStatus::kWouldBlock) {
+        continue;
+      }
+      if (status == TransferStatus::kClosed) break;
+      if (status != TransferStatus::kOk) {
+        FY_WARN("service[%s]: recv: %d", service_name.c_str(),
+                static_cast<int>(status));
         continue;
       }
       recv_count_.fetch_add(1, std::memory_order_relaxed);
@@ -76,12 +85,17 @@ struct ServiceCore final : ServiceHandle {
         if (--in_flight_ == 0) callbacks_cv_.notify_all();
       }
 
+      // 帧编码与业务错误码仍由 Core 负责；适配器只发送字节且回传 token。
       std::string frame = EncodeResponse(code, payload);
-      int send_r = socket->Send(frame);
-      if (send_r == 0) {
+      const Deadline reply_deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+      TransferStatus send_status =
+          responder->Reply(std::move(token), frame, reply_deadline);
+      if (send_status == TransferStatus::kOk) {
         sent_count_.fetch_add(1, std::memory_order_relaxed);
       } else {
-        FY_WARN("service[%s]: send: %d", service_name.c_str(), send_r);
+        FY_WARN("service[%s]: reply: %d", service_name.c_str(),
+                static_cast<int>(send_status));
       }
     }
     FY_INFO("service[%s]: worker exit", service_name.c_str());
@@ -92,6 +106,7 @@ struct ServiceCore final : ServiceHandle {
   void Shutdown() {
     if (shutdown_done_.exchange(true)) return;
     running_.store(false, std::memory_order_release);
+    if (responder) responder->Close();  // 幂等，跨线程唤醒 Receive
     // 若在 worker 线程内触发（回调里释放最后一个 Service 引用），join 自身
     // 会抛 system_error，WaitForCallbacks 会等当前回调自己返回而自锁。
     // 此时 running_=false 已保证循环在本次回调结束后退出，跳过这两步。
@@ -102,7 +117,6 @@ struct ServiceCore final : ServiceHandle {
       registry->Unregister(RegistryKind::kService, service_name, url);
       registered_ = false;
     }
-    if (socket) socket->Close();
     if (!on_worker) WaitForCallbacks();
     // 自保活引用只在清理完成后释放：确保 join() 期间 worker 线程内的
     // weak.lock() 持有的强引用之外仍有引用，core 不会在 join 过程中析构
@@ -117,7 +131,7 @@ struct ServiceCore final : ServiceHandle {
   std::shared_ptr<IRegistry> registry;
   OnRequestFunc on_request;
 
-  std::unique_ptr<ISocket> socket;
+  std::unique_ptr<RpcResponder> responder;
   // 运行期自保活，由 Shutdown 在 join/等待完成后释放（打破自引用环）。
   std::shared_ptr<ServiceCore> self_keepalive_;
   bool registered_ = false;
@@ -140,8 +154,8 @@ Result<std::shared_ptr<ServiceHandle>> CreateServiceCore(
     OnRequestFunc on_request, const std::shared_ptr<InjectionContext>& ctx) {
   const std::string where = "CreateService[service='" + service_name + "']: ";
   auto injection = ctx ? ctx : DefaultInjection();
-  auto transport = injection->transport ? injection->transport
-                                        : DefaultTransportFactory();
+  auto endpoints = injection->endpoints ? injection->endpoints
+                                       : DefaultEndpointFactory();
   auto registry =
       injection->registry ? injection->registry : DefaultRegistry();
 
@@ -149,13 +163,13 @@ Result<std::shared_ptr<ServiceHandle>> CreateServiceCore(
   core->self_keepalive_ = core;
   core->node_name = node_name;
   core->service_name = service_name;
-  core->socket = transport->Create(TransportKind::kRep);
-  if (!core->socket) {
+  core->responder = endpoints->CreateResponder();
+  if (!core->responder) {
     return {nullptr, ErrorCode::kTransport,
-            where + "transport create(kRep) failed"};
+            where + "endpoint create(RpcResponder) failed"};
   }
-  int r = core->socket->BindEphemeral(&core->url);
-  if (r != 0) {
+  TransferStatus bound = core->responder->Bind(&core->url);
+  if (bound != TransferStatus::kOk) {
     return {nullptr, ErrorCode::kTransport,
             where + "bind ephemeral port failed"};
   }

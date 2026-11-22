@@ -4,6 +4,7 @@
 #include <string>
 #include <thread>
 
+#include "firefly/detail/endpoint_api.h"
 #include "firefly/firefly.h"
 #include "test_messages.pb.h"
 
@@ -66,8 +67,10 @@ int main() {
   if (int e = Check(writer->Write(msg) == firefly::WriteStatus::kNoSubscriber, 71)) return e;
 
   // kQueueFull：协议层错误映射（真实 EAGAIN 需构造拥塞，本阶段验证映射函数）
-  if (int e = Check(firefly::detail::MapSendError(firefly::detail::kIoQueueFull) ==
-                        firefly::WriteStatus::kQueueFull, 80)) return e;
+  if (int e = Check(firefly::detail::MapSendError(
+                        firefly::detail::TransferStatus::kWouldBlock) ==
+                        firefly::WriteStatus::kQueueFull,
+                    80)) return e;
 
   // kTransport：未 Init 的 Writer 写操作走传输错误分支
   firefly::Writer<Chatter> uninitialized(firefly::ChannelConfig{});
