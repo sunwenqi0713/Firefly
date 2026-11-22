@@ -8,7 +8,8 @@
 // Registry 的具体方法。fake 注入发生在 CreateXxx 工厂层：CreateNode 的注入
 // 重载把 InjectionContext 传给端点；端点仍由外部 shared_ptr 独立持有（沿用
 // 阶段二方案 b），Node 生命周期不控制端点存亡。
-// 默认实现由 transport_nng.cc 提供，行为与阶段二完全一致。
+// 默认实现由构建开关选中的后端注入 object 提供（FIREFLY_WITH_NNG=ON 为 NNG，
+// OFF 为内存）；两种后端实现同一组接口与契约。
 // ===========================================================================
 
 #include <chrono>

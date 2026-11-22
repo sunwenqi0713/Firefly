@@ -24,8 +24,8 @@
 // ---------------------------------------------------------------------------
 // 四个 Core 只依赖 interfaces.h 中的 Publisher/Subscriber/RpcRequester/
 // RpcResponder 及其内部工厂，不再依赖 socket 类型、连接/重连细节、NS 错误码
-// 或超时 setsockopt。以下四张表是唯一的行为契约；实现（transport_nng.cc 与
-// 测试假后端）必须逐条满足。
+// 或超时 setsockopt。以下四张表是唯一的行为契约；实现（NNG 适配器、内存后端
+// 与测试假后端）必须逐条满足。
 //
 // 统一传输状态 TransferStatus（定义在 interfaces.h）：
 //   kOk           本地操作成功；对 Exchange 表示完整收到一帧响应。

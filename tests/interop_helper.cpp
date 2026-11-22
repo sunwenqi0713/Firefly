@@ -123,13 +123,16 @@ int LegacyPub() {
   if (!WaitRegistered(reg.get(), RegistryKind::kReader, kChannel, true, 10s)) {
     return 4;
   }
-  std::this_thread::sleep_for(200ms);  // 给 SUB 完成 dial（旧进程无订阅确认协议）
-  for (int seq = 1; seq <= 3; ++seq) {
-    if (SendRaw(sock, MakeChatter(seq)) != 0) return 5;
-    std::this_thread::sleep_for(50ms);
+  // 旧发布者没有订阅确认协议：重复发送同一序列，直到新订阅者完成 dial。
+  // 新订阅者按 seq==seen+1 接受，重复帧会被忽略，线协议不变。
+  for (int round = 0; round < 5; ++round) {
+    for (int seq = 1; seq <= 3; ++seq) {
+      if (SendRaw(sock, MakeChatter(seq)) != 0) return 5;
+      std::this_thread::sleep_for(50ms);
+    }
   }
   std::printf("LEGACY_PUB_OK\n");
-  std::this_thread::sleep_for(500ms);
+  std::this_thread::sleep_for(1500ms);
   reg->Unregister(id);
   nng_close(sock);
   return 0;
@@ -151,6 +154,8 @@ int NewSub() {
         return firefly::CallbackResult::kOk;
       }).value;
   if (!reader) return 11;
+  std::printf("NEW_SUB_READY\n");
+  std::fflush(stdout);
   if (future.wait_for(15s) != std::future_status::ready) return 12;
   if (seen.load() != 3) return 13;
   std::printf("NEW_SUB_OK seq=3\n");
@@ -162,20 +167,29 @@ int NewPub() {
   if (!node) return 20;
   auto writer = node->CreateWriter<Chatter>(kChannel).value;
   if (!writer) return 21;
+  std::printf("NEW_PUB_READY\n");
+  std::fflush(stdout);
   auto reg = Registry();
   if (!WaitRegistered(reg.get(), RegistryKind::kReader, kChannel, true, 10s)) {
     return 22;
   }
-  std::this_thread::sleep_for(200ms);
-  for (int seq = 1; seq <= 3; ++seq) {
-    Chatter msg;
-    msg.set_seq(seq);
-    msg.set_content("interop-" + std::to_string(seq));
-    if (writer->Write(msg) != firefly::WriteStatus::kAccepted) return 23;
-    std::this_thread::sleep_for(50ms);
+  // 旧订阅者要连续收 1..3；重复发送覆盖新发布者注册后 SUB dial 的时间窗。
+  for (int round = 0; round < 5; ++round) {
+    for (int seq = 1; seq <= 3; ++seq) {
+      Chatter msg;
+      msg.set_seq(seq);
+      msg.set_content("interop-" + std::to_string(seq));
+      const auto status = writer->Write(msg);
+      // 旧订阅者收满 3 帧后先退出，后续发送的 kNoSubscriber 是正常收尾。
+      if (status != firefly::WriteStatus::kAccepted &&
+          status != firefly::WriteStatus::kNoSubscriber) {
+        return 23;
+      }
+      std::this_thread::sleep_for(50ms);
+    }
   }
   std::printf("NEW_PUB_OK\n");
-  std::this_thread::sleep_for(500ms);
+  std::this_thread::sleep_for(1500ms);
   return 0;
 }
 
@@ -213,6 +227,8 @@ int LegacyRep() {
   auto reg = Registry();
   const auto id = RegisterLegacy(reg.get(), RegistryKind::kService, kService, url);
   if (id == 0) return 42;
+  std::printf("LEGACY_REP_READY\n");
+  std::fflush(stdout);
   for (int i = 0; i < 2; ++i) {
     std::string request;
     if (RecvRaw(sock, &request, 10000) != 0) return 43;
@@ -268,8 +284,12 @@ int NewRep() {
         return {firefly::ErrorCode::kOk, resp};
       }).value;
   if (!service) return 61;
+  std::printf("NEW_REP_READY\n");
+  std::fflush(stdout);
   if (future.wait_for(20s) != std::future_status::ready) return 62;
   std::printf("NEW_REP_OK\n");
+  // 主注册中心过早退出会让 follower 的迟到注销/请求失败；留出旧请求进程收尾时间。
+  std::this_thread::sleep_for(1000ms);
   return 0;
 }
 

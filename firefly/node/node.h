@@ -33,7 +33,8 @@ Result<std::unique_ptr<Node>> CreateNode(const std::string& node_name,
 
 // 阶段三：带注入点的工厂重载。fake 注入发生在 CreateXxx 工厂层；端点仍由
 // 外部 shared_ptr 独立持有（阶段二方案 b），Node 生命周期不控制端点存亡。
-// ctx 为空时所有端点退化为默认 nng 传输 + 默认 Registry，行为完全不变。
+// ctx 为空时所有端点退化为默认后端 + 默认 Registry
+// （FIREFLY_WITH_NNG=ON 为 NNG，OFF 为内存），行为完全不变。
 Result<std::unique_ptr<Node>> CreateNode(
     const std::string& node_name, const std::string& name_space,
     const std::shared_ptr<detail::InjectionContext>& ctx);

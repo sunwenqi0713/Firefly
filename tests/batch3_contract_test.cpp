@@ -1,5 +1,6 @@
 // batch3_contract_test.cpp：第 3 批发现层契约（记录模型 / 生命周期 / 注册失败）。
-// 并发时序由 promise/future 控制；每个用例使用独立的发现中心地址。
+// 并发时序由 promise/future 控制；NNG 后端下每个用例使用独立的发现中心地址，
+// 内存后端不需要网络地址。
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -11,11 +12,12 @@
 #include <utility>
 #include <vector>
 
+#include "firefly/detail/interfaces.h"
+#if FIREFLY_WITH_NNG
 #include <nng/nng.h>
 #include <nng/protocol/pubsub0/pub.h>
-
-#include "firefly/detail/interfaces.h"
 #include "firefly/detail/net.h"
+#endif
 #include "firefly/firefly.h"
 #include "test_messages.pb.h"
 
@@ -51,6 +53,7 @@ bool WaitUntil(Predicate pred, std::chrono::milliseconds limit) {
   return true;
 }
 
+#if FIREFLY_WITH_NNG
 // 用 NNG 临时监听端口取两个空闲端口，避免与固定 37221/37222 冲突。
 std::pair<int, int> PickFreePorts() {
   std::vector<nng_socket> socks;
@@ -77,13 +80,18 @@ std::pair<int, int> PickFreePorts() {
   for (auto s : socks) nng_close(s);
   return result;
 }
+#endif
 
 bool StartCase(const char* name) {
+#if FIREFLY_WITH_NNG
   const auto ports = PickFreePorts();
   if (ports.first == 0 || ports.second == 0) return false;
   firefly::detail::ConfigureDiscovery(
       {"tcp://127.0.0.1:" + std::to_string(ports.first),
        "tcp://127.0.0.1:" + std::to_string(ports.second)});
+#else
+  (void)name;
+#endif
   return firefly::Init(name);
 }
 
