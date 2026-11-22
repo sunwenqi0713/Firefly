@@ -113,9 +113,9 @@ struct ServiceCore final : ServiceHandle {
     const bool on_worker = worker_.joinable() &&
                            worker_.get_id() == std::this_thread::get_id();
     if (!on_worker && worker_.joinable()) worker_.join();
-    if (registered_) {
-      registry->Unregister(RegistryKind::kService, service_name, url);
-      registered_ = false;
+    if (record_id_ != 0) {
+      registry->Unregister(record_id_);
+      record_id_ = 0;
     }
     if (!on_worker) WaitForCallbacks();
     // 自保活引用只在清理完成后释放：确保 join() 期间 worker 线程内的
@@ -129,12 +129,12 @@ struct ServiceCore final : ServiceHandle {
   std::string service_name;
   std::string url;
   std::shared_ptr<IRegistry> registry;
+  EndpointRecordId record_id_ = 0;
   OnRequestFunc on_request;
 
   std::unique_ptr<RpcResponder> responder;
   // 运行期自保活，由 Shutdown 在 join/等待完成后释放（打破自引用环）。
   std::shared_ptr<ServiceCore> self_keepalive_;
-  bool registered_ = false;
   std::atomic<bool> shutdown_done_{false};
   std::atomic<bool> running_{false};
   std::thread worker_;
@@ -153,11 +153,9 @@ Result<std::shared_ptr<ServiceHandle>> CreateServiceCore(
     const std::string& node_name, const std::string& service_name,
     OnRequestFunc on_request, const std::shared_ptr<InjectionContext>& ctx) {
   const std::string where = "CreateService[service='" + service_name + "']: ";
-  auto injection = ctx ? ctx : DefaultInjection();
-  auto endpoints = injection->endpoints ? injection->endpoints
-                                       : DefaultEndpointFactory();
-  auto registry =
-      injection->registry ? injection->registry : DefaultRegistry();
+  auto injection = ResolveInjection(ctx);
+  auto endpoints = injection->endpoints;
+  auto registry = injection->registry;
 
   auto core = std::make_shared<ServiceCore>(registry, std::move(on_request));
   core->self_keepalive_ = core;
@@ -173,8 +171,15 @@ Result<std::shared_ptr<ServiceHandle>> CreateServiceCore(
     return {nullptr, ErrorCode::kTransport,
             where + "bind ephemeral port failed"};
   }
-  if (registry->Register(RegistryKind::kService, service_name, core->url)) {
-    core->registered_ = true;
+  EndpointRecord record;
+  record.kind = RegistryKind::kService;
+  record.name = service_name;
+  record.address = core->url;
+  core->record_id_ = registry->Register(record);
+  if (core->record_id_ == 0) {
+    core->responder->Close();
+    return {nullptr, ErrorCode::kTransport,
+            where + "registry register failed"};
   }
   core->running_.store(true, std::memory_order_release);
   // 工作线程只持有 weak_ptr：Service 释放最后一个外部 shared_ptr 时，core

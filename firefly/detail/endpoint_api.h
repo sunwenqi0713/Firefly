@@ -9,6 +9,16 @@
 // 对应的 *_core.cc 中实现。用户自定义 protobuf 消息无需显式实例化。
 // 端点方法签名与阶段一/二的语义（WriteStatus/ErrorCode/Cancel）保持不变。
 //
+// 第 3 批：发现与启动/销毁时序契约
+// ---------------------------------------------------------------------------
+// - Writer/Service 必须先完成 Publisher/RpcResponder::Bind（拿到监听地址）
+//   才调用 IRegistry::Register；Reader 无监听地址，以空 address 独立登记。
+// - 四个 Core 都在启动后台线程之前完成注册；Register/Watch 失败时立即
+//   Close 已创建的端点并返回现有 ErrorCode::kTransport，不留下线程或监听器。
+// - 注销一律使用注册返回的 EndpointRecordId；同一 id 只注销一次。
+// - 全局 Clear() 经默认注入面停 Registry 并清记录；此后旧端点析构触发的
+//   迟到 Unregister(id) 是 no-op；再次 Init() 重建组装，查不到旧记录。
+// ===========================================================================
 // ===========================================================================
 // 第 2 批：数据传输角色契约（Core ↔ 适配器）
 // ---------------------------------------------------------------------------
@@ -34,7 +44,7 @@
 //
 // Subscriber（订阅者，Core = ReaderCore）
 // | 操作 | 契约 | Core 保留的职责 |
-// | Connect(endpoint) | 把发布者地址交给后端；后端自行去重/建连/重连。 | 发现事件、地址集合传递、HasWriter。 |
+// | UpdatePublishers(endpoints) | 收发现层给出的当前地址全集；适配器自行去重、建连、断开已移除地址；重复同一集合为 no-op，空串忽略。 | Watch 快照 → 地址集合、HasWriter。 |
 // | Receive(bytes, deadline) | 收绝对截止时间；每次阻塞前重算剩余预算，kTimeout 只表示本次等待到期，可继续下一轮。Close 唤醒并使本调用返回 kClosed。 | 运行标志、回调串行、Observe 缓冲、统计。 |
 // | Close() | 幂等、跨线程唤醒阻塞 Receive；之后所有 Receive 立即返回 kClosed。 | 停止接收 → 唤醒 → join → 注销。 |
 //

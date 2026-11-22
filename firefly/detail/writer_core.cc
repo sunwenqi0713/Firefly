@@ -15,16 +15,16 @@ struct WriterCore final : WriterHandle {
   explicit WriterCore(std::shared_ptr<IRegistry> reg) : registry(std::move(reg)) {}
 
   ~WriterCore() override {
-    if (registered) {
-      registry->Unregister(RegistryKind::kWriter, config.channel_name, url);
+    if (record_id_ != 0) {
+      registry->Unregister(record_id_);
     }
   }
 
   ChannelConfig config;
   std::string url;
+  EndpointRecordId record_id_ = 0;
   std::unique_ptr<Publisher> publisher;
   std::shared_ptr<IRegistry> registry;
-  bool registered = false;
   std::atomic<bool> closed_{false};
   std::atomic<std::uint64_t> sent{0};
   std::atomic<std::uint64_t> dropped{0};
@@ -50,11 +50,9 @@ WriteStatus MapSendError(TransferStatus status) noexcept {
 Result<std::shared_ptr<WriterHandle>> CreateWriterCore(
     const ChannelConfig& config, const std::shared_ptr<InjectionContext>& ctx) {
   const std::string where = "CreateWriter[channel='" + config.channel_name + "']: ";
-  auto injection = ctx ? ctx : DefaultInjection();
-  auto endpoints = injection->endpoints ? injection->endpoints
-                                       : DefaultEndpointFactory();
-  auto registry =
-      injection->registry ? injection->registry : DefaultRegistry();
+  auto injection = ResolveInjection(ctx);
+  auto endpoints = injection->endpoints;
+  auto registry = injection->registry;
 
   auto core = std::make_shared<WriterCore>(registry);
   core->config = config;
@@ -69,9 +67,15 @@ Result<std::shared_ptr<WriterHandle>> CreateWriterCore(
     return {nullptr, ErrorCode::kTransport,
             where + "bind ephemeral port failed"};
   }
-  if (registry->Register(RegistryKind::kWriter, config.channel_name,
-                         core->url)) {
-    core->registered = true;
+  EndpointRecord record;
+  record.kind = RegistryKind::kWriter;
+  record.name = config.channel_name;
+  record.address = core->url;
+  core->record_id_ = registry->Register(record);
+  if (core->record_id_ == 0) {
+    core->publisher->Close();
+    return {nullptr, ErrorCode::kTransport,
+            where + "registry register failed"};
   }
   FY_INFO("writer[%s] ok at %s", config.channel_name.c_str(), core->url.c_str());
   return {core, ErrorCode::kOk, ""};

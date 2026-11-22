@@ -22,6 +22,8 @@
 using firefly::CallbackResult;
 using firefly::detail::Deadline;
 using firefly::detail::DefaultEndpointFactory;
+using firefly::detail::EndpointRecord;
+using firefly::detail::EndpointRecordId;
 using firefly::detail::IEndpointFactory;
 using firefly::detail::IRegistry;
 using firefly::detail::Publisher;
@@ -29,6 +31,7 @@ using firefly::detail::RegistryEvent;
 using firefly::detail::RegistryKind;
 using firefly::detail::Subscriber;
 using firefly::detail::TransferStatus;
+using firefly::detail::WatchCallback;
 using firefly::test::Chatter;
 
 namespace {
@@ -45,6 +48,7 @@ struct SharedBus {
   std::atomic<int> sends{0};
   std::atomic<int> recvs{0};
   std::atomic<int> dials{0};
+  std::atomic<int> disconnects{0};
 };
 
 class FakePublisher final : public Publisher {
@@ -79,9 +83,22 @@ class FakeSubscriber final : public Subscriber {
  public:
   explicit FakeSubscriber(std::shared_ptr<SharedBus> bus) : bus_(std::move(bus)) {}
 
-  TransferStatus Connect(const std::string&) override {
+  TransferStatus UpdatePublishers(
+      const std::vector<std::string>& endpoints) override {
     if (closed_.load(std::memory_order_acquire)) return TransferStatus::kClosed;
-    bus_->dials.fetch_add(1);
+    std::lock_guard<std::mutex> lock(bus_->mutex);
+    std::set<std::string> desired(endpoints.begin(), endpoints.end());
+    for (const auto& url : connected_) {
+      if (desired.count(url) == 0) bus_->disconnects.fetch_add(1);
+    }
+    for (const auto& url : desired) {
+      if (!url.empty() && connected_.count(url) == 0) {
+        connected_.insert(url);
+        bus_->dials.fetch_add(1);
+      }
+    }
+    connected_ = desired;
+    connected_.erase("");
     return TransferStatus::kOk;
   }
 
@@ -119,6 +136,7 @@ class FakeSubscriber final : public Subscriber {
 
  private:
   std::shared_ptr<SharedBus> bus_;
+  std::set<std::string> connected_;  // 受 bus_->mutex 保护
   std::atomic<bool> closed_{false};
 };
 
@@ -218,74 +236,126 @@ class FakeEndpointFactory final : public IEndpointFactory {
 
 class FakeRegistry final : public IRegistry {
  public:
-  bool Register(RegistryKind kind, const std::string& name,
-                const std::string& url) override {
-    std::vector<std::function<void(const RegistryEvent&)>> callbacks;
+  EndpointRecordId Register(const EndpointRecord& in) override {
+    EndpointRecord rec = in;
+    std::vector<WatchCallback> callbacks;
+    std::vector<EndpointRecord> snapshot;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      table_[{kind, name}].insert(url);
-      for (auto& sub : subs_) {
-        if (sub.kind == kind && sub.name == name) callbacks.push_back(sub.cb);
-      }
+      if (rec.id == 0 || table_.count(rec.id) != 0) rec.id = next_record_id_++;
+      if (rec.backend.empty()) rec.backend = "fake";
+      table_[rec.id] = rec;
+      snapshot = SnapshotLocked(rec.kind, rec.name);
+      callbacks = WatchersLocked(rec.kind, rec.name);
     }
-    auto endpoint = firefly::detail::MakeEndpointId(url);
-    for (auto& cb : callbacks) {
-      cb(RegistryEvent{kind, name, endpoint, true});
+    Dispatch(callbacks, snapshot);
+    return rec.id;
+  }
+
+  bool Unregister(EndpointRecordId id) override {
+    std::vector<WatchCallback> callbacks;
+    std::vector<EndpointRecord> snapshot;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = table_.find(id);
+      if (it == table_.end()) return true;
+      const auto kind = it->second.kind;
+      const auto name = it->second.name;
+      table_.erase(it);
+      snapshot = SnapshotLocked(kind, name);
+      callbacks = WatchersLocked(kind, name);
     }
+    Dispatch(callbacks, snapshot);
     return true;
   }
 
-  bool Unregister(RegistryKind kind, const std::string& name,
-                  const std::string& url) override {
+  std::vector<EndpointRecord> Query(
+      RegistryKind kind, const std::string& name,
+      const std::string& backend = std::string()) override {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = table_.find({kind, name});
-    if (it != table_.end()) it->second.erase(url);
-    return true;
-  }
-
-  std::vector<std::string> List(RegistryKind kind,
-                                const std::string& name) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = table_.find({kind, name});
-    if (it == table_.end()) return {};
-    return {it->second.begin(), it->second.end()};
+    auto all = SnapshotLocked(kind, name);
+    if (backend.empty()) return all;
+    std::vector<EndpointRecord> out;
+    for (const auto& rec : all) {
+      if (rec.backend == backend) out.push_back(rec);
+    }
+    return out;
   }
 
   bool Has(RegistryKind kind, const std::string& name) override {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = table_.find({kind, name});
-    return it != table_.end() && !it->second.empty();
+    return !SnapshotLocked(kind, name).empty();
   }
 
-  int Subscribe(RegistryKind kind, const std::string& name,
-                std::function<void(const RegistryEvent&)>&& cb) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const int id = next_id_++;
-    subs_.push_back({id, kind, name, std::move(cb)});
-    return id;
+  int Watch(RegistryKind kind, const std::string& name,
+            WatchCallback&& cb) override {
+    std::vector<EndpointRecord> snapshot;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const int id = next_watch_id_++;
+      watches_.push_back(WatchEntry{id, kind, name, std::move(cb)});
+      snapshot = SnapshotLocked(kind, name);
+      Dispatch({watches_.back().cb}, snapshot);
+      return id;
+    }
   }
 
-  void Unsubscribe(int id) override {
+  void Unwatch(int id) override {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto it = subs_.begin(); it != subs_.end(); ++it) {
+    for (auto it = watches_.begin(); it != watches_.end(); ++it) {
       if (it->id == id) {
-        subs_.erase(it);
+        watches_.erase(it);
         return;
       }
     }
   }
 
+  void Clear() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    table_.clear();
+    watches_.clear();
+  }
+
  private:
-  struct Sub {
+  struct WatchEntry {
     int id;
     RegistryKind kind;
     std::string name;
-    std::function<void(const RegistryEvent&)> cb;
+    WatchCallback cb;
   };
+
+  std::vector<EndpointRecord> SnapshotLocked(RegistryKind kind,
+                                             const std::string& name) const {
+    std::vector<EndpointRecord> out;
+    for (const auto& kv : table_) {
+      if (kv.second.kind == kind && kv.second.name == name) {
+        out.push_back(kv.second);
+      }
+    }
+    return out;
+  }
+
+  std::vector<WatchCallback> WatchersLocked(RegistryKind kind,
+                                            const std::string& name) const {
+    std::vector<WatchCallback> out;
+    for (const auto& w : watches_) {
+      if (w.kind == kind && w.name == name) out.push_back(w.cb);
+    }
+    return out;
+  }
+
+  static void Dispatch(const std::vector<WatchCallback>& callbacks,
+                       const std::vector<EndpointRecord>& snapshot) {
+    for (const auto& cb : callbacks) {
+      if (cb) cb(snapshot);
+    }
+  }
+
   std::mutex mutex_;
-  std::map<std::pair<RegistryKind, std::string>, std::set<std::string>> table_;
-  std::vector<Sub> subs_;
-  int next_id_ = 1;
+  std::map<EndpointRecordId, EndpointRecord> table_;
+  std::vector<WatchEntry> watches_;
+  EndpointRecordId next_record_id_ = 1;
+  int next_watch_id_ = 1;
 };
 
 // 角色契约：Close() 幂等且能唤醒另一线程上的阻塞 I/O；Exchange 收绝对

@@ -29,6 +29,8 @@ namespace {
 
 using namespace std::chrono_literals;
 using firefly::detail::IRegistry;
+using firefly::detail::EndpointRecord;
+using firefly::detail::EndpointRecordId;
 using firefly::detail::RegistryKind;
 using firefly::test::CalcRequest;
 using firefly::test::CalcResponse;
@@ -39,6 +41,24 @@ constexpr const char* kService = "interop_calc";
 
 std::shared_ptr<IRegistry> Registry() {
   return firefly::detail::DefaultRegistry();
+}
+
+EndpointRecordId RegisterLegacy(IRegistry* reg, RegistryKind kind,
+                                const char* name, const std::string& address) {
+  EndpointRecord rec;
+  rec.kind = kind;
+  rec.name = name;
+  rec.address = address;
+  return reg->Register(rec);
+}
+
+std::vector<std::string> ListAddresses(IRegistry* reg, RegistryKind kind,
+                                       const std::string& name) {
+  std::vector<std::string> out;
+  for (const auto& rec : reg->Query(kind, name)) {
+    if (!rec.address.empty()) out.push_back(rec.address);
+  }
+  return out;
 }
 
 bool WaitRegistered(IRegistry* reg, RegistryKind kind, const std::string& name,
@@ -98,7 +118,8 @@ int LegacyPub() {
   nng_listener listener = NNG_LISTENER_INITIALIZER;
   if (!firefly::detail::ListenOnEphemeralPort(sock, &listener, &url)) return 2;
   auto reg = Registry();
-  if (!reg->Register(RegistryKind::kWriter, kChannel, url)) return 3;
+  const auto id = RegisterLegacy(reg.get(), RegistryKind::kWriter, kChannel, url);
+  if (id == 0) return 3;
   if (!WaitRegistered(reg.get(), RegistryKind::kReader, kChannel, true, 10s)) {
     return 4;
   }
@@ -109,7 +130,7 @@ int LegacyPub() {
   }
   std::printf("LEGACY_PUB_OK\n");
   std::this_thread::sleep_for(500ms);
-  reg->Unregister(RegistryKind::kWriter, kChannel, url);
+  reg->Unregister(id);
   nng_close(sock);
   return 0;
 }
@@ -163,11 +184,12 @@ int LegacySub() {
   if (nng_sub0_open(&sock) != 0) return 30;
   if (nng_setopt(sock, NNG_OPT_SUB_SUBSCRIBE, "", size_t(0)) != 0) return 31;
   auto reg = Registry();
-  if (!reg->Register(RegistryKind::kReader, kChannel, "")) return 32;
+  const auto id = RegisterLegacy(reg.get(), RegistryKind::kReader, kChannel, "");
+  if (id == 0) return 32;
   if (!WaitRegistered(reg.get(), RegistryKind::kWriter, kChannel, true, 10s)) {
     return 33;
   }
-  for (const auto& url : reg->List(RegistryKind::kWriter, kChannel)) {
+  for (const auto& url : ListAddresses(reg.get(), RegistryKind::kWriter, kChannel)) {
     if (nng_dial(sock, url.c_str(), nullptr, 0) != 0) return 34;
   }
   for (int seq = 1; seq <= 3; ++seq) {
@@ -177,7 +199,7 @@ int LegacySub() {
     if (!msg.ParseFromString(bytes) || msg.seq() != seq) return 36;
   }
   std::printf("LEGACY_SUB_OK seq=3\n");
-  reg->Unregister(RegistryKind::kReader, kChannel, "");
+  reg->Unregister(id);
   nng_close(sock);
   return 0;
 }
@@ -189,7 +211,8 @@ int LegacyRep() {
   nng_listener listener = NNG_LISTENER_INITIALIZER;
   if (!firefly::detail::ListenOnEphemeralPort(sock, &listener, &url)) return 41;
   auto reg = Registry();
-  if (!reg->Register(RegistryKind::kService, kService, url)) return 42;
+  const auto id = RegisterLegacy(reg.get(), RegistryKind::kService, kService, url);
+  if (id == 0) return 42;
   for (int i = 0; i < 2; ++i) {
     std::string request;
     if (RecvRaw(sock, &request, 10000) != 0) return 43;
@@ -204,7 +227,7 @@ int LegacyRep() {
   }
   std::printf("LEGACY_REP_OK\n");
   std::this_thread::sleep_for(300ms);
-  reg->Unregister(RegistryKind::kService, kService, url);
+  reg->Unregister(id);
   nng_close(sock);
   return 0;
 }
@@ -255,7 +278,7 @@ int LegacyReq() {
   if (!WaitRegistered(reg.get(), RegistryKind::kService, kService, true, 10s)) {
     return 70;
   }
-  auto urls = reg->List(RegistryKind::kService, kService);
+  auto urls = ListAddresses(reg.get(), RegistryKind::kService, kService);
   if (urls.empty()) return 71;
   nng_socket sock = NNG_SOCKET_INITIALIZER;
   if (nng_req0_open(&sock) != 0) return 72;

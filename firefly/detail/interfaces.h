@@ -12,6 +12,7 @@
 // ===========================================================================
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -53,7 +54,10 @@ class Publisher {
 class Subscriber {
  public:
   virtual ~Subscriber() = default;
-  virtual TransferStatus Connect(const std::string& endpoint) = 0;
+  // 当前应连接的发布者地址全集；适配器自行去重、建连、断开已移除的地址。
+  // 重复传入相同集合必须是 no-op，空串地址忽略。Close 后返回 kClosed。
+  virtual TransferStatus UpdatePublishers(
+      const std::vector<std::string>& endpoints) = 0;
   virtual TransferStatus Receive(std::string* bytes, Deadline deadline) = 0;
   virtual void Close() = 0;
 };
@@ -117,27 +121,91 @@ struct RegistryEvent {
   bool added;
 };
 
+// ---------------- 发现层记录模型（第 3 批契约）----------------
+// EndpointRecord{id, kind, name, backend, address} 是一次注册的不可变快照：
+//   id      —— 注册成功返回的不透明整数句柄（EndpointRecordId），注销只认它；
+//              同一次注册在 Watch 快照与 Query 结果里 id 不变。
+//   kind/name —— 发现键；同一 kind+name 下允许多条记录（多 Writer、多 Reader、
+//              多 Service 实例并存），Query 必须全部返回，不得相互覆盖。
+//   backend —— 后端标识（如 "nng"/"fake"）；由 Registry 实现填充，Core 传入
+//              空串表示交由注册中心决定。Query 的 backend 过滤为空串表示不过滤。
+//   address —— 监听地址串；Reader 没有监听地址时以空串占位独立登记，不能被
+//              同通道其他 Reader 的占位记录合并，删除其中一个不影响其余。
+// 注意区分两个 id：本记录的 EndpointRecordId 是“注册句柄”；已有的 EndpointId
+// 类是“地址不透明句柄”（RegistryEvent::endpoint），仅用于日志/诊断与 Core 内
+// 部 dial，不参与注销。
+//
+// Watch(kind, name, cb) 的快照语义：
+//   1) 注册回调与计算初始快照在同一个串行化域内完成，回调先收到一份一致的
+//      当前记录集合（按 id 排序），不会漏掉注册之前已存在的记录；
+//   2) 之后该键任何 Register/Unregister 都会再次以“该键的完整当前快照”派发；
+//   3) 回调内禁止调用任何 IRegistry 方法（派发持有内部串行锁）；回调不得抛
+//      出异常。Unwatch 后不再派发。
+//
+// Clear()/生命周期：Clear 幂等，清空所有记录与 Watch 订阅；Clear 之后到达的
+// 迟到 Unregister(id) 为 no-op 并返回 true；再次 Register/Watch 可以重启发现
+// 中心，且不得看到 Clear 之前的任何旧记录。Clear 同时停掉注册中心的工作线程
+// 与监听端点；Register 失败不得留下线程或监听器。
+//
+// 线协议兼容：注册/注销命令与广播在末尾追加可选 id/backend 字段；旧版进程
+// 忽略新增字段，新版进程对缺失字段按 kind+name+address 派生稳定的兼容 id，
+// 因此新旧混跑时 Pub/Sub 地址与 RPC FFRP 帧格式均不变。
+using EndpointRecordId = std::uint64_t;
+
+// 注册中心持有的单条端点记录。Register 入参允许 id==0、backend 为空，由
+// Registry 分配 id 并填入默认 backend；其余字段由调用方给出。
+struct EndpointRecord {
+  EndpointRecordId id = 0;
+  RegistryKind kind = RegistryKind::kWriter;
+  std::string name;
+  std::string backend;
+  std::string address;
+};
+
+using WatchCallback =
+    std::function<void(const std::vector<EndpointRecord>& snapshot)>;
+
+// ---------------- IRegistry ----------------
 class IRegistry {
  public:
   virtual ~IRegistry() = default;
-  virtual bool Register(RegistryKind kind, const std::string& name,
-                        const std::string& url) = 0;
-  virtual bool Unregister(RegistryKind kind, const std::string& name,
-                          const std::string& url) = 0;
-  virtual std::vector<std::string> List(RegistryKind kind,
-                                        const std::string& name) = 0;
+  // 成功返回非零 id；失败返回 0。注册不替换已有记录。
+  virtual EndpointRecordId Register(const EndpointRecord& record) = 0;
+  // 按 id 精确注销；Clear 后的迟到调用返回 true 且不做任何事。
+  virtual bool Unregister(EndpointRecordId id) = 0;
+  // 按 kind+name 返回全部记录；backend 为空串表示不过滤。
+  virtual std::vector<EndpointRecord> Query(
+      RegistryKind kind, const std::string& name,
+      const std::string& backend = std::string()) = 0;
   virtual bool Has(RegistryKind kind, const std::string& name) = 0;
-  virtual int Subscribe(RegistryKind kind, const std::string& name,
-                        std::function<void(const RegistryEvent&)>&& cb) = 0;
-  virtual void Unsubscribe(int id) = 0;
+  // 注册即回传当前一致快照，此后每次变更再回传该键的完整快照。
+  virtual int Watch(RegistryKind kind, const std::string& name,
+                    WatchCallback&& cb) = 0;
+  virtual void Unwatch(int id) = 0;
+  // 幂等：停线程/监听器，清空记录与订阅；可再次 Register/Watch 重启。
+  virtual void Clear() = 0;
 };
 
-// 注入载体。任一字段为空时对应实现退化为默认实现。
+// 注入载体。字段为空时由 ResolveInjection 从运行时入口组装的默认依赖补齐；
+// Core 不再自行选择后端。测试可传入完整或部分注入对象。
 struct InjectionContext {
-  // 第 2 批注入点；为空时退化为 DefaultEndpointFactory()。
   std::shared_ptr<IEndpointFactory> endpoints;
   std::shared_ptr<IRegistry> registry;
 };
+
+// 发现中心监听地址；须在首次 Init/Start 前设置。空串表示保留当前值。
+struct DiscoveryConfig {
+  std::string rep_url;
+  std::string pub_url;
+};
+void ConfigureDiscovery(const DiscoveryConfig& config);
+
+// 运行时入口（Init）调用一次，组装默认端点工厂 + NNG Registry；之后 Core
+// 通过 ResolveInjection 取得补齐后的依赖。Clear 调 ResetDefaultInjection。
+void BootstrapDefaultInjection();
+void ResetDefaultInjection();
+std::shared_ptr<InjectionContext> ResolveInjection(
+    const std::shared_ptr<InjectionContext>& ctx);
 
 std::shared_ptr<IEndpointFactory> DefaultEndpointFactory();
 std::shared_ptr<IRegistry> DefaultRegistry();

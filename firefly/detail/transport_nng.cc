@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -109,18 +110,31 @@ class NngSubscriber final : public Subscriber {
  public:
   explicit NngSubscriber(std::unique_ptr<NngSocket> sock) : sock_(std::move(sock)) {}
 
-  TransferStatus Connect(const std::string& endpoint) override {
+  TransferStatus UpdatePublishers(
+      const std::vector<std::string>& endpoints) override {
     if (closed_.load(std::memory_order_acquire)) return TransferStatus::kClosed;
+    std::vector<std::string> desired;
+    for (const auto& endpoint : endpoints) {
+      if (!endpoint.empty()) desired.push_back(endpoint);
+    }
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (closed_.load(std::memory_order_acquire)) return TransferStatus::kClosed;
-    {
-      std::lock_guard<std::mutex> seen(connected_mutex_);
-      if (connected_.count(endpoint) != 0) return TransferStatus::kOk;
+    for (auto it = dialers_.begin(); it != dialers_.end();) {
+      if (std::find(desired.begin(), desired.end(), it->first) ==
+          desired.end()) {
+        nng_dialer_close(it->second);
+        it = dialers_.erase(it);
+      } else {
+        ++it;
+      }
     }
-    int r = nng_dial(sock_->Socket(), endpoint.c_str(), nullptr, 0);
-    if (r != 0) return MapNngStatus(r);
-    std::lock_guard<std::mutex> seen(connected_mutex_);
-    connected_.insert(endpoint);
+    for (const auto& endpoint : desired) {
+      if (dialers_.count(endpoint) != 0) continue;
+      nng_dialer dialer = NNG_DIALER_INITIALIZER;
+      int r = nng_dial(sock_->Socket(), endpoint.c_str(), &dialer, 0);
+      if (r != 0) return MapNngStatus(r);
+      dialers_[endpoint] = dialer;
+    }
     return TransferStatus::kOk;
   }
 
@@ -161,6 +175,8 @@ class NngSubscriber final : public Subscriber {
     if (closed_.exchange(true, std::memory_order_acq_rel)) return;
     {
       std::lock_guard<std::mutex> lock(io_mutex_);
+      for (auto& kv : dialers_) nng_dialer_close(kv.second);
+      dialers_.clear();
       sock_->Close();
     }
     cv_.notify_all();
@@ -169,8 +185,7 @@ class NngSubscriber final : public Subscriber {
  private:
   std::unique_ptr<NngSocket> sock_;
   std::mutex io_mutex_;
-  std::mutex connected_mutex_;
-  std::set<std::string> connected_;
+  std::map<std::string, nng_dialer> dialers_;  // 受 io_mutex_ 保护
   std::mutex wait_mutex_;
   std::condition_variable cv_;
   std::atomic<bool> closed_{false};
@@ -400,35 +415,60 @@ class NngResponder final : public RpcResponder {
   std::uint64_t next_token_ = 1;  // 只由 Receive 所在 worker 访问
 };
 
-class DefaultRegistryAdapter final : public IRegistry {
+class NngRegistry final : public IRegistry {
  public:
-  bool Register(RegistryKind kind, const std::string& name,
-                const std::string& url) override {
-    return discovery::Registry::instance().Register(kind, name, url);
+  EndpointRecordId Register(const EndpointRecord& record) override {
+    return discovery::Registry::instance().Register(record);
   }
-  bool Unregister(RegistryKind kind, const std::string& name,
-                  const std::string& url) override {
-    return discovery::Registry::instance().Unregister(kind, name, url);
+  bool Unregister(EndpointRecordId id) override {
+    return discovery::Registry::instance().Unregister(id);
   }
-  std::vector<std::string> List(RegistryKind kind,
-                                const std::string& name) override {
-    return discovery::Registry::instance().List(kind, name);
+  std::vector<EndpointRecord> Query(
+      RegistryKind kind, const std::string& name,
+      const std::string& backend = std::string()) override {
+    return discovery::Registry::instance().Query(kind, name, backend);
   }
   bool Has(RegistryKind kind, const std::string& name) override {
     return discovery::Registry::instance().Has(kind, name);
   }
-  int Subscribe(RegistryKind kind, const std::string& name,
-                std::function<void(const RegistryEvent&)>&& cb) override {
-    return discovery::Registry::instance().Subscribe(kind, name, std::move(cb));
+  int Watch(RegistryKind kind, const std::string& name,
+            WatchCallback&& cb) override {
+    return discovery::Registry::instance().Watch(kind, name, std::move(cb));
   }
-  void Unsubscribe(int id) override {
-    discovery::Registry::instance().Unsubscribe(id);
+  void Unwatch(int id) override {
+    discovery::Registry::instance().Unwatch(id);
   }
+  void Clear() override { discovery::Registry::instance().Stop(); }
 };
 
 }  // namespace
 
-class NngEndpointFactory final : public IEndpointFactory {
+namespace {
+
+std::mutex g_assembly_mutex;
+DiscoveryConfig g_discovery_config;
+std::shared_ptr<InjectionContext> g_default_ctx;
+
+std::string EnvValue(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr ? std::string(value) : std::string();
+}
+
+// 调用前持有 g_assembly_mutex。
+void BootstrapLocked() {
+  DiscoveryConfig config = g_discovery_config;
+  const std::string rep = EnvValue("FIREFLY_DISCOVERY_REP_URL");
+  const std::string pub = EnvValue("FIREFLY_DISCOVERY_PUB_URL");
+  if (!rep.empty()) config.rep_url = rep;
+  if (!pub.empty()) config.pub_url = pub;
+  discovery::Registry::Configure(config.rep_url, config.pub_url);
+  g_default_ctx = std::make_shared<InjectionContext>(
+      InjectionContext{DefaultEndpointFactory(), DefaultRegistry()});
+}
+
+}  // namespace
+
+class NngTransportFactory final : public IEndpointFactory {
  public:
   std::unique_ptr<Publisher> CreatePublisher() override {
     auto sock = std::make_unique<NngSocket>();
@@ -454,19 +494,49 @@ class NngEndpointFactory final : public IEndpointFactory {
 };
 
 std::shared_ptr<IEndpointFactory> DefaultEndpointFactory() {
-  static auto factory = std::make_shared<NngEndpointFactory>();
+  static auto factory = std::make_shared<NngTransportFactory>();
   return factory;
 }
 
 std::shared_ptr<IRegistry> DefaultRegistry() {
-  static auto registry = std::make_shared<DefaultRegistryAdapter>();
+  static auto registry = std::make_shared<NngRegistry>();
   return registry;
 }
 
+void ConfigureDiscovery(const DiscoveryConfig& config) {
+  std::lock_guard<std::mutex> lock(g_assembly_mutex);
+  g_discovery_config = config;
+}
+
+void BootstrapDefaultInjection() {
+  std::lock_guard<std::mutex> lock(g_assembly_mutex);
+  BootstrapLocked();
+}
+
+void ResetDefaultInjection() {
+  std::shared_ptr<InjectionContext> old;
+  {
+    std::lock_guard<std::mutex> lock(g_assembly_mutex);
+    old = std::move(g_default_ctx);
+  }
+  if (old && old->registry) old->registry->Clear();
+}
+
 std::shared_ptr<InjectionContext> DefaultInjection() {
-  static auto ctx = std::make_shared<InjectionContext>(InjectionContext{
-      DefaultEndpointFactory(), DefaultRegistry()});
-  return ctx;
+  std::lock_guard<std::mutex> lock(g_assembly_mutex);
+  if (!g_default_ctx) BootstrapLocked();
+  return g_default_ctx;
+}
+
+std::shared_ptr<InjectionContext> ResolveInjection(
+    const std::shared_ptr<InjectionContext>& ctx) {
+  auto defaults = DefaultInjection();
+  auto resolved = std::make_shared<InjectionContext>();
+  resolved->endpoints =
+      (ctx && ctx->endpoints) ? ctx->endpoints : defaults->endpoints;
+  resolved->registry =
+      (ctx && ctx->registry) ? ctx->registry : defaults->registry;
+  return resolved;
 }
 
 }  // namespace detail

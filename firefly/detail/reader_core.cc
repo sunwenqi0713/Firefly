@@ -44,15 +44,16 @@ struct ReaderCore final : ReaderHandle {
     callbacks_cv_.wait(lock, [this] { return in_flight_ == 0; });
   }
 
-  void DialWriter(const std::string& url) {
-    if (url.empty()) return;
-    TransferStatus r = subscriber->Connect(url);
-    if (r != TransferStatus::kOk) {
-      FY_WARN("reader[%s]: connect: %d", config.channel_name.c_str(),
-              static_cast<int>(r));
-      return;
+  void UpdatePublishers(const std::vector<EndpointRecord>& snapshot) {
+    std::vector<std::string> addresses;
+    for (const auto& rec : snapshot) {
+      if (!rec.address.empty()) addresses.push_back(rec.address);
     }
-    FY_INFO("reader[%s]: connected %s", config.channel_name.c_str(), url.c_str());
+    TransferStatus r = subscriber->UpdatePublishers(addresses);
+    if (r != TransferStatus::kOk) {
+      FY_WARN("reader[%s]: update publishers: %d", config.channel_name.c_str(),
+              static_cast<int>(r));
+    }
   }
 
   void RecvLoop() {
@@ -127,13 +128,13 @@ struct ReaderCore final : ReaderHandle {
     const bool on_recv = recv_thread_.joinable() &&
                          recv_thread_.get_id() == std::this_thread::get_id();
     if (!on_recv && recv_thread_.joinable()) recv_thread_.join();
-    if (subscription_id_ != 0) {
-      registry->Unsubscribe(subscription_id_);
-      subscription_id_ = 0;
+    if (watch_id_ != 0) {
+      registry->Unwatch(watch_id_);
+      watch_id_ = 0;
     }
-    if (registered_) {
-      registry->Unregister(RegistryKind::kReader, config.channel_name, "");
-      registered_ = false;
+    if (record_id_ != 0) {
+      registry->Unregister(record_id_);
+      record_id_ = 0;
     }
     if (!on_recv) WaitForCallbacks();
     // 与 ServiceCore 同理：join/wait 完成后才释放自保活引用，避免 core 在
@@ -153,8 +154,8 @@ struct ReaderCore final : ReaderHandle {
   std::unique_ptr<Subscriber> subscriber;
   // 运行期自保活，由 Shutdown 在 join/等待完成后释放。
   std::shared_ptr<ReaderCore> self_keepalive_;
-  int subscription_id_ = 0;
-  bool registered_ = false;
+  int watch_id_ = 0;
+  EndpointRecordId record_id_ = 0;
 
   std::atomic<bool> shutdown_done_{false};
   std::atomic<bool> running_{false};
@@ -181,11 +182,9 @@ Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
     const ReaderConfig& config, OnBytesFunc on_bytes,
     const std::shared_ptr<InjectionContext>& ctx) {
   const std::string where = "CreateReader[channel='" + config.channel_name + "']: ";
-  auto injection = ctx ? ctx : DefaultInjection();
-  auto endpoints = injection->endpoints ? injection->endpoints
-                                       : DefaultEndpointFactory();
-  auto registry =
-      injection->registry ? injection->registry : DefaultRegistry();
+  auto injection = ResolveInjection(ctx);
+  auto endpoints = injection->endpoints;
+  auto registry = injection->registry;
 
   auto core = std::make_shared<ReaderCore>(registry, std::move(on_bytes));
   core->self_keepalive_ = core;
@@ -199,22 +198,32 @@ Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
             where + "endpoint create(Subscriber) failed"};
   }
 
-  // 注册 reader 占位（url 为空），供 writer 的 HasReader 感知
-  registry->Register(RegistryKind::kReader, config.channel_name, "");
-  core->registered_ = true;
+  // Reader 无监听地址也独立登记；id 由 Registry 分配，注销只认 id。
+  EndpointRecord record;
+  record.kind = RegistryKind::kReader;
+  record.name = config.channel_name;
+  core->record_id_ = registry->Register(record);
+  if (core->record_id_ == 0) {
+    core->subscriber->Close();
+    return {nullptr, ErrorCode::kTransport,
+            where + "registry register failed"};
+  }
 
-  // 订阅 writer 上下线事件；事件只带不透明 EndpointId，detail 层才解析。
-  core->subscription_id_ = registry->Subscribe(
+  // Watch 先回传当前一致快照，再派发后续增删；地址集合交给适配器去重建连。
+  core->watch_id_ = registry->Watch(
       RegistryKind::kWriter, config.channel_name,
       [weak = std::weak_ptr<ReaderCore>(core)](
-          const RegistryEvent& ev) {
+          const std::vector<EndpointRecord>& snapshot) {
         auto self = weak.lock();
-        if (!self || !ev.added || !self->running_.load()) return;
-        if (ev.endpoint) self->DialWriter(ev.endpoint->Url());
+        if (!self || self->shutdown_done_.load(std::memory_order_acquire)) return;
+        self->UpdatePublishers(snapshot);
       });
-
-  auto urls = registry->List(RegistryKind::kWriter, config.channel_name);
-  for (const auto& url : urls) core->DialWriter(url);
+  if (core->watch_id_ == 0) {
+    registry->Unregister(core->record_id_);
+    core->record_id_ = 0;
+    core->subscriber->Close();
+    return {nullptr, ErrorCode::kTransport, where + "registry watch failed"};
+  }
 
   core->running_.store(true, std::memory_order_release);
   // 收线程只持有 weak_ptr：释放最后一个外部 shared_ptr 时 core 能析构，
@@ -224,8 +233,7 @@ Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
     if (auto self = weak.lock()) self->RecvLoop();
   });
   core->RegisterWaiter(core);
-  FY_INFO("reader[%s] ok, writers found: %zu", config.channel_name.c_str(),
-          urls.size());
+  FY_INFO("reader[%s] ok", config.channel_name.c_str());
   return {core, ErrorCode::kOk, ""};
 }
 

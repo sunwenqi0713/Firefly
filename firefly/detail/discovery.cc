@@ -1,8 +1,9 @@
 #include "firefly/detail/discovery.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
-#include <cstring>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -39,50 +40,39 @@ const char* KindToString(Kind k) {
 
 namespace {
 
-constexpr char kRegistryRepUrl[] = "tcp://127.0.0.1:37221";
-constexpr char kRegistryPubUrl[] = "tcp://127.0.0.1:37222";
+constexpr char kDefaultRepUrl[] = "tcp://127.0.0.1:37221";
+constexpr char kDefaultPubUrl[] = "tcp://127.0.0.1:37222";
+constexpr char kDefaultBackend[] = "nng";
 constexpr int kPollTimeoutMs = 200;
 constexpr int kReqTimeoutMs = 500;
 
-struct Sub {
+// 发现地址在 Start 时读取；Configure 必须在首次 Start 前调用。
+std::mutex g_config_mutex;
+std::string g_rep_url = kDefaultRepUrl;
+std::string g_pub_url = kDefaultPubUrl;
+
+struct WatchEntry {
   int id;
   Kind kind;
   std::string name;
-  std::function<void(const Event&)> cb;
+  WatchCallback cb;
 };
 
-}  // namespace
+std::string Key(Kind kind, const std::string& name) {
+  return std::string(KindToString(kind)) + "\t" + name;
+}
 
-// 嵌套类定义（私有，仅在实现中使用）
-struct Registry::Impl {
-  bool primary = false;
-  std::atomic<bool> running_{false};
-  std::mutex start_mutex_;
-
-  // 主实例
-  nng_socket rep_sock_{0};
-  nng_socket pub_sock_{0};
-  // 从实例
-  nng_socket req_sock_{0};
-  nng_socket sub_sock_{0};
-
-  std::mutex data_mutex_;
-  std::map<std::string, std::set<std::string>> table_;
-  // 空 URL 占位注册（Reader 用）的引用计数。多个同通道 Reader 各自登记一次，
-  // 不能用 set<string> 合并（否则删一个就把整条记录清空，审查 P1）。
-  std::map<std::string, int> empty_url_refs_;
-
-  std::mutex sub_mutex_;
-  std::vector<Sub> subs_;
-  int next_sub_id_ = 1;
-
-  std::mutex req_mutex_;
-
-  std::thread rep_thread_;
-  std::thread sub_thread_;
-};
-
-namespace {
+// 旧版（无 id 字段）记录派生稳定兼容 id：最高位为 1，与本地分配的 id 不冲突。
+EndpointRecordId LegacyId(Kind kind, const std::string& name,
+                          const std::string& address) {
+  const std::string text = Key(kind, name) + "\t" + address;
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (unsigned char c : text) {
+    hash ^= c;
+    hash *= 1099511628211ULL;
+  }
+  return (std::uint64_t{1} << 63) | (hash & 0x7fffffffffffffffULL);
+}
 
 bool KindFromString(const std::string& s, Kind* out) {
   if (s == "writer") {
@@ -97,10 +87,6 @@ bool KindFromString(const std::string& s, Kind* out) {
   return true;
 }
 
-inline std::string Key(Kind kind, const std::string& name) {
-  return std::string(KindToString(kind)) + "\t" + name;
-}
-
 void CloseSocket(nng_socket& s) {
   if (s.id != 0) {
     nng_close(s);
@@ -108,7 +94,6 @@ void CloseSocket(nng_socket& s) {
   }
 }
 
-// 阻塞接收一条消息并转为字符串；超时/关闭返回空串
 std::string RecvToString(nng_socket s) {
   void* data = nullptr;
   size_t size = 0;
@@ -124,7 +109,6 @@ std::string RecvToString(nng_socket s) {
   return out;
 }
 
-// 发送一条消息
 bool SendRaw(nng_socket s, const std::string& msg) {
   int r = nng_send(s, const_cast<char*>(msg.data()), msg.size(), 0);
   if (r != 0) {
@@ -134,106 +118,229 @@ bool SendRaw(nng_socket s, const std::string& msg) {
   return true;
 }
 
-// 通知本地匹配的订阅者
-void NotifyLocal(Registry::Impl& impl, const Event& ev) {
-  std::lock_guard<std::mutex> lock(impl.sub_mutex_);
-  for (const auto& sub : impl.subs_) {
-    if (sub.kind == ev.kind && sub.name == ev.name && sub.cb) {
-      try {
-        sub.cb(ev);
-      } catch (...) {
-        FY_ERROR("registry: subscriber callback threw");
-      }
+}  // namespace
+
+// 嵌套类定义（私有，仅在实现中使用）
+struct Registry::Impl {
+  bool primary = false;
+  std::atomic<bool> running_{false};
+  std::mutex start_mutex_;
+
+  nng_socket rep_sock_{0};
+  nng_socket pub_sock_{0};
+  nng_socket req_sock_{0};
+  nng_socket sub_sock_{0};
+
+  // 锁序恒为 dispatch_mutex_ → data_mutex_ → sub_mutex_。回调在持有
+  // dispatch_mutex_ 时派发，保证 Watch 的初始快照与后续变更顺序一致。
+  std::mutex dispatch_mutex_;
+  std::mutex data_mutex_;
+  std::map<EndpointRecordId, EndpointRecord> records_;
+  std::map<std::string, std::set<EndpointRecordId>> by_key_;
+  const std::uint32_t process_tag_ = static_cast<std::uint32_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count() &
+      0x7fffffffULL);
+  std::uint32_t next_local_id_ = 1;
+
+  std::mutex sub_mutex_;
+  std::vector<WatchEntry> watches_;
+  int next_watch_id_ = 1;
+
+  std::string rep_url;
+  std::string pub_url;
+
+  std::mutex req_mutex_;
+
+  std::thread rep_thread_;
+  std::thread sub_thread_;
+};
+
+namespace {
+
+EndpointRecordId MakeLocalId(Registry::Impl& impl) {
+  return (static_cast<EndpointRecordId>(impl.process_tag_) << 32) |
+         (impl.next_local_id_++ & 0xffffffffULL);
+}
+
+std::vector<EndpointRecord> SnapshotLocked(Registry::Impl& impl, Kind kind,
+                                           const std::string& name) {
+  std::vector<EndpointRecord> out;
+  const auto it = impl.by_key_.find(Key(kind, name));
+  if (it == impl.by_key_.end()) return out;
+  for (EndpointRecordId id : it->second) {
+    const auto rec = impl.records_.find(id);
+    if (rec != impl.records_.end()) out.push_back(rec->second);
+  }
+  return out;
+}
+
+// 调用前持有 dispatch_mutex_；本函数内部取得 data_mutex_ 与 sub_mutex_。
+void DispatchLocked(Registry::Impl& impl, Kind kind, const std::string& name) {
+  std::vector<WatchCallback> callbacks;
+  std::vector<EndpointRecord> snapshot;
+  {
+    std::lock_guard<std::mutex> data(impl.data_mutex_);
+    snapshot = SnapshotLocked(impl, kind, name);
+  }
+  {
+    std::lock_guard<std::mutex> sub(impl.sub_mutex_);
+    for (const auto& w : impl.watches_) {
+      if (w.kind == kind && w.name == name && w.cb) callbacks.push_back(w.cb);
+    }
+  }
+  for (const auto& cb : callbacks) {
+    try {
+      cb(snapshot);
+    } catch (...) {
+      FY_ERROR("registry: watch callback threw");
     }
   }
 }
 
-// 主实例：广播给其他进程
-void Broadcast(Registry::Impl& impl, const Event& ev) {
-  if (impl.pub_sock_.id == 0) return;
-  std::string note = std::string(ev.added ? "A|" : "R|") + KindToString(ev.kind) +
-                     "|" + ev.name + "|" +
-                     (ev.endpoint ? ev.endpoint->Url() : std::string());
-  SendRaw(impl.pub_sock_, note);
+// 调用前持有 dispatch_mutex_ 与 data_mutex_。
+EndpointRecordId ApplyLocked(Registry::Impl& impl, const EndpointRecord& in,
+                             bool added) {
+  if (added) {
+    EndpointRecord rec = in;
+    if (rec.id == 0 || impl.records_.count(rec.id) != 0) {
+      rec.id = MakeLocalId(impl);
+    }
+    if (rec.backend.empty()) rec.backend = kDefaultBackend;
+    const auto key = Key(rec.kind, rec.name);
+    impl.records_[rec.id] = rec;
+    impl.by_key_[key].insert(rec.id);
+    return rec.id;
+  }
+  EndpointRecordId id = in.id;
+  auto it = impl.records_.find(id);
+  if (it == impl.records_.end()) {
+    // 兼容旧版 UNREG：按 kind+name+address 找回派生 id。
+    for (const auto& kv : impl.records_) {
+      if (kv.second.kind == in.kind && kv.second.name == in.name &&
+          kv.second.address == in.address) {
+        id = kv.first;
+        it = impl.records_.find(id);
+        break;
+      }
+    }
+  }
+  if (it == impl.records_.end()) return 0;
+  const auto key = Key(it->second.kind, it->second.name);
+  impl.records_.erase(it);
+  auto kit = impl.by_key_.find(key);
+  if (kit != impl.by_key_.end()) {
+    kit->second.erase(id);
+    if (kit->second.empty()) impl.by_key_.erase(kit);
+  }
+  return id;
 }
 
-// 主实例：执行一条命令并返回响应文本
+std::string BroadcastNote(const EndpointRecord& rec, bool added) {
+  std::ostringstream out;
+  out << (added ? "A|" : "R|") << KindToString(rec.kind) << '|' << rec.name
+      << '|' << rec.address << '|' << rec.id << '|' << rec.backend;
+  return out.str();
+}
+
+void Broadcast(Registry::Impl& impl, const EndpointRecord& rec, bool added) {
+  if (impl.pub_sock_.id == 0) return;
+  SendRaw(impl.pub_sock_, BroadcastNote(rec, added));
+}
+
+std::string FormatRecords(const std::vector<EndpointRecord>& records) {
+  std::ostringstream out;
+  out << "OK " << records.size() << "\n";
+  for (const auto& rec : records) {
+    out << rec.id << '\t' << rec.backend << '\t' << rec.address << '\n';
+  }
+  return out.str();
+}
+
+// 主实例：执行一条命令并返回响应文本。响应在原协议末尾追加 id，旧版客户端
+// 只读取第一行的 "OK"，忽略新增字段。
 std::string Execute(Registry::Impl& impl, const std::string& req) {
   std::istringstream in(req);
-  std::string cmd, kind, name, url;
+  std::string cmd, kind, name, url, id_text, backend;
   std::getline(in, cmd, '\t');
 
   if (cmd == "REG" || cmd == "UNREG") {
     std::getline(in, kind, '\t');
     std::getline(in, name, '\t');
     std::getline(in, url, '\t');
+    std::getline(in, id_text, '\t');
+    std::getline(in, backend, '\t');
     Kind k;
     if (!KindFromString(kind, &k)) return "ERR bad kind\n";
     if (name.empty()) return "ERR bad name\n";
 
-    Event ev{k, name, MakeEndpointId(url), cmd == "REG"};
+    EndpointRecord rec;
+    rec.id = id_text.empty() ? 0 : std::stoull(id_text);
+    rec.kind = k;
+    rec.name = name;
+    rec.address = url;
+    rec.backend = backend;
+    EndpointRecordId id = 0;
     {
-      std::lock_guard<std::mutex> lock(impl.data_mutex_);
-      auto key = Key(k, name);
-      if (ev.added) {
-        if (url.empty()) {
-          // 占位注册：按引用计数，多个同通道 Reader 互不覆盖。
-          ++impl.empty_url_refs_[key];
-        } else {
-          impl.table_[key].insert(url);
-        }
-      } else {
-        if (url.empty()) {
-          auto rit = impl.empty_url_refs_.find(key);
-          if (rit != impl.empty_url_refs_.end() && --rit->second <= 0) {
-            impl.empty_url_refs_.erase(rit);
-          }
-        } else {
-          auto it = impl.table_.find(key);
-          if (it != impl.table_.end()) {
-            it->second.erase(url);
-            if (it->second.empty()) impl.table_.erase(it);
-          }
-        }
+      std::lock_guard<std::mutex> dispatch(impl.dispatch_mutex_);
+      {
+        std::lock_guard<std::mutex> data(impl.data_mutex_);
+        id = ApplyLocked(impl, rec, cmd == "REG");
+      }
+      if (id != 0) {
+        rec.id = id;
+        DispatchLocked(impl, k, name);
       }
     }
-    NotifyLocal(impl, ev);   // 本进程直接派发
-    Broadcast(impl, ev);     // 跨进程广播
-    return "OK\n";
+    if (id == 0) return "OK\n";
+    Broadcast(impl, rec, cmd == "REG");
+    return "OK " + std::to_string(id) + "\n";
+  }
+  if (cmd == "QLIST") {
+    std::getline(in, kind, '\t');
+    std::getline(in, name, '\t');
+    std::getline(in, backend, '\t');
+    Kind k;
+    if (!KindFromString(kind, &k)) return "ERR bad kind\n";
+    std::vector<EndpointRecord> records;
+    {
+      std::lock_guard<std::mutex> data(impl.data_mutex_);
+      records = SnapshotLocked(impl, k, name);
+    }
+    if (!backend.empty()) {
+      records.erase(std::remove_if(records.begin(), records.end(),
+                                   [&backend](const EndpointRecord& r) {
+                                     return r.backend != backend;
+                                   }),
+                    records.end());
+    }
+    return FormatRecords(records);
   }
   if (cmd == "LIST" || cmd == "HAS") {
     std::getline(in, kind, '\t');
     std::getline(in, name, '\t');
     Kind k;
     if (!KindFromString(kind, &k)) return "ERR bad kind\n";
-    std::vector<std::string> urls;
-    bool has = false;
+    std::vector<EndpointRecord> records;
     {
-      std::lock_guard<std::mutex> lock(impl.data_mutex_);
-      const auto key = Key(k, name);
-      auto it = impl.table_.find(key);
-      if (it != impl.table_.end()) {
-        if (cmd == "LIST") urls.assign(it->second.begin(), it->second.end());
-        has = !it->second.empty();
-      }
-      // 空 URL 占位注册（Reader）也算"存在"，但不作为可 dial 的地址返回。
-      auto rit = impl.empty_url_refs_.find(key);
-      if (rit != impl.empty_url_refs_.end() && rit->second > 0) has = true;
+      std::lock_guard<std::mutex> data(impl.data_mutex_);
+      records = SnapshotLocked(impl, k, name);
     }
-    if (cmd == "LIST") {
-      std::ostringstream out;
-      out << "OK " << urls.size() << "\n";
-      for (const auto& u : urls) out << u << "\n";
-      return out.str();
+    bool has = !records.empty();
+    std::vector<std::string> urls;
+    for (const auto& rec : records) {
+      if (!rec.address.empty()) urls.push_back(rec.address);
     }
-    return has ? "OK 1\n" : "OK 0\n";
+    if (cmd == "HAS") return has ? "OK 1\n" : "OK 0\n";
+    std::ostringstream out;
+    out << "OK " << urls.size() << "\n";
+    for (const auto& u : urls) out << u << '\n';
+    return out.str();
   }
   return "ERR unknown cmd\n";
 }
 
-// 主实例：REP 服务线程
 void RunRepThread(Registry::Impl& impl) {
-  FY_INFO("registry: primary on %s", kRegistryRepUrl);
+  FY_INFO("registry: primary on %s", impl.rep_url.c_str());
   while (impl.running_.load() &&
          !runtime::ShutdownManager::instance().IsShutdown()) {
     std::string req = RecvToString(impl.rep_sock_);
@@ -244,32 +351,81 @@ void RunRepThread(Registry::Impl& impl) {
   FY_INFO("registry: rep loop exit");
 }
 
-// 从实例：订阅广播
 void RunSubLoop(Registry::Impl& impl) {
-  FY_INFO("registry: follower on %s", kRegistryRepUrl);
+  FY_INFO("registry: follower on %s", impl.rep_url.c_str());
   while (impl.running_.load() &&
          !runtime::ShutdownManager::instance().IsShutdown()) {
     std::string line = RecvToString(impl.sub_sock_);
     if (line.empty()) continue;
     std::istringstream in(line);
-    std::string tag, kind, name, url;
+    std::string tag, kind, name, address, id_text, backend;
     std::getline(in, tag, '|');
     std::getline(in, kind, '|');
     std::getline(in, name, '|');
-    std::getline(in, url, '|');
+    std::getline(in, address, '|');
+    std::getline(in, id_text, '|');
+    std::getline(in, backend, '|');
     Kind k;
     if (!KindFromString(kind, &k)) continue;
-    NotifyLocal(impl, Event{k, name, MakeEndpointId(url), tag == "A"});
+    EndpointRecord rec;
+    rec.kind = k;
+    rec.name = name;
+    rec.address = address;
+    rec.id = id_text.empty() ? LegacyId(k, name, address)
+                             : std::stoull(id_text);
+    rec.backend = backend.empty() ? kDefaultBackend : backend;
+    const bool added = tag == "A";
+    {
+      std::lock_guard<std::mutex> dispatch(impl.dispatch_mutex_);
+      bool changed = false;
+      {
+        std::lock_guard<std::mutex> data(impl.data_mutex_);
+        const auto existing = impl.records_.find(rec.id);
+        if (added) {
+          // 本地 Register 已应用过同一条记录时，广播是重复通知。
+          if (existing == impl.records_.end() || existing->second.address != rec.address) {
+            ApplyLocked(impl, rec, true);
+            changed = true;
+          }
+        } else if (existing != impl.records_.end()) {
+          ApplyLocked(impl, rec, false);
+          changed = true;
+        }
+      }
+      if (changed) DispatchLocked(impl, k, name);
+    }
   }
   FY_INFO("registry: follower loop exit");
 }
 
-// 从实例：REQ 向主实例发命令
 std::string RemoteRequest(Registry::Impl& impl, const std::string& line) {
   std::lock_guard<std::mutex> lock(impl.req_mutex_);
   if (impl.req_sock_.id == 0) return "";
   if (!SendRaw(impl.req_sock_, line)) return "";
   return RecvToString(impl.req_sock_);
+}
+
+std::vector<EndpointRecord> ParseRecords(const std::string& resp) {
+  std::vector<EndpointRecord> out;
+  std::istringstream in(resp);
+  std::string status;
+  std::size_t count = 0;
+  in >> status >> count;
+  if (status != "OK") return out;
+  std::string line;
+  std::getline(in, line);  // 吞掉行尾
+  while (out.size() < count && std::getline(in, line)) {
+    if (line.empty()) continue;
+    std::istringstream fields(line);
+    EndpointRecord rec;
+    std::string id_text;
+    std::getline(fields, id_text, '\t');
+    std::getline(fields, rec.backend, '\t');
+    std::getline(fields, rec.address, '\t');
+    rec.id = id_text.empty() ? 0 : std::stoull(id_text);
+    out.push_back(std::move(rec));
+  }
+  return out;
 }
 
 }  // namespace anonymous
@@ -284,18 +440,28 @@ Registry& Registry::instance() {
   return registry;
 }
 
+void Registry::Configure(const std::string& rep_url, const std::string& pub_url) {
+  std::lock_guard<std::mutex> lock(g_config_mutex);
+  if (!rep_url.empty()) g_rep_url = rep_url;
+  if (!pub_url.empty()) g_pub_url = pub_url;
+}
+
 bool Registry::Start() {
   std::lock_guard<std::mutex> lock(impl_->start_mutex_);
   if (impl_->running_.load()) return true;
+  {
+    std::lock_guard<std::mutex> cfg(g_config_mutex);
+    impl_->rep_url = g_rep_url;
+    impl_->pub_url = g_pub_url;
+  }
 
-  // 1) 尝试成为主注册中心
   int r = nng_rep0_open(&impl_->rep_sock_);
   if (r != 0) {
     FY_ERROR("registry: nng_rep0_open: %s", nng_strerror(r));
     return false;
   }
   nng_setopt_ms(impl_->rep_sock_, NNG_OPT_RECVTIMEO, kPollTimeoutMs);
-  r = nng_listen(impl_->rep_sock_, kRegistryRepUrl, nullptr, 0);
+  r = nng_listen(impl_->rep_sock_, impl_->rep_url.c_str(), nullptr, 0);
   if (r == 0) {
     r = nng_pub0_open(&impl_->pub_sock_);
     if (r != 0) {
@@ -303,9 +469,10 @@ bool Registry::Start() {
       CloseSocket(impl_->rep_sock_);
       return false;
     }
-    r = nng_listen(impl_->pub_sock_, kRegistryPubUrl, nullptr, 0);
+    r = nng_listen(impl_->pub_sock_, impl_->pub_url.c_str(), nullptr, 0);
     if (r != 0) {
-      FY_ERROR("registry: pub listen %s: %s", kRegistryPubUrl, nng_strerror(r));
+      FY_ERROR("registry: pub listen %s: %s", impl_->pub_url.c_str(),
+               nng_strerror(r));
       CloseSocket(impl_->rep_sock_);
       CloseSocket(impl_->pub_sock_);
       return false;
@@ -317,9 +484,9 @@ bool Registry::Start() {
     return true;
   }
 
-  // 端口被占用：作为从实例连接既有主注册中心
   if (r != NNG_EADDRINUSE) {
-    FY_ERROR("registry: rep listen %s: %s", kRegistryRepUrl, nng_strerror(r));
+    FY_ERROR("registry: rep listen %s: %s", impl_->rep_url.c_str(),
+             nng_strerror(r));
     CloseSocket(impl_->rep_sock_);
     return false;
   }
@@ -332,9 +499,10 @@ bool Registry::Start() {
   }
   nng_setopt_ms(impl_->req_sock_, NNG_OPT_SENDTIMEO, kReqTimeoutMs);
   nng_setopt_ms(impl_->req_sock_, NNG_OPT_RECVTIMEO, kReqTimeoutMs);
-  r = nng_dial(impl_->req_sock_, kRegistryRepUrl, nullptr, 0);
+  r = nng_dial(impl_->req_sock_, impl_->rep_url.c_str(), nullptr, 0);
   if (r != 0) {
-    FY_ERROR("registry: req dial %s: %s", kRegistryRepUrl, nng_strerror(r));
+    FY_ERROR("registry: req dial %s: %s", impl_->rep_url.c_str(),
+             nng_strerror(r));
     CloseSocket(impl_->req_sock_);
     return false;
   }
@@ -347,9 +515,10 @@ bool Registry::Start() {
   }
   nng_setopt(impl_->sub_sock_, NNG_OPT_SUB_SUBSCRIBE, "", 0);
   nng_setopt_ms(impl_->sub_sock_, NNG_OPT_RECVTIMEO, kPollTimeoutMs);
-  r = nng_dial(impl_->sub_sock_, kRegistryPubUrl, nullptr, 0);
+  r = nng_dial(impl_->sub_sock_, impl_->pub_url.c_str(), nullptr, 0);
   if (r != 0) {
-    FY_ERROR("registry: sub dial %s: %s", kRegistryPubUrl, nng_strerror(r));
+    FY_ERROR("registry: sub dial %s: %s", impl_->pub_url.c_str(),
+             nng_strerror(r));
     CloseSocket(impl_->req_sock_);
     CloseSocket(impl_->sub_sock_);
     return false;
@@ -365,7 +534,6 @@ bool Registry::Start() {
 void Registry::Stop() {
   if (!impl_->running_.load()) return;
   impl_->running_.store(false);
-  // recv 内部带轮询超时，join 会在 ~200ms 内返回
   if (impl_->rep_thread_.joinable() &&
       impl_->rep_thread_.get_id() != std::this_thread::get_id()) {
     impl_->rep_thread_.join();
@@ -378,56 +546,118 @@ void Registry::Stop() {
   CloseSocket(impl_->pub_sock_);
   CloseSocket(impl_->req_sock_);
   CloseSocket(impl_->sub_sock_);
-  // Clear/重启语义：发现表与订阅表必须清空，否则 Clear() 后旧端点析构时
-  // 的 Unregister 会因 stopped 被跳过，重启后残留幽灵记录（审查 P2）。
+  // Clear/重启语义：记录、索引与 Watch 订阅一起清空，迟到 Unregister 为 no-op。
   {
-    std::lock_guard<std::mutex> lock(impl_->data_mutex_);
-    impl_->table_.clear();
-    impl_->empty_url_refs_.clear();
-  }
-  {
-    std::lock_guard<std::mutex> lock(impl_->sub_mutex_);
-    impl_->subs_.clear();
-  }
-}
-
-bool Registry::Register(Kind kind, const std::string& name,
-                        const std::string& url) {
-  if (!Start()) return false;
-  std::string line =
-      "REG\t" + std::string(KindToString(kind)) + "\t" + name + "\t" + url;
-  if (impl_->primary) return Execute(*impl_, line) == "OK\n";
-  return RemoteRequest(*impl_, line) == "OK\n";
-}
-
-bool Registry::Unregister(Kind kind, const std::string& name,
-                          const std::string& url) {
-  if (!impl_->running_.load()) return true;
-  std::string line =
-      "UNREG\t" + std::string(KindToString(kind)) + "\t" + name + "\t" + url;
-  if (impl_->primary) return Execute(*impl_, line) == "OK\n";
-  return RemoteRequest(*impl_, line) == "OK\n";
-}
-
-std::vector<std::string> Registry::List(Kind kind, const std::string& name) {
-  std::vector<std::string> urls;
-  if (!Start()) return urls;
-  std::string line = "LIST\t" + std::string(KindToString(kind)) + "\t" + name;
-  std::string resp =
-      impl_->primary ? Execute(*impl_, line) : RemoteRequest(*impl_, line);
-  std::istringstream in(resp);
-  std::string status;
-  int count = 0;
-  in >> status >> count;
-  if (status != "OK") return urls;
-  std::string u;
-  for (int i = 0; i < count && std::getline(in, u, '\n');) {
-    if (!u.empty()) {
-      urls.push_back(u);
-      ++i;
+    std::lock_guard<std::mutex> dispatch(impl_->dispatch_mutex_);
+    {
+      std::lock_guard<std::mutex> data(impl_->data_mutex_);
+      impl_->records_.clear();
+      impl_->by_key_.clear();
+    }
+    {
+      std::lock_guard<std::mutex> sub(impl_->sub_mutex_);
+      impl_->watches_.clear();
     }
   }
-  return urls;
+  impl_->primary = false;
+}
+
+EndpointRecordId Registry::Register(const EndpointRecord& record) {
+  if (!Start()) return 0;
+  std::ostringstream line;
+  line << "REG\t" << KindToString(record.kind) << '\t' << record.name << '\t'
+       << record.address << '\t' << record.id << '\t' << record.backend;
+  EndpointRecordId id = record.id;
+  std::string resp = impl_->primary ? Execute(*impl_, line.str())
+                                    : RemoteRequest(*impl_, line.str());
+  if (resp.rfind("OK ", 0) == 0) {
+    try {
+      id = std::stoull(resp.substr(3));
+    } catch (...) {
+      id = LegacyId(record.kind, record.name, record.address);
+    }
+  } else if (resp == "OK\n") {
+    id = LegacyId(record.kind, record.name, record.address);
+  } else {
+    return 0;
+  }
+  // 从实例：请求返回后先把记录落到本地表，广播中的同一 id 会被识别为重复。
+  if (!impl_->primary && id != 0) {
+    EndpointRecord rec = record;
+    rec.id = id;
+    if (rec.backend.empty()) rec.backend = kDefaultBackend;
+    {
+      std::lock_guard<std::mutex> dispatch(impl_->dispatch_mutex_);
+      bool changed = false;
+      {
+        std::lock_guard<std::mutex> data(impl_->data_mutex_);
+        if (impl_->records_.count(id) == 0) {
+          ApplyLocked(*impl_, rec, true);
+          changed = true;
+        }
+      }
+      if (changed) DispatchLocked(*impl_, rec.kind, rec.name);
+    }
+  }
+  return id;
+}
+
+bool Registry::Unregister(EndpointRecordId id) {
+  if (!impl_->running_.load()) return true;  // Clear 后的迟到注销
+  if (id == 0) return true;
+  EndpointRecord rec;
+  {
+    std::lock_guard<std::mutex> data(impl_->data_mutex_);
+    const auto it = impl_->records_.find(id);
+    if (it != impl_->records_.end()) rec = it->second;
+  }
+  std::ostringstream line;
+  line << "UNREG\t" << KindToString(rec.kind) << '\t' << rec.name << '\t'
+       << rec.address << '\t' << id;
+  std::string resp = impl_->primary ? Execute(*impl_, line.str())
+                                    : RemoteRequest(*impl_, line.str());
+  if (resp.empty()) return false;
+  if (!impl_->primary) {
+    std::lock_guard<std::mutex> dispatch(impl_->dispatch_mutex_);
+    std::lock_guard<std::mutex> data(impl_->data_mutex_);
+    if (impl_->records_.count(id) != 0) ApplyLocked(*impl_, rec, false);
+  }
+  return true;
+}
+
+std::vector<EndpointRecord> Registry::Query(RegistryKind kind,
+                                            const std::string& name,
+                                            const std::string& backend) {
+  if (!Start()) return {};
+  std::ostringstream line;
+  line << "QLIST\t" << KindToString(kind) << '\t' << name << '\t' << backend;
+  std::string resp = impl_->primary ? Execute(*impl_, line.str())
+                                    : RemoteRequest(*impl_, line.str());
+  auto records = ParseRecords(resp);
+  if (!records.empty() || resp.rfind("OK ", 0) == 0) return records;
+  // 旧版主实例不认识 QLIST：退回原 LIST 文本协议并派生兼容字段。
+  line.str(std::string());
+  line.clear();
+  line << "LIST\t" << KindToString(kind) << '\t' << name;
+  resp = impl_->primary ? Execute(*impl_, line.str())
+                        : RemoteRequest(*impl_, line.str());
+  std::istringstream in(resp);
+  std::string status;
+  std::size_t count = 0;
+  in >> status >> count;
+  if (status != "OK") return {};
+  std::string address;
+  while (records.size() < count && std::getline(in, address, '\n')) {
+    if (address.empty()) continue;
+    EndpointRecord rec;
+    rec.kind = kind;
+    rec.name = name;
+    rec.address = address;
+    rec.backend = kDefaultBackend;
+    rec.id = LegacyId(kind, name, address);
+    if (backend.empty() || backend == rec.backend) records.push_back(rec);
+  }
+  return records;
 }
 
 bool Registry::Has(Kind kind, const std::string& name) {
@@ -438,21 +668,48 @@ bool Registry::Has(Kind kind, const std::string& name) {
   return resp == "OK 1\n";
 }
 
-int Registry::Subscribe(Kind kind, const std::string& name,
-                        std::function<void(const Event&)>&& cb) {
+int Registry::Watch(Kind kind, const std::string& name, WatchCallback&& cb) {
   if (!Start()) return 0;
-  std::lock_guard<std::mutex> lock(impl_->sub_mutex_);
-  int id = impl_->next_sub_id_++;
-  impl_->subs_.push_back(Sub{id, kind, name, std::move(cb)});
+  int id = 0;
+  std::vector<EndpointRecord> snapshot;
+  {
+    std::lock_guard<std::mutex> dispatch(impl_->dispatch_mutex_);
+    {
+      std::lock_guard<std::mutex> sub(impl_->sub_mutex_);
+      id = impl_->next_watch_id_++;
+      impl_->watches_.push_back(WatchEntry{id, kind, name, std::move(cb)});
+    }
+    {
+      std::lock_guard<std::mutex> data(impl_->data_mutex_);
+      snapshot = SnapshotLocked(*impl_, kind, name);
+    }
+    if (id != 0 && !impl_->watches_.empty()) {
+      WatchCallback initial;
+      {
+        std::lock_guard<std::mutex> sub(impl_->sub_mutex_);
+        for (const auto& w : impl_->watches_) {
+          if (w.id == id) initial = w.cb;
+        }
+      }
+      if (initial) {
+        try {
+          initial(snapshot);
+        } catch (...) {
+          FY_ERROR("registry: watch callback threw");
+        }
+      }
+    }
+  }
   return id;
 }
 
-void Registry::Unsubscribe(int id) {
-  std::lock_guard<std::mutex> lock(impl_->sub_mutex_);
-  auto& subs = impl_->subs_;
-  subs.erase(std::remove_if(subs.begin(), subs.end(),
-                            [id](const Sub& s) { return s.id == id; }),
-             subs.end());
+void Registry::Unwatch(int id) {
+  std::lock_guard<std::mutex> dispatch(impl_->dispatch_mutex_);
+  std::lock_guard<std::mutex> sub(impl_->sub_mutex_);
+  auto& watches = impl_->watches_;
+  watches.erase(std::remove_if(watches.begin(), watches.end(),
+                               [id](const WatchEntry& w) { return w.id == id; }),
+                watches.end());
 }
 
 }  // namespace discovery

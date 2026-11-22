@@ -31,17 +31,26 @@ namespace discovery {
 using Kind = firefly::detail::RegistryKind;
 using Event = firefly::detail::RegistryEvent;
 using firefly::detail::EndpointId;
+using firefly::detail::EndpointRecord;
+using firefly::detail::EndpointRecordId;
+using firefly::detail::IRegistry;
 using firefly::detail::MakeEndpointId;
+using firefly::detail::RegistryKind;
+using firefly::detail::WatchCallback;
 
 const char* KindToString(Kind k);
 
-// 轻量注册中心客户端（进程单例）。
+// 轻量注册中心客户端（进程单例；detail 层可由 NngRegistry 适配成 IRegistry）。
 // - 第一个成功 bind 的进程为主注册中心（REP 服务端 + PUB 广播）；
 // - 其余进程为从实例（REQ 查询/注册 + SUB 接收广播）。
-// 实现见 discovery.cc（基于 NNG）。
-class Registry {
+// 实现见 discovery.cc（基于 NNG）。记录模型与 Watch 快照语义见 interfaces.h
+// 的 IRegistry 契约注释；Start/Stop 保留给发现层单测与 Clear 使用。
+class Registry final : public IRegistry {
  public:
   static Registry& instance();
+
+  // 在首次 Start 前设置发现中心 REP/PUB 地址；空串保持默认端口。
+  static void Configure(const std::string& rep_url, const std::string& pub_url);
 
   // 实现细节（定义于 discovery.cc），仅用于 pimpl
   struct Impl;
@@ -54,20 +63,17 @@ class Registry {
   // 停止注册中心：退出服务线程并关闭所有内部 socket
   void Stop();
 
-  // 注册/注销：成功返回 true。url 为内部地址（仅 detail 层构造/传入）
-  bool Register(Kind kind, const std::string& name, const std::string& url);
-  bool Unregister(Kind kind, const std::string& name, const std::string& url);
-
-  // 查询：返回 name 下所有端点地址字符串（仅供 detail 层 dial）
-  std::vector<std::string> List(Kind kind, const std::string& name);
-
-  // name 下是否存在至少一个注册项
-  bool Has(Kind kind, const std::string& name);
-
-  // 订阅某名字的变更事件；返回订阅号，用 Unsubscribe 注销
-  int Subscribe(Kind kind, const std::string& name,
-                std::function<void(const Event&)>&& cb);
-  void Unsubscribe(int id);
+  // IRegistry 记录模型
+  EndpointRecordId Register(const EndpointRecord& record) override;
+  bool Unregister(EndpointRecordId id) override;
+  std::vector<EndpointRecord> Query(
+      RegistryKind kind, const std::string& name,
+      const std::string& backend = std::string()) override;
+  bool Has(RegistryKind kind, const std::string& name) override;
+  int Watch(RegistryKind kind, const std::string& name,
+            WatchCallback&& cb) override;
+  void Unwatch(int id) override;
+  void Clear() override { Stop(); }
 
  private:
   Registry();

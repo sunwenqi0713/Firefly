@@ -169,6 +169,11 @@ add_executable(firefly_batch1_contract_test tests/batch1_contract_test.cpp)
 target_link_libraries(firefly_batch1_contract_test PRIVATE firefly test_messages)
 add_test(NAME batch1_contract_test COMMAND firefly_batch1_contract_test)
 
+# 第 3 批行为契约：记录模型 / 生命周期 / 注册失败
+add_executable(firefly_batch3_contract_test tests/batch3_contract_test.cpp)
+target_link_libraries(firefly_batch3_contract_test PRIVATE firefly test_messages)
+add_test(NAME batch3_contract_test COMMAND firefly_batch3_contract_test)
+
 # 旧版 raw-NNG 进程与新版公开 API 进程的线兼容辅助程序（手工互测入口）
 add_executable(firefly_interop_helper tests/interop_helper.cpp)
 target_link_libraries(firefly_interop_helper PRIVATE firefly test_messages)
@@ -185,7 +190,7 @@ set_tests_properties(
     deprecated_compat_test shutdown_test request_cancel_test duplicate_test
     endpoint_lifecycle_test callback_contract_test callback_context_test
     stats_test fake_transport_test clear_wait_test review_regression_test
-    batch1_contract_test
+    batch1_contract_test batch3_contract_test
     PROPERTIES RESOURCE_LOCK firefly_registry_port)
 
 # ---------------- 使用示例 ----------------

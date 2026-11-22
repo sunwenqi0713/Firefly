@@ -127,12 +127,12 @@ struct ClientCore final : ClientHandle {
       out.code = ErrorCode::kTimeout;
       return out;
     }
-    auto urls = registry->List(RegistryKind::kService, service_name);
+    auto records = registry->Query(RegistryKind::kService, service_name);
     if (RemainingMs(deadline) <= 0) {
       out.code = ErrorCode::kTimeout;
       return out;
     }
-    if (urls.empty()) {
+    if (records.empty()) {
       out.code = ErrorCode::kServiceNotFound;
       return out;
     }
@@ -142,7 +142,7 @@ struct ClientCore final : ClientHandle {
     }
     std::string frame;
     TransferStatus status =
-        requester->Exchange(urls.front(), bytes, deadline, &frame);
+        requester->Exchange(records.front().address, bytes, deadline, &frame);
     if (status != TransferStatus::kOk) {
       out.code = MapExchangeStatus(status);
       return out;
@@ -292,11 +292,9 @@ struct ClientCore final : ClientHandle {
 Result<std::shared_ptr<ClientHandle>> CreateClientCore(
     const std::string& node_name, const std::string& service_name,
     const std::shared_ptr<InjectionContext>& ctx) {
-  auto injection = ctx ? ctx : DefaultInjection();
-  auto endpoints = injection->endpoints ? injection->endpoints
-                                       : DefaultEndpointFactory();
-  auto registry =
-      injection->registry ? injection->registry : DefaultRegistry();
+  auto injection = ResolveInjection(ctx);
+  auto endpoints = injection->endpoints;
+  auto registry = injection->registry;
   auto requester = endpoints->CreateRequester();
   if (!requester) {
     return {nullptr, ErrorCode::kTransport,

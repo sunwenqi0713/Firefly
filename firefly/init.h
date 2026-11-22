@@ -14,7 +14,10 @@ namespace firefly {
 // 可用；客户端应显式调用 Client::WaitForService() 等待服务就绪。
 //
 // binary_name 参数当前未使用（runtime.cc 中 (void)binary_name），保留以兼容
-// 现有签名。Init 幂等：重复调用返回 true。
+// 现有签名。Init 幂等：重复调用返回 true。Init 在运行时入口一次组装默认
+// 端点工厂与 NNG Registry；测试可通过 detail::InjectionContext 注入替身，
+// 发现中心地址可由 detail::ConfigureDiscovery 或环境变量
+// FIREFLY_DISCOVERY_REP_URL / FIREFLY_DISCOVERY_PUB_URL 在首次使用前配置。
 //
 // ---- 关停语义（Shutdown / WaitForShutdown / WaitForShutdownFor / Clear） ----
 // Shutdown()：主动触发全局关停，复用 ShutdownManager 的 shutdown_ 状态位

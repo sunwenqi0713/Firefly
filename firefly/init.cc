@@ -2,6 +2,7 @@
 
 #include "firefly/common/log.h"
 #include "firefly/detail/discovery.h"
+#include "firefly/detail/interfaces.h"
 #include "firefly/runtime.h"
 
 namespace firefly {
@@ -11,7 +12,9 @@ bool Init(const char* binary_name) {
   if (!ok) {
     return false;
   }
-  // 注册中心惰性启动：第一次 Register/List/Subscribe 时才真正 bind/dial
+  // 运行时入口一次组装默认端点工厂 + NNG Registry；Core 只接收已解析依赖。
+  detail::BootstrapDefaultInjection();
+  // 注册中心惰性启动：第一次 Register/Query/Watch 时才真正 bind/dial
   return true;
 }
 
@@ -32,7 +35,7 @@ bool WaitForShutdownFor(std::chrono::milliseconds timeout) {
 }
 
 void Clear() {
-  discovery::Registry::instance().Stop();
+  detail::ResetDefaultInjection();  // 停默认 Registry 并清空默认组装
   // 阶段三：等待此刻仍在途的端点回调返回（Reader/Service），再清全局状态。
   // 注意：全局关停不关闭端点线程，Clear 返回后新消息仍可能触发新回调。
   runtime::ShutdownManager::instance().WaitForInFlightCallbacks();
