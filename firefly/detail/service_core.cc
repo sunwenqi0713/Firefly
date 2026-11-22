@@ -22,8 +22,9 @@ struct ServiceCore final : ServiceHandle {
 
   ~ServiceCore() override {
     Shutdown();
-    // 兜底：若在 worker 线程内析构（无法 join 自身），detach 避免 thread
-    // 析构 terminate。running_=false 已保证循环在本次回调后退出。
+    // 兜底：仅当 core 在 worker 线程内析构（回调线程触发停机且外部引用已
+    // 全部释放）时线程仍 joinable 且无法 join 自身，detach 避免 terminate。
+    // 正常路径 Shutdown 已 join，joinable 为 false，不会走到这里。
     if (worker_.joinable()) worker_.detach();
   }
 
@@ -86,8 +87,8 @@ struct ServiceCore final : ServiceHandle {
     FY_INFO("service[%s]: worker exit", service_name.c_str());
   }
 
-  // 幂等：Service::~Service() 显式 Shutdown 与 ~ServiceCore() 兜底 Shutdown
-  // 都会走这里；exchange 保证只 join/注销一次。
+  // 幂等：Service::~Service() 显式 Shutdown、全局关停兜底、~ServiceCore()
+  // 三条入口都走这里；exchange 保证停止接收/退出 worker/注销只执行一次。
   void Shutdown() {
     if (shutdown_done_.exchange(true)) return;
     running_.store(false, std::memory_order_release);
@@ -103,6 +104,11 @@ struct ServiceCore final : ServiceHandle {
     }
     if (socket) socket->Close();
     if (!on_worker) WaitForCallbacks();
+    // 自保活引用只在清理完成后释放：确保 join() 期间 worker 线程内的
+    // weak.lock() 持有的强引用之外仍有引用，core 不会在 join 过程中析构
+    // （否则析构里的 detach 与 join 并发，属未定义行为）。回调线程触发时
+    // worker 自己的局部强引用仍会保活到循环退出，之后才在 worker 上析构。
+    self_keepalive_.reset();
   }
 
   std::string node_name;
@@ -112,6 +118,8 @@ struct ServiceCore final : ServiceHandle {
   OnRequestFunc on_request;
 
   std::unique_ptr<ISocket> socket;
+  // 运行期自保活，由 Shutdown 在 join/等待完成后释放（打破自引用环）。
+  std::shared_ptr<ServiceCore> self_keepalive_;
   bool registered_ = false;
   std::atomic<bool> shutdown_done_{false};
   std::atomic<bool> running_{false};
@@ -138,6 +146,7 @@ Result<std::shared_ptr<ServiceHandle>> CreateServiceCore(
       injection->registry ? injection->registry : DefaultRegistry();
 
   auto core = std::make_shared<ServiceCore>(registry, std::move(on_request));
+  core->self_keepalive_ = core;
   core->node_name = node_name;
   core->service_name = service_name;
   core->socket = transport->Create(TransportKind::kRep);

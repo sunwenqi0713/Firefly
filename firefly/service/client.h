@@ -26,8 +26,17 @@
 //   - Cancel 后服务端响应迟到：直接丢弃。不做请求去重/幂等表 —— 同一请求
 //     Cancel 后再 Send 不保证幂等，由上层业务负责。
 // Client::Shutdown() 语义：置位关停 → 取消全部在途请求（以 kCancelled 兑现）
-//   → 阻塞至全部在途请求兑现或取消 → 关闭 socket 释放 impl_。
-// @threadsafe SendRequest 经 core 内 io_mutex_ 串行化（REQ 单在途限制）；
+//   → 停止 I/O 执行者并等待在途请求退出 → 关闭 socket 释放 impl_。
+//
+// ---- 第 1 批：同步/异步共用截止时间与两态取消 ----
+// SendRequest 与 AsyncSendRequest 的 timeout 是端到端预算（从入队这一刻起
+// 算）：排队、服务查询、连接、发送、接收共用同一绝对 deadline，任一步耗尽
+// 都以 kTimeout 失败；有界请求队列满时同步返回 kQueueFull、异步 future 抛
+// FireflyException{kQueueFull}，不扩公共 API。
+// Cancel 区分两态：排队中取消使服务端执行 0 次；已提交发送后取消只结束
+// 本地等待（兑现 kCancelled），服务端仍可能执行该请求。每请求只兑现一次。
+// Shutdown 后或同一 Client 重新 Init() 后，旧 RequestHandle::Cancel() 恒 false。
+// @threadsafe SendRequest/AsyncSendRequest 共用 core 的单一 I/O 执行者；
 //   Cancel 经 pending_mutex_ 保护，可并发调用；
 //   不得与同一 Client 的 Shutdown()/析构并发（impl_ 生命周期竞态）。
 //
@@ -77,7 +86,7 @@ class Client : public ClientBase {
     SharedFuture future;
 
     // 返回 true=已取消且 future 已以 kCancelled 兑现；
-    // false=请求已完成/已兑现/已取消/Client 已 Shutdown。
+    // false=请求已完成/已兑现/已取消/Client 已 Shutdown 或已重新 Init。
     bool Cancel() { return cancel_fn_ ? cancel_fn_(id) : false; }
 
    private:

@@ -54,20 +54,27 @@ Node::~Node() {
 }
 
 bool Node::DeleteReader(const std::string& channel_name) {
-  // 先在锁内摘出指针并从表移除，再在锁外 Shutdown：
-  // Shutdown 会 join 收线程并等待在途回调，回调内可能调用 GetReader/Observe
-  // 需要 readers_mutex_；若持锁等待将自锁死锁（审查 P1）。
+  // 锁内标记"正在删除"，但保留 readers_ 表项：回调内并发 GetReader/Observe
+  // 仍能正常拿到对象；同名 Reader 在 Shutdown 完成前一律 kDuplicate。
   std::shared_ptr<ReaderBase> victim;
   {
     std::lock_guard<std::mutex> lg(readers_mutex_);
     auto it = readers_.find(channel_name);
-    if (it == readers_.end()) {
-      return false;  // 不存在
+    if (it == readers_.end() || readers_deleting_.count(channel_name) != 0) {
+      return false;  // 不存在或已在删除中
     }
     victim = it->second;
-    readers_.erase(it);
+    readers_deleting_.insert(channel_name);
   }
+  // 节点锁外 Shutdown：join 收线程并等待在途回调，回调可能需要 readers_mutex_。
   victim->Shutdown();
+  // Shutdown 完成（线程已退出、注册已注销）后才释放名称。
+  {
+    std::lock_guard<std::mutex> lg(readers_mutex_);
+    readers_deleting_.erase(channel_name);
+    auto it = readers_.find(channel_name);
+    if (it != readers_.end() && it->second == victim) readers_.erase(it);
+  }
   return true;
 }
 

@@ -164,6 +164,11 @@ add_executable(firefly_review_regression_test tests/review_regression_test.cpp)
 target_link_libraries(firefly_review_regression_test PRIVATE firefly test_messages)
 add_test(NAME review_regression_test COMMAND firefly_review_regression_test)
 
+# 第 1 批行为契约：Service 停机 / Reader 删除 / RPC 两态取消
+add_executable(firefly_batch1_contract_test tests/batch1_contract_test.cpp)
+target_link_libraries(firefly_batch1_contract_test PRIVATE firefly test_messages)
+add_test(NAME batch1_contract_test COMMAND firefly_batch1_contract_test)
+
 # ---------------------------------------------------------------------------
 # 端口隔离（审查验证结果）：发现中心使用固定端口 37221/37222，多个测试进程
 # 并行启动时会争抢主/从角色，导致注册请求超时（discovery_test/clear_wait_test
@@ -176,6 +181,7 @@ set_tests_properties(
     deprecated_compat_test shutdown_test request_cancel_test duplicate_test
     endpoint_lifecycle_test callback_contract_test callback_context_test
     stats_test fake_transport_test clear_wait_test review_regression_test
+    batch1_contract_test
     PROPERTIES RESOURCE_LOCK firefly_registry_port)
 
 # ---------------- 使用示例 ----------------

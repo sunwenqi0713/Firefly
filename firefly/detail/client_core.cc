@@ -3,7 +3,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -19,63 +23,75 @@ namespace firefly {
 namespace detail {
 namespace {
 
+using Deadline = std::chrono::steady_clock::time_point;
+
+// 有界请求队列：同步与异步共用，队列满时直接以现有错误码 kQueueFull 失败。
+constexpr std::size_t kMaxQueuedRequests = 64;
+
+// 请求状态机（stage 与 on_settled 由同一把锁保护）：
+//   kQueued --TryStartSending--> kSending --> kDone（Settle）
+//   kQueued / kSending --Cancel--> kDone（立即兑现 kCancelled）
+// 因此"取消与发送谁先发生"只有一次裁决，且每请求只兑现一次。
+// 排队中取消：TryStartSending 返回 false，请求从发送路径移除，服务端 0 次。
+// 已提交发送后取消：只结束本地等待，发送与接收继续进行，服务端仍可能执行。
 struct PendingCall {
-  OnSettledFunc on_settled;
-  std::atomic<bool> cancelled{false};
-  std::mutex settle_mutex;
-  bool settled = false;  // 保护：promise/回调只兑现一次
-};
+  enum class Stage { kQueued, kSending, kDone };
 
-void Settle(PendingCall* pending, ErrorCode code, const std::string& payload) {
-  if (!pending) return;
-  OnSettledFunc callback;
-  {
-    std::lock_guard<std::mutex> lock(pending->settle_mutex);
-    if (pending->settled) return;
-    pending->settled = true;
-    callback = std::move(pending->on_settled);
-  }
-  if (callback) callback(code, payload);
-}
+  explicit PendingCall(OnSettledFunc cb) : on_settled(std::move(cb)) {}
 
-// 取消必须在同一把锁内完成"检查已兑现/已取消 + 标记 + 摘出回调"，
-// 否则重复 Cancel 会误报 true（阶段二 RequestHandle 契约要求第二次返回 false）。
-bool CancelPending(PendingCall* pending, OnSettledFunc* callback) {
-  std::lock_guard<std::mutex> lock(pending->settle_mutex);
-  if (pending->settled || pending->cancelled.load()) return false;
-  pending->cancelled.store(true);
-  pending->settled = true;
-  *callback = std::move(pending->on_settled);
-  return true;
-}
-
-struct ClientCore final : ClientHandle {
-  ClientCore(std::shared_ptr<ITransportFactory> factory,
-             std::shared_ptr<IRegistry> registry)
-      : transport(std::move(factory)), registry(std::move(registry)) {}
-
-  ~ClientCore() override {
-    std::unique_lock<std::mutex> lock(pending_mutex_);
-    idle_cv_.wait(lock, [this] { return in_flight_ == 0; });
-    if (socket) socket->Close();
-  }
-
-  bool EnsureConnected() {
-    if (socket && socket->Valid()) return true;
-    auto urls = registry->List(RegistryKind::kService, service_name);
-    if (urls.empty()) return false;
-    socket = transport->Create(TransportKind::kReq);
-    if (!socket) return false;
-    if (socket->Dial(urls.front()) != 0) {
-      FY_WARN("client[%s]: dial failed", service_name.c_str());
-      socket->Close();
-      socket.reset();
-      return false;
-    }
+  // 执行者出队后、真正 Send 前调用。
+  bool TryStartSending() {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (stage != Stage::kQueued) return false;
+    stage = Stage::kSending;
     return true;
   }
 
-  using Deadline = std::chrono::steady_clock::time_point;
+  // 返回 true 表示本次调用取得了兑现权；已兑现的请求再次 Cancel 返回 false。
+  bool Cancel(OnSettledFunc* callback) {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (stage == Stage::kDone) return false;
+    stage = Stage::kDone;
+    *callback = std::move(on_settled);
+    return true;
+  }
+
+  void Settle(ErrorCode code, const std::string& payload) {
+    OnSettledFunc callback;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex);
+      if (stage == Stage::kDone) return;  // 迟到响应 / 重复兑现一律丢弃
+      stage = Stage::kDone;
+      callback = std::move(on_settled);
+    }
+    if (callback) callback(code, payload);
+  }
+
+ private:
+  std::mutex state_mutex;
+  Stage stage = Stage::kQueued;
+  OnSettledFunc on_settled;
+};
+
+struct QueuedCall {
+  std::uint64_t id = 0;
+  std::string bytes;
+  Deadline deadline{};
+  std::shared_ptr<PendingCall> pending;
+};
+
+struct ClientCore final : ClientHandle {
+  ClientCore(std::shared_ptr<ITransportFactory> factory,
+             std::shared_ptr<IRegistry> reg)
+      : transport(std::move(factory)), registry(std::move(reg)) {}
+
+  ~ClientCore() override {
+    ShutdownInternal();
+    // 仅当析构发生在 I/O 线程内（兑现回调释放最后引用）时无法 join 自身。
+    if (io_thread_.joinable()) io_thread_.detach();
+  }
+
+  void StartIo() { io_thread_ = std::thread([this] { IoLoop(); }); }
 
   static int RemainingMs(Deadline deadline) {
     const auto now = std::chrono::steady_clock::now();
@@ -84,61 +100,88 @@ struct ClientCore final : ClientHandle {
                                 deadline - now).count());
   }
 
-  // deadline 在请求进入客户端时计算，覆盖排队等待 io_mutex_ 的时间；
-  // should_cancel 在拿到 io_mutex_ 后、真正 Send 前复查，杜绝"已取消仍发送"。
-  WireResponse SendBytes(const std::string& bytes, Deadline deadline,
-                         const std::function<bool()>& should_cancel) {
-    std::lock_guard<std::mutex> lock(io_mutex_);  // REQ 单在途
-    WireResponse out;
-    // 排队已耗尽预算：尚未发送，按超时兑现（不触碰连接状态机）。
+  // 服务查询与连接也受同一绝对截止时间约束；返回 nullptr 时通过 code 区分
+  // kTimeout / kServiceNotFound / kTransport / kNotReady。
+  std::shared_ptr<ISocket> EnsureConnected(Deadline deadline, ErrorCode* code) {
+    {
+      std::lock_guard<std::mutex> lock(socket_mutex_);
+      if (socket && socket->Valid()) return socket;
+    }
     if (RemainingMs(deadline) <= 0) {
+      *code = ErrorCode::kTimeout;
+      return nullptr;
+    }
+    auto urls = registry->List(RegistryKind::kService, service_name);
+    if (RemainingMs(deadline) <= 0) {
+      *code = ErrorCode::kTimeout;
+      return nullptr;
+    }
+    if (urls.empty()) {
+      *code = ErrorCode::kServiceNotFound;
+      return nullptr;
+    }
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
+      *code = ErrorCode::kNotReady;
+      return nullptr;
+    }
+    std::shared_ptr<ISocket> fresh = transport->Create(TransportKind::kReq);
+    if (!fresh) {
+      *code = ErrorCode::kTransport;
+      return nullptr;
+    }
+    // nng_dial 非阻塞，仍按预算复查，避免短超时请求挂起。
+    if (RemainingMs(deadline) <= 0 || fresh->Dial(urls.front()) != 0) {
+      *code = RemainingMs(deadline) <= 0 ? ErrorCode::kTimeout
+                                         : ErrorCode::kTransport;
+      return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    socket = fresh;
+    return fresh;
+  }
+
+  // 执行者内的唯一 I/O 路径：发送与接收共用剩余预算，超时后关闭连接以重置
+  // REQ 状态机。socket 用 shared_ptr 局部副本，关停线程可安全唤醒 Recv。
+  WireResponse Exchange(const std::string& bytes, Deadline deadline) {
+    WireResponse out;
+    std::lock_guard<std::mutex> io_lock(io_mutex_);  // REQ 单在途
+    if (shutdown_requested_.load(std::memory_order_acquire)) {
+      out.code = ErrorCode::kNotReady;
+      return out;
+    }
+    ErrorCode conn_code = ErrorCode::kOk;
+    auto sock = EnsureConnected(deadline, &conn_code);
+    if (!sock) {
+      out.code = conn_code;
+      return out;
+    }
+    int left = RemainingMs(deadline);
+    if (left <= 0) {
       out.code = ErrorCode::kTimeout;
       return out;
     }
-    // 取消可能发生在排队等待锁期间；拿锁后必须复查（审查 P1）。
-    if (should_cancel && should_cancel()) {
-      out.code = ErrorCode::kCancelled;
-      return out;
-    }
-    if (!EnsureConnected()) {
-      const bool registered =
-          registry->Has(RegistryKind::kService, service_name);
-      out.code = registered ? ErrorCode::kTransport : ErrorCode::kServiceNotFound;
-      return out;
-    }
-    int send_ms = RemainingMs(deadline);
-    if (send_ms <= 0) {
-      out.code = ErrorCode::kTimeout;
-      return out;
-    }
-    socket->SetSendTimeout(send_ms);
-    int r = socket->Send(bytes);
-    if (r != 0) {
-      FY_WARN("client[%s]: send: %d", service_name.c_str(), r);
+    sock->SetSendTimeout(left);
+    if (sock->Send(bytes) != 0) {
+      FY_WARN("client[%s]: send failed (remaining %d ms)",
+              service_name.c_str(), left);
       out.code = ErrorCode::kTransport;
       return out;
     }
     sent_count_.fetch_add(1, std::memory_order_relaxed);
 
-    // 接收预算 = 截止时间减去排队 + 发送已耗时间（不再各用一份完整预算）。
-    int recv_ms = RemainingMs(deadline);
-    if (recv_ms <= 0) {
+    left = RemainingMs(deadline);
+    if (left <= 0) {
       out.code = ErrorCode::kTimeout;
-      socket->Close();
-      socket.reset();
+      sock->Close();
       return out;
     }
-    socket->SetRecvTimeout(recv_ms);
+    sock->SetRecvTimeout(left);
     std::string frame;
-    r = socket->Recv(&frame, recv_ms);
+    const int r = sock->Recv(&frame, left);
     if (r != kIoOk) {
       FY_WARN("client[%s]: recv: %d", service_name.c_str(), r);
       out.code = (r == kIoTimeout) ? ErrorCode::kTimeout : ErrorCode::kTransport;
-      if (r == kIoTimeout) {
-        // REQ 超时后状态机可能失配，关闭以重置（与阶段二一致）。
-        socket->Close();
-        socket.reset();
-      }
+      if (r == kIoTimeout) sock->Close();  // REQ 超时后状态机可能失配
       return out;
     }
     ErrorCode frame_code = ErrorCode::kSerialization;
@@ -154,12 +197,121 @@ struct ClientCore final : ClientHandle {
     return out;
   }
 
+  // 同步与异步唯一入队口。锁序恒为 pending_mutex_ → queue_mutex_，与
+  // ShutdownInternal 一致；回调一律在锁外兑现。
+  std::uint64_t Enqueue(const std::string& bytes,
+                        std::chrono::milliseconds timeout,
+                        OnSettledFunc on_settled) {
+    auto pending = std::make_shared<PendingCall>(std::move(on_settled));
+    const std::uint64_t id = next_id_.fetch_add(1);
+    const Deadline deadline = std::chrono::steady_clock::now() + timeout;
+    ErrorCode failure = ErrorCode::kOk;
+    {
+      std::lock_guard<std::mutex> pending_lock(pending_mutex_);
+      if (shutdown_requested_.load(std::memory_order_acquire)) {
+        failure = ErrorCode::kNotReady;
+      } else {
+        std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+        if (io_stopping_ || queue_.size() >= kMaxQueuedRequests) {
+          failure = ErrorCode::kQueueFull;
+        } else {
+          queue_.push_back(QueuedCall{id, bytes, deadline, pending});
+          pending_[id] = pending;
+          ++in_flight_;
+        }
+      }
+    }
+    if (failure != ErrorCode::kOk) {
+      pending->Settle(failure, "");
+      return 0;
+    }
+    queue_cv_.notify_one();
+    return id;
+  }
+
+  void IoLoop() {
+    for (;;) {
+      QueuedCall call;
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        queue_cv_.wait(lock, [this] { return io_stopping_ || !queue_.empty(); });
+        if (queue_.empty()) break;  // 关停且队列已清空
+        call = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      WireResponse out{ErrorCode::kCancelled, ""};
+      // 唯一的"取消 vs 发送"裁决点：排队中已取消则不触碰连接。
+      if (call.pending->TryStartSending()) {
+        out = RemainingMs(call.deadline) <= 0
+                  ? WireResponse{ErrorCode::kTimeout, ""}
+                  : Exchange(call.bytes, call.deadline);
+        if (out.code == ErrorCode::kCancelled) out.code = ErrorCode::kTimeout;
+      }
+      Finish(call.id, call.pending.get(), out);
+    }
+  }
+
+  // 先退出 pending 表、递减计数，再兑现：兑现回调可安全调用 Cancel/Shutdown。
+  void Finish(std::uint64_t id, PendingCall* pending, const WireResponse& out) {
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      // Shutdown 可能已统一回收 pending 表；重复回收不得让计数下溢。
+      if (pending_.erase(id) != 0 && in_flight_ > 0 && --in_flight_ == 0) {
+        idle_cv_.notify_all();
+      }
+    }
+    pending->Settle(out.code, out.payload);
+  }
+
+  void ShutdownInternal() {
+    if (shutdown_done_.exchange(true)) return;
+    shutdown_requested_.store(true, std::memory_order_release);
+    std::vector<std::shared_ptr<PendingCall>> to_cancel;
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      for (auto& kv : pending_) to_cancel.push_back(kv.second);
+      // 排队中/在途请求统一回收；执行者稍后的 Finish 只会是空操作。
+      pending_.clear();
+      in_flight_ = 0;
+      idle_cv_.notify_all();
+    }
+    for (auto& pending : to_cancel) {
+      OnSettledFunc callback;
+      if (pending->Cancel(&callback) && callback) callback(ErrorCode::kCancelled, "");
+    }
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      io_stopping_ = true;
+      queue_.clear();
+    }
+    queue_cv_.notify_all();
+
+    // 不提前 close socket：在途请求受统一 deadline 约束，关停按阶段二契约
+    // 等待其自然兑现（或超时），避免调用方被无限期挂起。
+    const bool on_io = io_thread_.joinable() &&
+                       io_thread_.get_id() == std::this_thread::get_id();
+    if (!on_io && io_thread_.joinable()) io_thread_.join();
+    if (!on_io) {
+      std::unique_lock<std::mutex> lock(pending_mutex_);
+      idle_cv_.wait(lock, [this] { return in_flight_ == 0; });
+    }
+  }
+
   std::string node_name;
   std::string service_name;
   std::shared_ptr<ITransportFactory> transport;
   std::shared_ptr<IRegistry> registry;
-  std::unique_ptr<ISocket> socket;
+
+  std::mutex socket_mutex_;
+  std::shared_ptr<ISocket> socket;
   std::mutex io_mutex_;
+
+  // 同步与异步共用的有界队列 + 单一 I/O 执行者。
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
+  std::deque<QueuedCall> queue_;
+  bool io_stopping_ = false;  // 受 queue_mutex_ 保护
+  std::thread io_thread_;
 
   std::mutex pending_mutex_;
   std::map<std::uint64_t, std::shared_ptr<PendingCall>> pending_;
@@ -167,6 +319,7 @@ struct ClientCore final : ClientHandle {
   std::condition_variable idle_cv_;
   std::size_t in_flight_ = 0;  // 受 pending_mutex_ 保护
   std::atomic<bool> shutdown_requested_{false};
+  std::atomic<bool> shutdown_done_{false};
 
   std::atomic<std::uint64_t> sent_count_{0};
 };
@@ -184,6 +337,7 @@ Result<std::shared_ptr<ClientHandle>> CreateClientCore(
   auto core = std::make_shared<ClientCore>(transport, registry);
   core->node_name = node_name;
   core->service_name = service_name;
+  core->StartIo();
   return {core, ErrorCode::kOk, ""};
 }
 
@@ -191,10 +345,15 @@ WireResponse ClientSendBytes(ClientHandle* handle, const std::string& bytes,
                              std::chrono::milliseconds timeout) {
   auto* core = static_cast<ClientCore*>(handle);
   if (!core) return {ErrorCode::kNotReady, ""};
-  // deadline 在请求进入客户端时确定，排队时间计入总预算。
-  const auto deadline =
-      std::chrono::steady_clock::now() + timeout;
-  return core->SendBytes(bytes, deadline, nullptr);
+  // 同步请求也走同一有界队列；不出队不兑现，不占用调用线程做 I/O。
+  auto promise = std::make_shared<std::promise<WireResponse>>();
+  auto future = promise->get_future();
+  core->Enqueue(bytes, timeout,
+                [promise](ErrorCode code, const std::string& payload) {
+                  promise->set_value(WireResponse{
+                      code, code == ErrorCode::kOk ? payload : std::string{}});
+                });
+  return future.get();
 }
 
 std::uint64_t ClientAsyncSendBytes(ClientHandle* handle,
@@ -206,48 +365,16 @@ std::uint64_t ClientAsyncSendBytes(ClientHandle* handle,
     if (on_settled) on_settled(ErrorCode::kNotReady, "");
     return 0;
   }
-  auto pending = std::make_shared<PendingCall>();
-  pending->on_settled = std::move(on_settled);
-  if (core->shutdown_requested_.load()) {
-    Settle(pending.get(), ErrorCode::kNotReady, "");
-    return 0;
-  }
-  const std::uint64_t id = core->next_id_.fetch_add(1);
-  {
-    std::lock_guard<std::mutex> lock(core->pending_mutex_);
-    core->pending_[id] = pending;
-    ++core->in_flight_;
-  }
-
-  // deadline 在此刻（请求提交时）确定；should_cancel 在拿到 io_mutex_ 后复查。
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  const std::string service = core->service_name;
-  std::thread([core, bytes, deadline, id, pending, service]() {
-    WireResponse response;
-    if (pending->cancelled.load()) {
-      response.code = ErrorCode::kCancelled;
-    } else {
-      response = core->SendBytes(bytes, deadline,
-                                 [pending]() { return pending->cancelled.load(); });
-      if (pending->cancelled.load()) {
-        FY_WARN("client[%s]: late response for cancelled request %llu dropped",
-                service.c_str(), static_cast<unsigned long long>(id));
-        response.code = ErrorCode::kCancelled;
-        response.payload.clear();
-      }
-    }
-    Settle(pending.get(), response.code, response.payload);
-
-    std::lock_guard<std::mutex> lock(core->pending_mutex_);
-    core->pending_.erase(id);
-    if (--core->in_flight_ == 0) core->idle_cv_.notify_all();
-  }).detach();
-  return id;
+  // deadline 在入队这一刻确定，排队时间计入总预算。
+  return core->Enqueue(bytes, timeout, std::move(on_settled));
 }
 
 bool ClientCancelRequestCore(ClientHandle* handle, std::uint64_t id) {
   auto* core = static_cast<ClientCore*>(handle);
-  if (!core) return false;
+  // Client 关停/重建后旧 core 的标志已置位，旧句柄不能再取消任何请求。
+  if (!core || core->shutdown_requested_.load(std::memory_order_acquire)) {
+    return false;
+  }
   std::shared_ptr<PendingCall> pending;
   {
     std::lock_guard<std::mutex> lock(core->pending_mutex_);
@@ -256,45 +383,26 @@ bool ClientCancelRequestCore(ClientHandle* handle, std::uint64_t id) {
     pending = it->second;
   }
   OnSettledFunc callback;
-  if (!CancelPending(pending.get(), &callback)) return false;
+  if (!pending->Cancel(&callback)) return false;
   if (callback) callback(ErrorCode::kCancelled, "");
   return true;
 }
 
 void ClientShutdownCore(ClientHandle* handle) {
   auto* core = static_cast<ClientCore*>(handle);
-  if (!core) return;
-  core->shutdown_requested_.store(true);
-
-  std::vector<std::shared_ptr<PendingCall>> to_cancel;
-  {
-    std::lock_guard<std::mutex> lock(core->pending_mutex_);
-    for (auto& kv : core->pending_) to_cancel.push_back(kv.second);
-  }
-  for (auto& pending : to_cancel) {
-    pending->cancelled.store(true);
-    Settle(pending.get(), ErrorCode::kCancelled, "");
-  }
-  {
-    std::unique_lock<std::mutex> lock(core->pending_mutex_);
-    core->idle_cv_.wait(lock, [core] { return core->in_flight_ == 0; });
-  }
-  if (core->socket) {
-    core->socket->Close();
-    core->socket.reset();
-  }
+  if (core) core->ShutdownInternal();
 }
 
 bool ClientServiceIsReady(const ClientHandle* handle) {
   auto* core = static_cast<const ClientCore*>(handle);
-  if (!core) return false;
+  if (!core || core->shutdown_requested_.load()) return false;
   return core->registry->Has(RegistryKind::kService, core->service_name);
 }
 
 bool ClientWaitForService(const ClientHandle* handle,
                           std::optional<std::chrono::milliseconds> timeout) {
   auto* core = static_cast<const ClientCore*>(handle);
-  if (!core) return false;
+  if (!core || core->shutdown_requested_.load()) return false;
   const bool infinite = !timeout.has_value();
   const auto deadline =
       infinite ? std::chrono::steady_clock::time_point::max()

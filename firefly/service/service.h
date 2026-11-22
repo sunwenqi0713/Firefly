@@ -30,6 +30,17 @@
 //     kServiceFailed（见 service_core.cc）。
 //   - Service::Shutdown() 与全局 Clear() 都会等待在途回调返回。
 //
+// ---- 第 1 批：Service 生命周期契约 ----
+//   显式 Shutdown() 与 ~Service() 复用同一条 detail::ServiceCore::Shutdown()
+//   路径，幂等；"停止接收 → worker 退出 → 注册注销 → 关闭 socket"只执行一次。
+//   worker 只持有 core 的 weak_ptr，所以释放最后一个外部 shared_ptr 必然触发
+//   停机，旧客户端不再能调用该服务。
+//   停机允许在回调线程内触发（回调里 Shutdown()，或释放最后一个引用导致
+//   ~Service() 在该线程执行）：此时不 join 自身、不等待当前在途回调，只置
+//   running_=false 并完成注销；worker 在本次回调返回后自行退出。若 core 的
+//   析构正发生在 worker 线程上，则 detach 线程兜底，避免 terminate。
+//   从其他线程调用 Shutdown()/析构则 join worker 并等待在途回调后才返回。
+//
 // 阶段三（任务 2）：本模板只做 protobuf 序列化 shim，nng 交互全部下沉到
 // detail/service_core.cc；公共头不再包含 detail/*_impl.h 或 nng 头。
 // ===========================================================================

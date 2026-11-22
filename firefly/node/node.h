@@ -158,6 +158,11 @@ class Node {
       const CallbackFunc<MessageT>& reader_func = nullptr);
 
   // 删除订阅者（不存在返回 false）
+  // 删除中契约（第 1 批）：锁内在 readers_deleting_ 标记"正在删除"，但暂不
+  // 释放 readers_ 表项；释放节点锁后才调用 Reader::Shutdown()（会 join 收
+  // 线程并等待在途回调，回调内可并发调用 GetReader/Observe），完成后才在
+  // 锁内移除标记与表项。因此：回调内 GetReader 不会死锁且仍拿到旧 Reader；
+  // 删除中的同名 CreateReader 返回 kDuplicate；Shutdown 返回后可重建同名。
   bool DeleteReader(const std::string& channel_name);
 
   // 删除发布者 / 服务 / 客户端（阶段二，返回 Result<void>）：
@@ -201,6 +206,9 @@ class Node {
 
   std::mutex readers_mutex_;
   std::map<std::string, std::shared_ptr<ReaderBase>> readers_;
+  // 正在 Shutdown 的 Reader 名称；表项保留到 Shutdown 完成，防止删除中
+  // 重建同名端点或旧端点注销误伤新端点。
+  std::set<std::string> readers_deleting_;
 
   // 阶段二：Writer/Service/Client 的弱引用注册表，仅用于单 Node 查重与
   // DeleteXxx 定位。弱引用不改变"端点由外部 shared_ptr 持有、独立存活"的
@@ -302,10 +310,11 @@ Result<std::shared_ptr<Reader<MessageT>>> Node::CreateReader(
                  "']: invalid QoS (depth must be > 0)"};
   }
   std::lock_guard<std::mutex> lg(readers_mutex_);
-  if (readers_.find(config.channel_name) != readers_.end()) {
+  if (readers_.find(config.channel_name) != readers_.end() ||
+      readers_deleting_.count(config.channel_name) != 0) {
     return R{nullptr, ErrorCode::kDuplicate,
              "CreateReader[channel='" + config.channel_name + "', node='" +
-                 node_name_ + "']: a Reader already exists on this channel"};
+                 node_name_ + "']: a Reader already exists (or is being deleted) on this channel"};
   }
   auto reader = std::make_shared<Reader<MessageT>>(config, reader_func, ctx_);
   if (!reader->Init()) {

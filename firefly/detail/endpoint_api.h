@@ -74,6 +74,17 @@ EndpointStats ServiceStats(const ServiceHandle* handle);
 
 // ---------------- Client（REQ）----------------
 
+// ---- 第 1 批：RPC 队列与取消契约 ----
+// 同步 ClientSendBytes 与异步 ClientAsyncSendBytes 共用 ClientCore 内同一个
+// 有界队列（64 项）和单个 I/O 执行者；不在调用线程做 I/O。入队时以
+// steady_clock 计算绝对 deadline，排队、服务查询、连接、发送、接收共用该
+// 预算，任一步耗尽即 kTimeout；队列满以现有错误码 kQueueFull 失败。
+// 取消两态：执行者出队后、Send 前用同一状态转换裁决。
+//   - 排队中取消：请求从发送路径移除，服务端执行 0 次；
+//   - 已提交发送后取消：只结束本地等待并兑现 kCancelled，服务端仍可能执行。
+// 每请求只兑现一次；Shutdown/析构取消全部在途并停止执行者，旧请求句柄
+// Cancel() 返回 false。公共 API 签名不变。
+//
 // 一次性兑现回调：成功后 payload 为响应字节；失败时忽略 payload。
 using OnSettledFunc = std::function<void(ErrorCode code, const std::string& payload)>;
 

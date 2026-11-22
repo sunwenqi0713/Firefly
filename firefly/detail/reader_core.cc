@@ -24,8 +24,8 @@ struct ReaderCore final : ReaderHandle {
 
   ~ReaderCore() override {
     Shutdown();
-    // 兜底：若在收线程内析构（无法 join 自身），detach 避免 thread 析构
-    // terminate；running_=false 已保证循环在本次回调后退出。
+    // 兜底：仅当 core 在收线程内析构（回调触发停机且外部引用已全部释放）
+    // 时线程仍 joinable 且无法 join 自身，detach 避免 terminate。
     if (recv_thread_.joinable()) recv_thread_.detach();
   }
 
@@ -108,7 +108,9 @@ struct ReaderCore final : ReaderHandle {
     FY_INFO("reader[%s]: recv loop exit", config.channel_name.c_str());
   }
 
-  // 幂等：显式 Shutdown 与 ~ReaderCore() 兜底都走这里。
+  // 幂等：Node/公开对象显式 Shutdown、全局关停兜底、~ReaderCore() 都走这里。
+  // 固定顺序：停止接收 → join 收线程（回调线程内触发时跳过 self-join）→
+  // 退订/注销 → 关闭 socket → 等待在途回调 → 释放自保活引用。
   void Shutdown() {
     if (shutdown_done_.exchange(true)) return;
     running_.store(false, std::memory_order_release);
@@ -129,6 +131,9 @@ struct ReaderCore final : ReaderHandle {
       socket->Close();
     }
     if (!on_recv) WaitForCallbacks();
+    // 与 ServiceCore 同理：join/wait 完成后才释放自保活引用，避免 core 在
+    // 另一线程 join 期间被析构并在析构里 detach（未定义行为）。
+    self_keepalive_.reset();
   }
 
   static double NowSec() {
@@ -141,6 +146,8 @@ struct ReaderCore final : ReaderHandle {
   OnBytesFunc on_bytes;
 
   std::unique_ptr<ISocket> socket;
+  // 运行期自保活，由 Shutdown 在 join/等待完成后释放。
+  std::shared_ptr<ReaderCore> self_keepalive_;
   int subscription_id_ = 0;
   bool registered_ = false;
 
@@ -176,6 +183,7 @@ Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
       injection->registry ? injection->registry : DefaultRegistry();
 
   auto core = std::make_shared<ReaderCore>(registry, std::move(on_bytes));
+  core->self_keepalive_ = core;
   core->config = config;
   core->history_depth_.store(config.qos_profile.depth,
                              std::memory_order_relaxed);
