@@ -45,6 +45,8 @@ constexpr char kDefaultPubUrl[] = "tcp://127.0.0.1:37222";
 constexpr char kDefaultBackend[] = "nng";
 constexpr int kPollTimeoutMs = 200;
 constexpr int kReqTimeoutMs = 500;
+// Follower 定期与主实例对账：弥补启动时错过的广播、SUB 重连期间的漏报。
+constexpr auto kReconcileInterval = std::chrono::seconds(3);
 
 // 发现地址在 Start 时读取；Configure 必须在首次 Start 前调用。
 std::mutex g_config_mutex;
@@ -137,6 +139,12 @@ struct Registry::Impl {
   std::mutex data_mutex_;
   std::map<EndpointRecordId, EndpointRecord> records_;
   std::map<std::string, std::set<EndpointRecordId>> by_key_;
+  // 修订号（均受 data_mutex_ 保护）：id_revision_ 记录某个 id 最近一次本地
+  // 变更；removed_revision_ 记录注销广播（即便本地原本没有该记录），用于
+  // 判断远端快照是否陈旧，避免"快照覆盖其后到达的增删"。
+  std::uint64_t revision_ = 0;
+  std::map<EndpointRecordId, std::uint64_t> id_revision_;
+  std::map<EndpointRecordId, std::uint64_t> removed_revision_;
   const std::uint32_t process_tag_ = static_cast<std::uint32_t>(
       std::chrono::steady_clock::now().time_since_epoch().count() &
       0x7fffffffULL);
@@ -209,6 +217,8 @@ EndpointRecordId ApplyLocked(Registry::Impl& impl, const EndpointRecord& in,
     const auto key = Key(rec.kind, rec.name);
     impl.records_[rec.id] = rec;
     impl.by_key_[key].insert(rec.id);
+    impl.removed_revision_.erase(rec.id);
+    impl.id_revision_[rec.id] = ++impl.revision_;
     return rec.id;
   }
   EndpointRecordId id = in.id;
@@ -225,6 +235,7 @@ EndpointRecordId ApplyLocked(Registry::Impl& impl, const EndpointRecord& in,
     }
   }
   if (it == impl.records_.end()) return 0;
+  impl.removed_revision_[id] = ++impl.revision_;
   const auto key = Key(it->second.kind, it->second.name);
   impl.records_.erase(it);
   auto kit = impl.by_key_.find(key);
@@ -267,6 +278,10 @@ std::string Execute(Registry::Impl& impl, const std::string& req) {
     std::getline(in, kind, '\t');
     std::getline(in, name, '\t');
     std::getline(in, url, '\t');
+    // 线协议版本探测：旧客户端只发 4 个字段（末尾无 \t），并严格比较
+    // "OK\n"；新客户端固定追加 id/backend 两个字段（可为空），因此读完
+    // url 后流尚未结束。对旧请求保留原响应，避免"注册失败但 Has() 为真"。
+    const bool legacy_request = in.eof();
     std::getline(in, id_text, '\t');
     std::getline(in, backend, '\t');
     Kind k;
@@ -293,7 +308,8 @@ std::string Execute(Registry::Impl& impl, const std::string& req) {
     }
     if (id == 0) return "OK\n";
     Broadcast(impl, rec, cmd == "REG");
-    return "OK " + std::to_string(id) + "\n";
+    // 旧版 Follower 只能识别 "OK\n"；新版客户端需要 id 做精确注销。
+    return legacy_request ? "OK\n" : "OK " + std::to_string(id) + "\n";
   }
   if (cmd == "QLIST") {
     std::getline(in, kind, '\t');
@@ -351,10 +367,18 @@ void RunRepThread(Registry::Impl& impl) {
   FY_INFO("registry: rep loop exit");
 }
 
+// 定义见本文件末尾：定期从主实例重新对账 Watch 的键。
+void ReconcileWatches(Registry::Impl& impl);
+
 void RunSubLoop(Registry::Impl& impl) {
   FY_INFO("registry: follower on %s", impl.rep_url.c_str());
+  auto next_reconcile = std::chrono::steady_clock::now() + kReconcileInterval;
   while (impl.running_.load() &&
          !runtime::ShutdownManager::instance().IsShutdown()) {
+    if (std::chrono::steady_clock::now() >= next_reconcile) {
+      next_reconcile = std::chrono::steady_clock::now() + kReconcileInterval;
+      ReconcileWatches(impl);
+    }
     std::string line = RecvToString(impl.sub_sock_);
     if (line.empty()) continue;
     std::istringstream in(line);
@@ -383,13 +407,18 @@ void RunSubLoop(Registry::Impl& impl) {
         const auto existing = impl.records_.find(rec.id);
         if (added) {
           // 本地 Register 已应用过同一条记录时，广播是重复通知。
-          if (existing == impl.records_.end() || existing->second.address != rec.address) {
+          if (existing == impl.records_.end() ||
+              existing->second.address != rec.address) {
             ApplyLocked(impl, rec, true);
             changed = true;
           }
         } else if (existing != impl.records_.end()) {
           ApplyLocked(impl, rec, false);
           changed = true;
+        } else {
+          // 本地没有该记录也要记注销修订号：对账查询可能拿到删除前的旧
+          // 快照，随后合并时据此丢弃陈旧记录。
+          impl.removed_revision_[rec.id] = ++impl.revision_;
         }
       }
       if (changed) DispatchLocked(impl, k, name);
@@ -405,7 +434,8 @@ std::string RemoteRequest(Registry::Impl& impl, const std::string& line) {
   return RecvToString(impl.req_sock_);
 }
 
-std::vector<EndpointRecord> ParseRecords(const std::string& resp) {
+std::vector<EndpointRecord> ParseRecords(const std::string& resp, Kind kind,
+                                         const std::string& name) {
   std::vector<EndpointRecord> out;
   std::istringstream in(resp);
   std::string status;
@@ -418,6 +448,10 @@ std::vector<EndpointRecord> ParseRecords(const std::string& resp) {
     if (line.empty()) continue;
     std::istringstream fields(line);
     EndpointRecord rec;
+    // 线协议只在首部携带 kind/name，记录行里没有；必须回填，否则合并后
+    // 记录会落到空键下，Watch 快照依旧为空。
+    rec.kind = kind;
+    rec.name = name;
     std::string id_text;
     std::getline(fields, id_text, '\t');
     std::getline(fields, rec.backend, '\t');
@@ -426,6 +460,104 @@ std::vector<EndpointRecord> ParseRecords(const std::string& resp) {
     out.push_back(std::move(rec));
   }
   return out;
+}
+
+// 旧主实例（或尚未升级的进程）不认识 QLIST：回退原 LIST 文本协议并派生
+// 兼容字段。与 Registry::Query 的回退逻辑保持一致。
+std::vector<EndpointRecord> ParseLegacyList(const std::string& resp, Kind kind,
+                                            const std::string& name,
+                                            const std::string& backend) {
+  std::vector<EndpointRecord> out;
+  std::istringstream in(resp);
+  std::string status;
+  std::size_t count = 0;
+  in >> status >> count;
+  if (status != "OK") return out;
+  std::string address;
+  while (out.size() < count && std::getline(in, address, '\n')) {
+    if (address.empty()) continue;
+    EndpointRecord rec;
+    rec.kind = kind;
+    rec.name = name;
+    rec.address = address;
+    rec.backend = kDefaultBackend;
+    rec.id = LegacyId(kind, name, address);
+    if (backend.empty() || backend == rec.backend) out.push_back(rec);
+  }
+  return out;
+}
+
+// 从实例直接向主实例取快照：Watch 的初始集合与定期对账共用。
+std::vector<EndpointRecord> QueryRemote(Registry::Impl& impl, Kind kind,
+                                        const std::string& name,
+                                        const std::string& backend) {
+  std::ostringstream line;
+  line << "QLIST\t" << KindToString(kind) << '\t' << name << '\t' << backend;
+  std::string resp = RemoteRequest(impl, line.str());
+  auto records = ParseRecords(resp, kind, name);
+  if (!records.empty() || resp.rfind("OK ", 0) == 0) return records;
+  line.str(std::string());
+  line.clear();
+  line << "LIST\t" << KindToString(kind) << '\t' << name;
+  return ParseLegacyList(RemoteRequest(impl, line.str()), kind, name, backend);
+}
+
+// 调用前持有 dispatch_mutex_；内部取 data_mutex_。query_revision 是发起远端
+// 查询之前的本地修订号：查询期间到达的广播（新增或注销）修订号更大，必须
+// 优先于快照，否则晚启动 Reader 可能先拿到旧快照再被过期记录污染。
+bool MergeSnapshotLocked(Registry::Impl& impl, Kind kind,
+                         const std::string& name,
+                         const std::vector<EndpointRecord>& remote,
+                         std::uint64_t query_revision) {
+  bool changed = false;
+  std::lock_guard<std::mutex> data(impl.data_mutex_);
+  for (const auto& rec : remote) {
+    if (rec.id == 0) continue;
+    const auto removed = impl.removed_revision_.find(rec.id);
+    if (removed != impl.removed_revision_.end() &&
+        removed->second > query_revision) {
+      continue;
+    }
+    const auto changed_id = impl.id_revision_.find(rec.id);
+    if (changed_id != impl.id_revision_.end() &&
+        changed_id->second > query_revision) {
+      continue;
+    }
+    const auto existing = impl.records_.find(rec.id);
+    if (existing != impl.records_.end() &&
+        existing->second.address == rec.address &&
+        existing->second.backend == rec.backend) {
+      continue;
+    }
+    ApplyLocked(impl, rec, true);
+    changed = true;
+  }
+  return changed;
+}
+
+// 定期重连/漏广播对账：只处理当前有 Watch 的键，且仅在合并确实改变记录
+// 集合时派发回调，避免每轮无谓地触发 UpdatePublishers。
+void ReconcileWatches(Registry::Impl& impl) {
+  if (impl.primary || !impl.running_.load()) return;
+  std::set<std::pair<Kind, std::string>> keys;
+  {
+    std::lock_guard<std::mutex> sub(impl.sub_mutex_);
+    for (const auto& w : impl.watches_) keys.emplace(w.kind, w.name);
+  }
+  for (const auto& key : keys) {
+    std::uint64_t start_revision = 0;
+    {
+      std::lock_guard<std::mutex> data(impl.data_mutex_);
+      start_revision = impl.revision_;
+    }
+    auto remote = QueryRemote(impl, key.first, key.second, std::string());
+    if (remote.empty()) continue;
+    std::lock_guard<std::mutex> dispatch(impl.dispatch_mutex_);
+    if (MergeSnapshotLocked(impl, key.first, key.second, remote,
+                            start_revision)) {
+      DispatchLocked(impl, key.first, key.second);
+    }
+  }
 }
 
 }  // namespace anonymous
@@ -553,6 +685,8 @@ void Registry::Stop() {
       std::lock_guard<std::mutex> data(impl_->data_mutex_);
       impl_->records_.clear();
       impl_->by_key_.clear();
+      impl_->id_revision_.clear();
+      impl_->removed_revision_.clear();
     }
     {
       std::lock_guard<std::mutex> sub(impl_->sub_mutex_);
@@ -629,35 +763,17 @@ std::vector<EndpointRecord> Registry::Query(RegistryKind kind,
                                             const std::string& name,
                                             const std::string& backend) {
   if (!Start()) return {};
+  if (!impl_->primary) return QueryRemote(*impl_, kind, name, backend);
   std::ostringstream line;
   line << "QLIST\t" << KindToString(kind) << '\t' << name << '\t' << backend;
-  std::string resp = impl_->primary ? Execute(*impl_, line.str())
-                                    : RemoteRequest(*impl_, line.str());
-  auto records = ParseRecords(resp);
+  std::string resp = Execute(*impl_, line.str());
+  auto records = ParseRecords(resp, kind, name);
   if (!records.empty() || resp.rfind("OK ", 0) == 0) return records;
   // 旧版主实例不认识 QLIST：退回原 LIST 文本协议并派生兼容字段。
   line.str(std::string());
   line.clear();
   line << "LIST\t" << KindToString(kind) << '\t' << name;
-  resp = impl_->primary ? Execute(*impl_, line.str())
-                        : RemoteRequest(*impl_, line.str());
-  std::istringstream in(resp);
-  std::string status;
-  std::size_t count = 0;
-  in >> status >> count;
-  if (status != "OK") return {};
-  std::string address;
-  while (records.size() < count && std::getline(in, address, '\n')) {
-    if (address.empty()) continue;
-    EndpointRecord rec;
-    rec.kind = kind;
-    rec.name = name;
-    rec.address = address;
-    rec.backend = kDefaultBackend;
-    rec.id = LegacyId(kind, name, address);
-    if (backend.empty() || backend == rec.backend) records.push_back(rec);
-  }
-  return records;
+  return ParseLegacyList(Execute(*impl_, line.str()), kind, name, backend);
 }
 
 bool Registry::Has(Kind kind, const std::string& name) {
@@ -672,12 +788,28 @@ int Registry::Watch(Kind kind, const std::string& name, WatchCallback&& cb) {
   if (!Start()) return 0;
   int id = 0;
   std::vector<EndpointRecord> snapshot;
+  // Follower 的本地缓存只包含启动后收到的广播；启动前已注册的记录必须
+  // 主动向主实例取快照，否则晚启动 Reader 永远 dial 不到已有 Writer。
+  // 查询在 dispatch_mutex_ 之外完成，避免阻塞广播派发；查询期间的变更由
+  // 修订号裁决，保证初始快照不覆盖更新的增量。
+  std::vector<EndpointRecord> remote;
+  std::uint64_t query_revision = 0;
+  if (!impl_->primary) {
+    {
+      std::lock_guard<std::mutex> data(impl_->data_mutex_);
+      query_revision = impl_->revision_;
+    }
+    remote = QueryRemote(*impl_, kind, name, std::string());
+  }
   {
     std::lock_guard<std::mutex> dispatch(impl_->dispatch_mutex_);
     {
       std::lock_guard<std::mutex> sub(impl_->sub_mutex_);
       id = impl_->next_watch_id_++;
       impl_->watches_.push_back(WatchEntry{id, kind, name, std::move(cb)});
+    }
+    if (!remote.empty()) {
+      MergeSnapshotLocked(*impl_, kind, name, remote, query_revision);
     }
     {
       std::lock_guard<std::mutex> data(impl_->data_mutex_);

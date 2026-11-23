@@ -176,6 +176,17 @@ struct ReaderCore final : ReaderHandle {
   std::atomic<std::uint64_t> dropped_count_{0};
 };
 
+// 创建期的失败回滚 guard：self_keepalive_ 属于"运行期"所有权，只在所有
+// 可能失败的步骤都成功、收线程已启动之后才建立。此前任何失败由 guard 调用
+// Shutdown() 统一回收（关端点/注销/退订），避免 core 因自引用泄漏。
+struct ReaderCreationGuard {
+  std::shared_ptr<ReaderCore> core;
+  bool committed = false;
+  ~ReaderCreationGuard() {
+    if (!committed && core) core->Shutdown();
+  }
+};
+
 }  // namespace
 
 Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
@@ -187,7 +198,7 @@ Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
   auto registry = injection->registry;
 
   auto core = std::make_shared<ReaderCore>(registry, std::move(on_bytes));
-  core->self_keepalive_ = core;
+  ReaderCreationGuard rollback{core};
   core->config = config;
   core->history_depth_.store(config.qos_profile.depth,
                              std::memory_order_relaxed);
@@ -204,7 +215,6 @@ Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
   record.name = config.channel_name;
   core->record_id_ = registry->Register(record);
   if (core->record_id_ == 0) {
-    core->subscriber->Close();
     return {nullptr, ErrorCode::kTransport,
             where + "registry register failed"};
   }
@@ -219,9 +229,6 @@ Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
         self->UpdatePublishers(snapshot);
       });
   if (core->watch_id_ == 0) {
-    registry->Unregister(core->record_id_);
-    core->record_id_ = 0;
-    core->subscriber->Close();
     return {nullptr, ErrorCode::kTransport, where + "registry watch failed"};
   }
 
@@ -232,6 +239,9 @@ Result<std::shared_ptr<ReaderHandle>> CreateReaderCore(
   core->recv_thread_ = std::thread([weak]() {
     if (auto self = weak.lock()) self->RecvLoop();
   });
+  // 线程已启动，所有失败点已过：此时才建立运行期自保活并交接所有权。
+  core->self_keepalive_ = core;
+  rollback.committed = true;
   core->RegisterWaiter(core);
   FY_INFO("reader[%s] ok", config.channel_name.c_str());
   return {core, ErrorCode::kOk, ""};

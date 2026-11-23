@@ -147,6 +147,16 @@ struct ServiceCore final : ServiceHandle {
   std::atomic<std::uint64_t> sent_count_{0};
 };
 
+// 创建期失败回滚：运行期自保活只在所有失败点之后建立；此前失败由 guard
+// 调用 Shutdown() 统一回收端点与注册记录，避免 core 自引用泄漏。
+struct ServiceCreationGuard {
+  std::shared_ptr<ServiceCore> core;
+  bool committed = false;
+  ~ServiceCreationGuard() {
+    if (!committed && core) core->Shutdown();
+  }
+};
+
 }  // namespace
 
 Result<std::shared_ptr<ServiceHandle>> CreateServiceCore(
@@ -158,7 +168,7 @@ Result<std::shared_ptr<ServiceHandle>> CreateServiceCore(
   auto registry = injection->registry;
 
   auto core = std::make_shared<ServiceCore>(registry, std::move(on_request));
-  core->self_keepalive_ = core;
+  ServiceCreationGuard rollback{core};
   core->node_name = node_name;
   core->service_name = service_name;
   core->responder = endpoints->CreateResponder();
@@ -177,7 +187,6 @@ Result<std::shared_ptr<ServiceHandle>> CreateServiceCore(
   record.address = core->url;
   core->record_id_ = registry->Register(record);
   if (core->record_id_ == 0) {
-    core->responder->Close();
     return {nullptr, ErrorCode::kTransport,
             where + "registry register failed"};
   }
@@ -188,6 +197,9 @@ Result<std::shared_ptr<ServiceHandle>> CreateServiceCore(
   core->worker_ = std::thread([weak]() {
     if (auto self = weak.lock()) self->WorkerLoop();
   });
+  // worker 已启动且所有失败点已过，才交接运行期所有权。
+  core->self_keepalive_ = core;
+  rollback.committed = true;
   core->RegisterWaiter(core);
   FY_INFO("service[%s] ok at %s", service_name.c_str(), core->url.c_str());
   return {core, ErrorCode::kOk, ""};

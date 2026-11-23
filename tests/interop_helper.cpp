@@ -4,11 +4,22 @@
 //   new_pub / legacy_sub      : 新发布者 → 旧订阅者
 //   legacy_rep / new_req      : 旧服务 → 新客户端（FFRP 响应帧）
 //   new_rep / legacy_req      : 新服务 → 旧客户端（FFRP 响应帧）
+//   new_reg_primary / legacy_reg_client
+//                             : 旧版注册协议客户端 → 新版 Primary
+//   legacy_reg_primary / new_reg_follower
+//                             : 新版 Follower → 旧版 Primary（注册/查询/注销/Watch）
+//   new_pub_first / new_sub_late
+//                             : 同版本双进程，Writer 先注册、Reader 后启动
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <future>
+#include <map>
 #include <memory>
+#include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +70,12 @@ std::vector<std::string> ListAddresses(IRegistry* reg, RegistryKind kind,
     if (!rec.address.empty()) out.push_back(rec.address);
   }
   return out;
+}
+
+std::string DiscoveryUrl(const char* name, const char* fallback) {
+  const char* value = std::getenv(name);
+  return (value != nullptr && *value != '\0') ? std::string(value)
+                                              : std::string(fallback);
 }
 
 bool WaitRegistered(IRegistry* reg, RegistryKind kind, const std::string& name,
@@ -327,11 +344,244 @@ int LegacyReq() {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// 发现协议兼容：严格按旧版（4aecd32）的 4 字段请求与 "OK\n" 判断实现。
+// ---------------------------------------------------------------------------
+constexpr const char* kLegacyRegName = "legacy/reg";
+constexpr const char* kLegacyRegAddress = "legacy://reg";
+constexpr const char* kLegacySvcName = "legacy/reg/svc";
+constexpr const char* kLegacySvcAddress = "legacy://service";
+
+int LegacyRegClient() {
+  nng_socket req = NNG_SOCKET_INITIALIZER;
+  if (nng_req0_open(&req) != 0) return 80;
+  const auto url = DiscoveryUrl("FIREFLY_DISCOVERY_REP_URL",
+                                "tcp://127.0.0.1:37221");
+  if (nng_dial(req, url.c_str(), nullptr, 0) != 0) {
+    nng_close(req);
+    return 81;
+  }
+  // 旧版调用方严格比较完整响应；新版返回 "OK <id>\n" 会被误判为失败。
+  auto strict = [&](const std::string& line, const std::string& expected) {
+    if (SendRaw(req, line) != 0) return false;
+    std::string resp;
+    return RecvRaw(req, &resp, 3000) == 0 && resp == expected;
+  };
+  const std::string reg = std::string("REG\twriter\t") + kLegacyRegName + "\t" +
+                          kLegacyRegAddress;
+  if (!strict(reg, "OK\n")) return 82;
+  if (!strict(std::string("HAS\twriter\t") + kLegacyRegName, "OK 1\n")) return 83;
+  if (!strict(std::string("LIST\twriter\t") + kLegacyRegName,
+              std::string("OK 1\n") + kLegacyRegAddress + "\n")) return 84;
+  // 给主实例一次轮询窗口观察 HAS=true（REQ/REP 连续调用可能快于 20ms 轮询）。
+  std::this_thread::sleep_for(1000ms);
+  const std::string unreg = std::string("UNREG\twriter\t") + kLegacyRegName +
+                            "\t" + kLegacyRegAddress;
+  if (!strict(unreg, "OK\n")) return 85;
+  if (!strict(std::string("HAS\twriter\t") + kLegacyRegName, "OK 0\n")) return 86;
+  nng_close(req);
+  std::printf("LEGACY_REG_OK\n");
+  return 0;
+}
+
+int NewRegPrimary() {
+  auto reg = Registry();
+  EndpointRecord self;
+  self.kind = RegistryKind::kReader;
+  self.name = "legacy/reg/observer";
+  const auto id = reg->Register(self);
+  if (id == 0) return 88;
+  std::printf("NEW_REG_PRIMARY_READY\n");
+  std::fflush(stdout);
+  if (!WaitRegistered(reg.get(), RegistryKind::kWriter, kLegacyRegName, true,
+                      15s)) {
+    return 89;
+  }
+  auto records = reg->Query(RegistryKind::kWriter, kLegacyRegName);
+  if (records.size() != 1 || records.front().address != kLegacyRegAddress) {
+    return 90;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + 15s;
+  while (reg->Has(RegistryKind::kWriter, kLegacyRegName) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(20ms);
+  }
+  if (reg->Has(RegistryKind::kWriter, kLegacyRegName)) return 91;
+  reg->Unregister(id);
+  firefly::Clear();
+  std::printf("NEW_REG_PRIMARY_OK\n");
+  return 0;
+}
+
+// 旧版 Primary 的最小实现：只认 4 字段 REG/UNREG、LIST/HAS，响应恒为
+// "OK\n"；广播为 4 段 "A|kind|name|url"。在启动屏障前预置一个 service，
+// 供新版 Follower 的 Watch 初始快照验证。
+int LegacyRegPrimary() {
+  nng_socket rep = NNG_SOCKET_INITIALIZER;
+  nng_socket pub = NNG_SOCKET_INITIALIZER;
+  if (nng_rep0_open(&rep) != 0) return 92;
+  if (nng_pub0_open(&pub) != 0) {
+    nng_close(rep);
+    return 93;
+  }
+  const auto rep_url = DiscoveryUrl("FIREFLY_DISCOVERY_REP_URL",
+                                    "tcp://127.0.0.1:37221");
+  const auto pub_url = DiscoveryUrl("FIREFLY_DISCOVERY_PUB_URL",
+                                    "tcp://127.0.0.1:37222");
+  nng_setopt_ms(rep, NNG_OPT_RECVTIMEO, 200);
+  if (nng_listen(rep, rep_url.c_str(), nullptr, 0) != 0 ||
+      nng_listen(pub, pub_url.c_str(), nullptr, 0) != 0) {
+    nng_close(rep);
+    nng_close(pub);
+    return 94;
+  }
+  std::map<std::string, std::set<std::string>> urls;
+  // 屏障之前就存在的记录：新版 Follower 的 Watch 初始快照必须能拿到它。
+  urls[std::string("service\t") + kLegacySvcName].insert(kLegacySvcAddress);
+  std::printf("LEGACY_REG_PRIMARY_READY\n");
+  std::fflush(stdout);
+  const auto deadline = std::chrono::steady_clock::now() + 15s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::string req;
+    if (RecvRaw(rep, &req, 200) != 0) continue;
+    std::istringstream in(req);
+    std::string cmd, kind, name, url;
+    std::getline(in, cmd, '\t');
+    std::getline(in, kind, '\t');
+    std::getline(in, name, '\t');
+    std::getline(in, url, '\t');
+    const std::string key = kind + "\t" + name;
+    std::string resp;
+    if (cmd == "REG" || cmd == "UNREG") {
+      if (cmd == "REG") {
+        urls[key].insert(url);
+      } else {
+        auto it = urls.find(key);
+        if (it != urls.end()) {
+          it->second.erase(url);
+          if (it->second.empty()) urls.erase(it);
+        }
+      }
+      // 旧版广播没有 id/backend 字段。
+      SendRaw(pub, std::string(cmd == "REG" ? "A|" : "R|") + kind + "|" + name +
+                       "|" + url);
+      resp = "OK\n";
+    } else if (cmd == "LIST" || cmd == "HAS") {
+      auto it = urls.find(key);
+      bool has = it != urls.end() && !it->second.empty();
+      if (cmd == "HAS") {
+        resp = has ? "OK 1\n" : "OK 0\n";
+      } else {
+        std::ostringstream out;
+        out << "OK " << (has ? it->second.size() : 0) << "\n";
+        if (has) {
+          for (const auto& u : it->second) out << u << "\n";
+        }
+        resp = out.str();
+      }
+    } else {
+      resp = "ERR unknown cmd\n";
+    }
+    SendRaw(rep, resp);
+  }
+  nng_close(rep);
+  nng_close(pub);
+  std::printf("LEGACY_REG_PRIMARY_OK\n");
+  return 0;
+}
+
+int NewRegFollower() {
+  auto reg = Registry();
+  EndpointRecord rec;
+  rec.kind = RegistryKind::kWriter;
+  rec.name = kLegacyRegName;
+  rec.address = "new://writer";
+  const auto id = reg->Register(rec);  // 旧主实例占端口，本进程成为 Follower
+  if (id == 0) return 96;
+  auto found = reg->Query(RegistryKind::kWriter, kLegacyRegName);
+  if (std::find_if(found.begin(), found.end(), [](const EndpointRecord& r) {
+        return r.address == "new://writer";
+      }) == found.end()) {
+    return 97;
+  }
+  // Watch 的初始快照必须包含旧主实例在本进程启动前登记的服务：这正是
+  // 旧版 LIST 回退 + Follower 主动对账要覆盖的场景。
+  std::promise<std::vector<std::string>> snapshot;
+  auto future = snapshot.get_future();
+  std::atomic<bool> once{false};
+  const int watch = reg->Watch(
+      RegistryKind::kService, kLegacySvcName,
+      [&](const std::vector<EndpointRecord>& records) {
+        if (once.exchange(true)) return;
+        std::vector<std::string> addresses;
+        for (const auto& r : records) addresses.push_back(r.address);
+        snapshot.set_value(std::move(addresses));
+      });
+  if (watch == 0) return 98;
+  if (future.wait_for(10s) != std::future_status::ready) return 99;
+  auto addresses = future.get();
+  if (std::find(addresses.begin(), addresses.end(), kLegacySvcAddress) ==
+      addresses.end()) {
+    return 100;
+  }
+  reg->Unwatch(watch);
+  if (!reg->Unregister(id)) return 101;
+  if (reg->Has(RegistryKind::kWriter, kLegacyRegName)) return 102;
+  firefly::Clear();
+  std::printf("NEW_REG_FOLLOWER_OK\n");
+  return 0;
+}
+
+// 同版本双进程：Writer 先注册并持续发布，Reader 随后启动。旧实现中
+// Follower 的 Watch 只读本地广播缓存，永远 dial 不到启动前的 Writer。
+int NewPubFirst() {
+  auto node = firefly::CreateNode("interop_new_pub_first").value;
+  if (!node) return 110;
+  auto writer = node->CreateWriter<Chatter>("late/reader/ch").value;
+  if (!writer) return 111;
+  std::printf("NEW_PUB_FIRST_READY\n");
+  std::fflush(stdout);
+  for (int round = 0; round < 60; ++round) {
+    Chatter msg;
+    msg.set_seq(round % 3 + 1);
+    msg.set_content("late-reader");
+    (void)writer->Write(msg);
+    std::this_thread::sleep_for(100ms);
+  }
+  std::printf("NEW_PUB_FIRST_OK\n");
+  return 0;
+}
+
+int NewSubLate() {
+  auto node = firefly::CreateNode("interop_new_sub_late").value;
+  if (!node) return 112;
+  std::promise<void> done;
+  auto future = done.get_future();
+  std::atomic<int> seen{0};
+  auto reader = node->CreateReader<Chatter>(
+      "late/reader/ch",
+      [&](const firefly::MessageContext&,
+          const std::shared_ptr<const Chatter>& msg) {
+        if (msg->seq() == seen.load() + 1) {
+          seen.fetch_add(1);
+          if (seen.load() == 3) done.set_value();
+        }
+        return firefly::CallbackResult::kOk;
+      }).value;
+  if (!reader) return 113;
+  if (future.wait_for(15s) != std::future_status::ready) return 114;
+  std::printf("NEW_SUB_LATE_OK seq=3\n");
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 2) return 90;
   const std::string mode = argv[1];
+  // 发现协议模式自行管理 Init/Clear（raw NNG 端点需要精确控制主/从角色）。
+  if (mode == "legacy_reg_client") return LegacyRegClient();
+  if (mode == "legacy_reg_primary") return LegacyRegPrimary();
   if (!firefly::Init(("interop_" + mode).c_str())) return 91;
   int rc = 92;
   if (mode == "legacy_pub") rc = LegacyPub();
@@ -342,6 +592,10 @@ int main(int argc, char** argv) {
   else if (mode == "new_req") rc = NewReq();
   else if (mode == "new_rep") rc = NewRep();
   else if (mode == "legacy_req") rc = LegacyReq();
+  else if (mode == "new_reg_primary") rc = NewRegPrimary();
+  else if (mode == "new_reg_follower") rc = NewRegFollower();
+  else if (mode == "new_pub_first") rc = NewPubFirst();
+  else if (mode == "new_sub_late") rc = NewSubLate();
   firefly::Clear();
   return rc;
 }

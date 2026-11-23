@@ -212,6 +212,7 @@ add_firefly_test(firefly_callback_contract_test tests/callback_contract_test.cpp
 add_firefly_test(firefly_callback_context_test tests/callback_context_test.cpp)
 add_firefly_test(firefly_stats_test tests/stats_test.cpp)
 add_firefly_test(firefly_fake_transport_test tests/fake_transport_test.cpp)
+add_firefly_test(firefly_creation_failure_test tests/creation_failure_test.cpp)
 add_firefly_test(firefly_clear_wait_test tests/clear_wait_test.cpp)
 add_firefly_test(firefly_message_traits_test tests/message_traits_test.cpp)
 
@@ -266,6 +267,16 @@ if(FIREFLY_WITH_NNG)
       new_req legacy_rep NEW_REQ_OK LEGACY_REP_OK 37505 37506 LEGACY_REP_READY)
   add_interop_pair(cross_rpc_new_to_legacy
       legacy_req new_rep LEGACY_REQ_OK NEW_REP_OK 37507 37508 NEW_REP_READY)
+  # 三项 P1 回归：旧注册协议、Follower 初始快照、Writer 先启 Reader 后启。
+  add_interop_pair(cross_registry_legacy_follower_new_primary
+      legacy_reg_client new_reg_primary LEGACY_REG_OK NEW_REG_PRIMARY_OK
+      37509 37510 NEW_REG_PRIMARY_READY)
+  add_interop_pair(cross_registry_new_follower_legacy_primary
+      new_reg_follower legacy_reg_primary NEW_REG_FOLLOWER_OK LEGACY_REG_PRIMARY_OK
+      37511 37512 LEGACY_REG_PRIMARY_READY)
+  add_interop_pair(cross_pubsub_writer_first_reader_late
+      new_sub_late new_pub_first NEW_SUB_LATE_OK NEW_PUB_FIRST_OK
+      37513 37514 NEW_PUB_FIRST_READY)
 endif()
 
 # 端口隔离：所有依赖注册中心的测试共享同一 RESOURCE_LOCK。
@@ -274,7 +285,7 @@ set(FIREFLY_PORT_LOCK_TESTS
     error_code_test write_status_test rpc_error_test empty_message_test
     deprecated_compat_test shutdown_test request_cancel_test duplicate_test
     endpoint_lifecycle_test callback_contract_test callback_context_test
-    stats_test fake_transport_test clear_wait_test review_regression_test
+    stats_test fake_transport_test creation_failure_test clear_wait_test review_regression_test
     batch1_contract_test batch3_contract_test)
 if(FIREFLY_WITH_NNG)
   list(APPEND FIREFLY_PORT_LOCK_TESTS discovery_test)
