@@ -29,10 +29,10 @@
 
 | # | 验收标准 | 证据 | 提交 | 状态 |
 | --- | --- | --- | --- | --- |
-| 2.1 | 四个 Core 均无 NNG 头文件、常量或错误码引用 | `no_leak_check`（`tools/check_no_leak.py`）；`firefly/detail/*_core.cc` 源码检查 | `c379dc0`、`ee4b006` | 已覆盖 |
-| 2.2 | 旧 `ISocket` / `ITransportFactory` / `kIo*` 整数码的生产调用者全部迁移后删除 | `firefly/detail/interfaces.h`；`no_leak_check` | `ee4b006` | 已覆盖 |
-| 2.3 | 四角色契约表公开声明，接口只含该角色需要的操作 | `firefly/detail/endpoint_api.h` 顶部四张契约表；`interfaces.h` | `30dfb0b` | 已覆盖 |
-| 2.4 | `TransferStatus` 统一状态；`NNG_EAGAIN` 只在适配器内映射，Core 只见统一状态 | `fake_transport_test`；`transport_nng.cc` 收口 | `30dfb0b` | 已覆盖 |
+| 2.1 | 四个 Core 均无 NNG 头文件、常量或错误码引用 | `no_leak_check`（`tools/check_no_leak.py`）；`src/core/*_core.cc` 源码检查 | `c379dc0`、`ee4b006` | 已覆盖 |
+| 2.2 | 旧 `ISocket` / `ITransportFactory` / `kIo*` 整数码的生产调用者全部迁移后删除 | `src/core/interfaces.h`；`no_leak_check` | `ee4b006` | 已覆盖 |
+| 2.3 | 四角色契约表公开声明，接口只含该角色需要的操作 | `include/src/core/endpoint_api.h` 顶部四张契约表；`interfaces.h` | `30dfb0b` | 已覆盖 |
+| 2.4 | `TransferStatus` 统一状态；`NNG_EAGAIN` 只在适配器内映射，Core 只见统一状态 | `fake_transport_test`；`src/backends/nng/transport.cc` 收口 | `30dfb0b` | 已覆盖 |
 | 2.5 | `Exchange` 收绝对 deadline，连接/发送/接收各阻塞点前重算剩余预算 | `fake_transport_test`；`backend_contract_test::absolute_deadline`、`close_and_deadline` | `32e4dad`、`8f1e8b7` | 已覆盖 |
 | 2.6 | `ReplyToken` 不透明，Core 只原样回传，后端校验归属 | `fake_transport_test`；`backend_contract_test::response_matching` | `32e4dad`、`8f1e8b7` | 已覆盖 |
 | 2.7 | 四角色 `Close()` 幂等且可跨线程唤醒阻塞 I/O；此后调用返回 `kClosed` | `fake_transport_test`；`backend_contract_test::close_and_deadline`（promise/future 控时序） | `30dfb0b`、`8f1e8b7` | 已覆盖 |
@@ -50,7 +50,7 @@
 | 3.5 | 按 kind+name 查多记录、按 backend 过滤、按独立 `EndpointId` 注销 | `batch3_contract_test::multi_record_and_backend_filter`；`discovery_test` | `3d26888` | 已覆盖 |
 | 3.6 | `Watch` 取得一致初始快照与后续完整快照；`Clear` 后迟到注销为 no-op、可重启 | `batch3_contract_test`；`review_regression_test`；`discovery_test` | `3d26888`、`46b6d0e` | 已覆盖 |
 | 3.7 | 线协议仅追加可选 id/backend；旧版忽略新字段，新版派生兼容 id，QLIST 回退 LIST | `discovery.cc`；`cross_*` 新旧进程混跑 | `cb0751a`、`7664b2c` | 已覆盖 |
-| 3.8 | `Init` 一次组装 `NngTransportFactory + NngRegistry`；四 Core 不再各自选默认后端 | `firefly/init.cc`；`detail::ResolveInjection`；`fake_transport_test` 注入 | `cb0751a` | 已覆盖 |
+| 3.8 | `Init` 一次组装 `NngTransportFactory + NngRegistry`；四 Core 不再各自选默认后端 | `src/runtime/init.cc`；`detail::ResolveInjection`；`fake_transport_test` 注入 | `cb0751a` | 已覆盖 |
 | 3.9 | 启动顺序恒为 Bind → Register → 启动工作线程；`Subscriber::UpdatePublishers` 收地址全集 | `batch3_contract_test`；`fake_transport_test` 统计 | `11a2b33`、`34f0bdc` | 已覆盖 |
 
 ## 4. 第 4 批：用构建和契约测试证明可替换
@@ -61,7 +61,7 @@
 | 4.2 | Core target 不链接 NNG、不 include `<nng/...>` | `firefly_core` 链接接口仅 `protobuf::libprotobuf Threads::Threads`；`no_leak_check` | `d3c753b` | 已覆盖 |
 | 4.3 | `FIREFLY_WITH_NNG=OFF` 跳过 `find_package(nng)`，排除 NNG target | `CMakeLists.txt:21-28`；OFF 配置日志 `NNG backend DISABLED (in-memory backend selected)` | `46003e9` | 已覆盖 |
 | 4.4 | 无 NNG 环境完成配置、构建、链接、测试 | `build-no-nng/deps` 独立前缀（仅 protobuf/abseil，无 nng）；OFF 65/65 步；`ctest` 23/23 → 24/24 | `46003e9`、`8f1e8b7` | 已覆盖 |
-| 4.5 | 同一套上层调用在默认 NNG 组装与内存组装下通过同一套行为契约 | `backend_contract_memory` + `backend_contract_nng`（同一 `tests/backend_contract_test.cpp`） | `8f1e8b7` | 已覆盖 |
+| 4.5 | 同一套上层调用在默认 NNG 组装与内存组装下通过同一套行为契约 | `backend_contract_memory` + `backend_contract_nng`（同一 `tests/contract/backend_contract_test.cpp`） | `8f1e8b7` | 已覆盖 |
 | 4.6 | 契约覆盖取消、绝对截止时间、`Close()` 跨线程唤醒与幂等、响应对应、回调顺序、独立注册 | `backend_contract_test` 6 case：`cancelled_request` / `absolute_deadline` / `response_matching` / `callback_order` / `independent_registration` / `close_and_deadline` | `8f1e8b7` | 已覆盖 |
 | 4.7 | 跨进程覆盖发现、Pub/Sub、RPC，独立地址，并行 CTest 稳定 | `cross_pubsub_legacy_to_new`、`cross_pubsub_new_to_legacy`、`cross_rpc_legacy_to_new`、`cross_rpc_new_to_legacy`；端口对 37501–37508；`ctest -j6` 连续两轮 30/30 | `7664b2c` | 已覆盖 |
 | 4.8 | 前三批全部测试与示例仍通过；公共 API 签名、线协议不变 | 默认 ON 30/30；两个示例退出码 0；`header_check`；`docs/build.md` 第 3 节行为不变量 | `7664b2c` | 已覆盖 |

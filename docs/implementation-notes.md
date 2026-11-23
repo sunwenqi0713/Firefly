@@ -4,7 +4,7 @@
 ## 第 2 批落地说明（角色接口，2026-11-21）
 
 本批把数据传输从通用 `ISocket` 迁移到四个角色接口，声明与契约表位于
-`firefly/detail/endpoint_api.h` 顶部，接口定义位于 `firefly/detail/interfaces.h`。
+`include/src/core/endpoint_api.h` 顶部，接口定义位于 `src/core/interfaces.h`。
 
 | 角色 | 适配器实现 | Core 保留行为 |
 | --- | --- | --- |
@@ -15,7 +15,7 @@
 
 契约要点：
 - `TransferStatus`：`kOk/kTimeout/kClosed/kWouldBlock/kIoError/kInvalidArgument`。
-  `NNG_EAGAIN` 只在 `transport_nng.cc` 映射为 `kWouldBlock`，Core 只见统一状态。
+  `NNG_EAGAIN` 只在 `src/backends/nng/transport.cc` 映射为 `kWouldBlock`，Core 只见统一状态。
 - `Exchange(endpoint, request, deadline, response)` 收 `steady_clock` 绝对时间点；
   连接、发送、接收各阻塞点之前都重新计算剩余预算，任一步耗尽即 `kTimeout`。
 - `ReplyToken` 是只有虚析构的不透明接口；token 由适配器生成并校验归属，

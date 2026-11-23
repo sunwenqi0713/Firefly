@@ -5,6 +5,7 @@
 
 #include "firefly/detail/endpoint_api.h"
 #include "firefly/firefly.h"
+#include "core/transport.h"
 #include "test_messages.pb.h"
 
 using firefly::WriteStatus;

@@ -1,5 +1,13 @@
 # Firefly 构建拆分契约（第 4 批）
 
+> 目录搬迁后（提交见 release-notes）源码按 `include/firefly`（公共头）、
+> `src/core`（四 Core + transport/registry/injection 契约）、
+> `src/backends/{nng,memory}`（后端实现与默认注入）、`src/runtime`（入口与
+> 默认组装）分层；测试按 `tests/contract`、`tests/integration`、
+> `tests/support` 分组。CMake 的 include 根目录为 `include/` 与 `src/`，
+> 公共包含路径 `"firefly/..."` 不变。已用只依赖公共头 + `firefly::firefly`
+> 的外部消费者（链接后实际构造 Node/Writer）验证调用方式未变。
+
 本文件记录第 4 批「用构建和契约测试证明可替换」的构建契约、target 拓扑、
 开关语义、测试分组和验收记录。本批不改 Core 行为语义、不改线协议、不改公共
 API 签名、不引入新第三方依赖。
@@ -9,8 +17,8 @@ API 签名、不引入新第三方依赖。
 ### 1.1 当前 target 与源文件归属
 
 - 唯一静态库 `firefly`（`CMakeLists.txt`）：聚合入口 `init.cc`、运行时
-  `runtime.cc`、日志 `common/log.cc`、发现层 `detail/discovery.cc`、
-  `detail/endpoint_id.cc`、四 Core、NNG 适配器 `detail/transport_nng.cc` 与
+  `runtime.cc`、日志 `common/log.cc`、发现层 `src/backends/nng/registry.cc`、
+  `src/core/endpoint_id.cc`、四 Core、NNG 适配器 `src/backends/nng/transport.cc` 与
   `node/node.cc`；`PUBLIC` 链接 protobuf + nng + Threads。
 - 测试可执行文件全部在根 `CMakeLists.txt` 注册（无 `tests/CMakeLists.txt`），
   统一 `PRIVATE firefly`，多数另加 `test_messages`。示例 2 个、`interop_helper`
@@ -18,9 +26,9 @@ API 签名、不引入新第三方依赖。
 
 ### 1.2 测试/示例对 NNG 的依赖
 
-- 直接源码依赖：`tests/batch3_contract_test.cpp`、
-  `tests/interop_helper.cpp`（`<nng/...>` 与 `detail/net.h` 的
-  `ListenOnEphemeralPort`）；`tests/discovery_test.cpp` 直接使用
+- 直接源码依赖：`tests/contract/batch3_contract_test.cpp`、
+  `tests/integration/interop_helper.cpp`（`<nng/...>` 与 `src/backends/nng/net.h` 的
+  `ListenOnEphemeralPort`）；`tests/integration/discovery_test.cpp` 直接使用
   `firefly::discovery::Registry`，强绑定 NNG 发现实现。
 - 间接依赖：其余测试与示例都经 `firefly` 传递链接 `nng::nng`；
   `fake_transport_test.cpp` 还调用 `DefaultEndpointFactory()` 跑真实 NNG 适配器；
@@ -30,20 +38,20 @@ API 签名、不引入新第三方依赖。
 
 ### 1.3 Core 源文件清单（必须留在无 NNG target）
 
-- 入口/运行时：`firefly/init.cc`、`firefly/runtime.cc`、`firefly/common/log.cc`
-- 类型与句柄：`firefly/detail/endpoint_id.cc`、`firefly/detail/handles.h`、
-  `firefly/detail/rpc_frame.h`、`firefly/common/types.h`
-- 四 Core：`firefly/detail/writer_core.cc`、`reader_core.cc`、
+- 入口/运行时：`src/runtime/init.cc`、`src/runtime/runtime.cc`、`src/core/log.cc`
+- 类型与句柄：`src/core/endpoint_id.cc`、`include/src/core/handles.h`、
+  `src/core/rpc_frame.h`、`include/firefly/common/types.h`
+- 四 Core：`src/core/writer_core.cc`、`reader_core.cc`、
   `service_core.cc`、`client_core.cc`
-- Node 与公共头：`firefly/node/*`、`firefly/service/*`、`firefly/firefly.h`、
-  `firefly/detail/interfaces.h`、`firefly/detail/endpoint_api.h`
+- Node 与公共头：`include/firefly/node/*`、`include/firefly/service/*`、`include/firefly/firefly.h`、
+  `src/core/interfaces.h`、`include/src/core/endpoint_api.h`
 
-NNG 实现源文件：`firefly/detail/transport_nng.cc`、
-`firefly/detail/discovery.cc`、`firefly/detail/net.h`，全部归入 NNG target。
+NNG 实现源文件：`src/backends/nng/transport.cc`、
+`src/backends/nng/registry.cc`、`src/backends/nng/net.h`，全部归入 NNG target。
 
 ### 1.4 内存实现现有缺口
 
-生产代码没有内存后端；只有 `tests/fake_transport_test.cpp` 内的测试 Fake。
+生产代码没有内存后端；只有 `tests/contract/fake_transport_test.cpp` 内的测试 Fake。
 对照角色/注册表契约，缺失：
 
 - 四角色：`Publisher::Bind/Send/Close`、`Subscriber::UpdatePublishers/Receive/Close`、
@@ -52,12 +60,12 @@ NNG 实现源文件：`firefly/detail/transport_nng.cc`、
   `Watch` 初始/后续完整快照、`Unwatch`、`Clear` 后迟到注销 no-op。
 - 默认组装：`DefaultEndpointFactory/DefaultRegistry/BootstrapDefaultInjection/
   ResetDefaultInjection/ResolveInjection/ConfigureDiscovery` 目前都在
-  `transport_nng.cc`，OFF 构建会缺符号。
+  `src/backends/nng/transport.cc`，OFF 构建会缺符号。
 
 ### 1.5 运行时组装点
 
 唯一入口 `firefly::Init()` → `detail::BootstrapDefaultInjection()`
-（`firefly/init.cc:16`）；默认组装逻辑在 `firefly/detail/transport_nng.cc`
+（`src/runtime/init.cc:16`）；默认组装逻辑在 `src/backends/nng/transport.cc`
 尾部。`Clear()` 调 `ResetDefaultInjection()`；`ResolveInjection()` 只补空字段。
 
 ## 2. 构建拆分契约
@@ -70,7 +78,7 @@ NNG 实现源文件：`firefly/detail/transport_nng.cc`、
   内存四角色与注册表 / 默认注入；只依赖接口头。角色 object 可单独链接，
   使同一测试进程能同时构造内存与 NNG 后端而不重复注入符号。
 - `firefly_nng_role_objects` / `firefly_nng_injection_objects`（OBJECT，仅 ON）：
-  `transport_nng.cc`/`discovery.cc` 与 `nng_injection.cc`；链接 `nng::nng`。
+  `src/backends/nng/transport.cc`/`discovery.cc` 与 `nng_injection.cc`；链接 `nng::nng`。
 - `firefly_core`（STATIC）：Core object + 内存角色 object + 内存注入 object；
   自包含，无 NNG。
 - `firefly_nng`（STATIC，仅 ON）：NNG 角色 object + NNG 注入 object。
@@ -99,7 +107,7 @@ NNG 实现源文件：`firefly/detail/transport_nng.cc`、
   `ConfigureDiscovery()` 在每个后端各实现一次；最终链接只出现一份。
 - 内存后端额外导出 `MakeMemoryEndpointFactory()`、`MakeMemoryRegistry()`，
   NNG 后端额外导出 `MakeNngEndpointFactory()`、`MakeNngRegistry()`，供
-  `detail/backend_access.h` 的后端无关测试显式构造；测试不依赖 `Default*` 的后端选择。
+  `src/core/backend_access.h` 的后端无关测试显式构造；测试不依赖 `Default*` 的后端选择。
 
 ### 2.4 测试分组
 
@@ -149,7 +157,7 @@ NNG 实现源文件：`firefly/detail/transport_nng.cc`、
 
 ### T4（共享后端契约，提交 `8f1e8b7`）
 
-- `tests/backend_contract_test.cpp` 一份源码两种实例：
+- `tests/contract/backend_contract_test.cpp` 一份源码两种实例：
   `backend_contract_memory` 与 `backend_contract_nng`。
 - 覆盖排队中取消（服务端 0 次执行）、排队请求绝对截止时间、`Close()` 跨线程唤醒
   与幂等（Subscriber/Responder）、响应对应、回调顺序、同键独立注册。
@@ -158,7 +166,7 @@ NNG 实现源文件：`firefly/detail/transport_nng.cc`、
 
 ### T5/T6（跨进程与文档收尾，提交见本步）
 
-- `tests/run_interop_pair.py` 用标准库启动两进程，`*_READY` 标记作为启动屏障；
+- `tests/integration/run_interop_pair.py` 用标准库启动两进程，`*_READY` 标记作为启动屏障；
   4 组用例端口对 37501–37508 互不重叠，独立发现地址，无需共享锁。
 - 跨进程覆盖 legacy_pub→new_sub、new_pub→legacy_sub、legacy_rep→new_req、
   new_rep→legacy_req，验证发现、Pub/Sub、RPC 双向线兼容，4/4 通过。

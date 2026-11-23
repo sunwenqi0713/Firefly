@@ -3,8 +3,8 @@
 > 适用对象：为 Firefly 增加**第二套生产级**数据传输 / 端点发现后端。
 > 前置阅读：`docs/build.md`（target 拓扑与验证入口）、
 > `docs/acceptance-matrix.md`（验收基线）、
-> `firefly/detail/interfaces.h`（唯一接口定义）、
-> `firefly/detail/endpoint_api.h`（四角色行为契约表）。
+> `src/core/interfaces.h`（唯一接口定义）、
+> `include/src/core/endpoint_api.h`（四角色行为契约表）。
 
 ## 0. 一句话原则
 
@@ -18,7 +18,7 @@
 
 | # | 组件 | 接口 / 函数 | 参考实现 |
 | --- | --- | --- | --- |
-| 1 | 四角色工厂 | `IEndpointFactory` | `memory_transport.cc` / `transport_nng.cc` |
+| 1 | 四角色工厂 | `IEndpointFactory` | `memory_transport.cc` / `src/backends/nng/transport.cc` |
 | 2 | 发布者 | `Publisher` | 同上 |
 | 3 | 订阅者 | `Subscriber` | 同上 |
 | 4 | RPC 请求方 | `RpcRequester` | 同上 |
@@ -27,8 +27,8 @@
 | 7 | 默认注入函数组 | 见 1.3 | `memory_injection.cc` / `nng_injection.cc` |
 | 8 | 显式构造导出 | `backend_access.h` 增加两行声明 | `backend_access.h` |
 
-所有类型都定义在 `firefly::detail` 命名空间，位于 `firefly/detail/` 下；
-**不得**出现在任何公共头（`firefly/firefly.h`、`firefly/node/*`、`firefly/service/*`、
+所有类型都定义在 `firefly::detail` 命名空间，位于 `src/core/` 下；
+**不得**出现在任何公共头（`include/firefly/firefly.h`、`include/firefly/node/*`、`include/firefly/service/*`、
 `firefly/common/*`）中。
 
 ### 1.1 四角色签名与必须满足的契约
@@ -128,7 +128,7 @@ class IRegistry {
 
 ### 1.3 默认注入函数组（每个后端各实现一次，最终链接只出现一份）
 
-在 `firefly/detail/<name>_injection.cc` 中实现 `interfaces.h` 声明的全部入口：
+在 `src/core/<name>_injection.cc` 中实现 `interfaces.h` 声明的全部入口：
 
 | 函数 | 职责 |
 | --- | --- |
@@ -158,7 +158,7 @@ std::shared_ptr<IRegistry> Make<Name>Registry();
 
 ## 2. 构建接入（不改 target 拓扑）
 
-1. 新增 `firefly/detail/<name>_transport.cc`、`<name>_registry.cc`、
+1. 新增 `src/core/<name>_transport.cc`、`<name>_registry.cc`、
    `<name>_injection.cc`（若注册中心与传输紧耦合，可合并，但保持「角色」与
    「注入」两个 translation unit 的拆分）。
 2. 在 `CMakeLists.txt` 增加 `<name>_role_objects` 与 `<name>_injection_objects`
@@ -176,7 +176,7 @@ std::shared_ptr<IRegistry> Make<Name>Registry();
 
 | 测试 | 覆盖 | 新后端接入要求 |
 | --- | --- | --- |
-| `tests/backend_contract_test.cpp` **双实例** | 取消、绝对截止时间、`Close()` 跨线程唤醒与幂等、响应对应、回调顺序、独立注册（6 case） | 同一份源码增加 `<name>` 分支并注册 CTest 实例；与既有 `backend_contract_memory` / `backend_contract_nng` 并列，**不得复制测试逻辑** |
+| `tests/contract/backend_contract_test.cpp` **双实例** | 取消、绝对截止时间、`Close()` 跨线程唤醒与幂等、响应对应、回调顺序、独立注册（6 case） | 同一份源码增加 `<name>` 分支并注册 CTest 实例；与既有 `backend_contract_memory` / `backend_contract_nng` 并列，**不得复制测试逻辑** |
 | `batch1_contract_test` | Service 停机、Reader 删除并发、RPC 队列/取消 | 确认 Core 行为不回归 |
 | `batch3_contract_test` | 记录模型、多记录/backend 过滤、Watch 快照、Clear 重入、注册失败无残留 | 新 `IRegistry` 必须全绿 |
 | `fake_transport_test` / `no_leak_check` | 角色状态映射、公共头不泄漏后端实现 | 新后端不得让 `no_leak_check` 失败 |
@@ -190,16 +190,16 @@ std::shared_ptr<IRegistry> Make<Name>Registry();
 
 允许修改的只有：
 
-- `firefly/detail/` 下新增的后端实现与注入文件；
-- `firefly/detail/backend_access.h` 的导出声明；
+- `src/core/` 下新增的后端实现与注入文件；
+- `src/core/backend_access.h` 的导出声明；
 - `CMakeLists.txt` 的后端 object 与开关（**保持 target 拓扑不变**）；
 - `tests/` 下的新后端测试实例与互测辅助程序；
 - `docs/` 文档。
 
 **禁止**：
 
-- 修改 `firefly/detail/*_core.cc`（四个 Core）、`firefly/node/*`、
-  `firefly/service/*`、`firefly/common/*`、任何公共头；
+- 修改 `src/core/*_core.cc`（四个 Core）、`include/firefly/node/*`、
+  `include/firefly/service/*`、`firefly/common/*`、任何公共头；
 - 修改公共 API 签名、`WriteStatus` / `ErrorCode` / `RequestHandle` 语义、
   `QosProfile`、回调执行模型与关停契约；
 - 修改线协议：Pub/Sub 裸 protobuf 载荷、RPC `FFRP` 响应帧、发现文本协议；

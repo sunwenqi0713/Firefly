@@ -7,7 +7,7 @@
 #include <thread>
 
 #include "firefly/firefly.h"
-#include "firefly/detail/rpc_frame.h"
+#include "core/rpc_frame.h"
 #include "test_messages.pb.h"
 
 using firefly::ErrorCode;

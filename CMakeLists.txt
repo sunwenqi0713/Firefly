@@ -29,17 +29,18 @@ endif()
 
 # ---------------- Core object 集合：不得出现 <nng/...> 或 NNG 符号 ----------------
 add_library(firefly_core_objects OBJECT
-    firefly/init.cc
-    firefly/runtime.cc
-    firefly/common/log.cc
-    firefly/detail/endpoint_id.cc
-    firefly/detail/writer_core.cc
-    firefly/detail/reader_core.cc
-    firefly/detail/service_core.cc
-    firefly/detail/client_core.cc
-    firefly/node/node.cc)
+    src/runtime/init.cc
+    src/runtime/runtime.cc
+    src/core/log.cc
+    src/core/endpoint_id.cc
+    src/core/writer_core.cc
+    src/core/reader_core.cc
+    src/core/service_core.cc
+    src/core/client_core.cc
+    src/core/node.cc)
 target_include_directories(firefly_core_objects PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
 target_link_libraries(firefly_core_objects PUBLIC
     protobuf::libprotobuf Threads::Threads)
 target_compile_definitions(firefly_core_objects PUBLIC
@@ -50,31 +51,32 @@ target_compile_definitions(firefly_core_objects PUBLIC
 # 每个后端各一份，最终链接只能出现一份。
 function(configure_firefly_object target)
   target_include_directories(${target} PUBLIC
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
   target_link_libraries(${target} PUBLIC Threads::Threads)
   target_compile_definitions(${target} PUBLIC
       FIREFLY_WITH_NNG=${FIREFLY_WITH_NNG_DEFINE})
 endfunction()
 
 add_library(firefly_memory_role_objects OBJECT
-    firefly/detail/memory_transport.cc
-    firefly/detail/memory_registry.cc)
+    src/backends/memory/transport.cc
+    src/backends/memory/registry.cc)
 configure_firefly_object(firefly_memory_role_objects)
 
 add_library(firefly_memory_injection_objects OBJECT
-    firefly/detail/memory_injection.cc)
+    src/backends/memory/injection.cc)
 configure_firefly_object(firefly_memory_injection_objects)
 
 if(FIREFLY_WITH_NNG)
   add_library(firefly_nng_role_objects OBJECT
-      firefly/detail/transport_nng.cc
-      firefly/detail/discovery.cc)
+      src/backends/nng/transport.cc
+      src/backends/nng/registry.cc)
   configure_firefly_object(firefly_nng_role_objects)
   target_link_libraries(firefly_nng_role_objects PUBLIC
       nng::nng protobuf::libprotobuf)
 
   add_library(firefly_nng_injection_objects OBJECT
-      firefly/detail/nng_injection.cc)
+      src/backends/nng/injection.cc)
   configure_firefly_object(firefly_nng_injection_objects)
   target_link_libraries(firefly_nng_injection_objects PUBLIC nng::nng)
 endif()
@@ -100,7 +102,8 @@ add_library(firefly_core STATIC
     $<TARGET_OBJECTS:firefly_memory_role_objects>
     $<TARGET_OBJECTS:firefly_memory_injection_objects>)
 target_include_directories(firefly_core PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
 target_link_libraries(firefly_core PUBLIC protobuf::libprotobuf Threads::Threads)
 target_compile_definitions(firefly_core PUBLIC
     FIREFLY_WITH_NNG=${FIREFLY_WITH_NNG_DEFINE})
@@ -111,7 +114,8 @@ if(FIREFLY_WITH_NNG)
       $<TARGET_OBJECTS:firefly_nng_role_objects>
       $<TARGET_OBJECTS:firefly_nng_injection_objects>)
   target_include_directories(firefly_nng PUBLIC
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
   target_link_libraries(firefly_nng PUBLIC
       nng::nng protobuf::libprotobuf Threads::Threads)
   add_library(firefly::nng ALIAS firefly_nng)
@@ -130,7 +134,8 @@ add_library(firefly STATIC
     ${FIREFLY_BACKEND_OBJECTS})
 add_library(firefly::firefly ALIAS firefly)
 target_include_directories(firefly PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
 target_link_libraries(firefly PUBLIC protobuf::libprotobuf Threads::Threads)
 target_compile_definitions(firefly PUBLIC
     FIREFLY_WITH_NNG=${FIREFLY_WITH_NNG_DEFINE})
@@ -163,7 +168,7 @@ target_link_libraries(firefly_header_check PRIVATE firefly)
 add_test(NAME header_check COMMAND firefly_header_check)
 
 # 端到端测试：先由 protoc 生成测试消息代码
-set(TEST_MESSAGES_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_messages.proto")
+set(TEST_MESSAGES_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/tests/support/test_messages.proto")
 set(TEST_MESSAGES_OUT "${CMAKE_CURRENT_BINARY_DIR}/tests/gen")
 find_program(PROTOC_EXE protoc HINTS
     "${CMAKE_CURRENT_BINARY_DIR}/vcpkg_installed/x64-windows/tools/protobuf")
@@ -175,7 +180,7 @@ add_custom_command(
     OUTPUT ${TEST_MESSAGES_OUT}/test_messages.pb.cc
            ${TEST_MESSAGES_OUT}/test_messages.pb.h
     COMMAND ${CMAKE_COMMAND} -E make_directory ${TEST_MESSAGES_OUT}
-    COMMAND ${PROTOC_EXE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    COMMAND ${PROTOC_EXE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/support
             --cpp_out=${TEST_MESSAGES_OUT} ${TEST_MESSAGES_PROTO}
     DEPENDS ${TEST_MESSAGES_PROTO}
     COMMENT "Protoc generating test_messages"
@@ -188,11 +193,11 @@ target_link_libraries(test_messages PUBLIC protobuf::libprotobuf)
 
 # 发现中心 / Reader / Service / Client 单元测试
 if(FIREFLY_WITH_NNG)
-  add_firefly_test(firefly_discovery_test tests/discovery_test.cpp)
+  add_firefly_test(firefly_discovery_test tests/integration/discovery_test.cpp)
 endif()
-add_firefly_test(firefly_e2e_test tests/e2e_test.cpp)
-add_firefly_test(firefly_reader_test tests/reader_test.cpp)
-add_firefly_test(firefly_client_test tests/client_test.cpp)
+add_firefly_test(firefly_e2e_test tests/integration/e2e_test.cpp)
+add_firefly_test(firefly_reader_test tests/integration/reader_test.cpp)
+add_firefly_test(firefly_client_test tests/integration/client_test.cpp)
 
 # 阶段一验收：错误码 / Write 状态 / RPC 错误 / 空消息 / 旧 API
 add_firefly_test(firefly_error_code_test tests/error_code_test.cpp)
@@ -211,18 +216,18 @@ add_firefly_test(firefly_callback_contract_test tests/callback_contract_test.cpp
 # 阶段三验收：上下文回调 / 统计 / fake 注入 / Clear 等待 / schema
 add_firefly_test(firefly_callback_context_test tests/callback_context_test.cpp)
 add_firefly_test(firefly_stats_test tests/stats_test.cpp)
-add_firefly_test(firefly_fake_transport_test tests/fake_transport_test.cpp)
-add_firefly_test(firefly_creation_failure_test tests/creation_failure_test.cpp)
+add_firefly_test(firefly_fake_transport_test tests/contract/fake_transport_test.cpp)
+add_firefly_test(firefly_creation_failure_test tests/contract/creation_failure_test.cpp)
 add_firefly_test(firefly_clear_wait_test tests/clear_wait_test.cpp)
 add_firefly_test(firefly_message_traits_test tests/message_traits_test.cpp)
 
 # 审查回归 + 第 1/3 批行为契约
 add_firefly_test(firefly_review_regression_test tests/review_regression_test.cpp)
-add_firefly_test(firefly_batch1_contract_test tests/batch1_contract_test.cpp)
-add_firefly_test(firefly_batch3_contract_test tests/batch3_contract_test.cpp)
+add_firefly_test(firefly_batch1_contract_test tests/contract/batch1_contract_test.cpp)
+add_firefly_test(firefly_batch3_contract_test tests/contract/batch3_contract_test.cpp)
 
 # 第 4 批共享后端契约：同一测试源分别用内存与 NNG 显式后端各跑一遍。
-add_executable(firefly_backend_contract_test tests/backend_contract_test.cpp)
+add_executable(firefly_backend_contract_test tests/contract/backend_contract_test.cpp)
 target_link_libraries(firefly_backend_contract_test PRIVATE firefly test_messages)
 if(FIREFLY_WITH_NNG)
   # 默认聚合库含 NNG 注入；这里补上内存角色 object（不含注入）避免符号重复。
@@ -242,7 +247,7 @@ endif()
 
 # 旧版 raw-NNG 进程与新版公开 API 进程的线兼容辅助程序（仅 NNG 后端）
 if(FIREFLY_WITH_NNG)
-  add_executable(firefly_interop_helper tests/interop_helper.cpp)
+  add_executable(firefly_interop_helper tests/integration/interop_helper.cpp)
   target_link_libraries(firefly_interop_helper PRIVATE firefly test_messages)
 
   # 跨进程两组用例：每组独立发现地址，可并行运行，不共享 RESOURCE_LOCK。
@@ -252,7 +257,7 @@ if(FIREFLY_WITH_NNG)
   function(add_interop_pair name mode_a mode_b marker_a marker_b rep_port pub_port)
     add_test(NAME ${name}
              COMMAND ${Python3_EXECUTABLE}
-                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_interop_pair.py
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/run_interop_pair.py
                      $<TARGET_FILE:firefly_interop_helper>
                      ${mode_a} ${mode_b} ${marker_a} ${marker_b} ${ARGN})
     set_tests_properties(${name} PROPERTIES ENVIRONMENT

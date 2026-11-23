@@ -14,6 +14,27 @@
 - **构建可拆分**：`FIREFLY_WITH_NNG=OFF` 跳过 `find_package(nng)`，运行时自动
   组装内存后端。
 
+## 目录结构
+
+```
+include/firefly/         公共头（仍以 "firefly/..." 路径包含）
+  firefly.h init.h common/ message/ node/ service/
+  detail/                公共模板所需句柄与工厂声明（桥接头）
+src/
+  core/                  四 Core、Node、注入契约（transport/registry/injection）
+  backends/nng/          NNG transport、registry、net、默认注入
+  backends/memory/       内存 transport、registry、默认注入
+  runtime/               init.cc / runtime.cc（默认组装入口）
+tests/
+  contract/              双后端共享行为契约与故障注入
+  integration/           公开 API 与跨进程 / 真实旧版互测
+  support/               测试消息 proto
+```
+
+公共模板只包含句柄与工厂声明；传输角色与 Registry 的完整定义位于
+`src/core/`。使用方只需 `#include "firefly/firefly.h"` 并链接 `firefly::firefly`，
+无需感知内部目录划分。
+
 ## 一条命令验证
 
 ```bash
@@ -48,10 +69,10 @@ cmake -S . -B build-off -DFIREFLY_WITH_NNG=OFF -DCMAKE_TOOLCHAIN_FILE=<vcpkg too
   （NNG 或内存），四个 Core 只调用 `detail::ResolveInjection()`，不自行选择后端。
 - 测试或嵌入方需要替换时，通过 `InjectionContext` 注入
   `IEndpointFactory`（四角色工厂）与 `IRegistry`（记录模型）。
-- `detail/backend_access.h` 导出显式构造入口：
+- `src/core/backend_access.h` 导出显式构造入口：
   `MakeMemoryEndpointFactory()` / `MakeMemoryRegistry()`（两种开关都可用）；
   `MakeNngEndpointFactory()` / `MakeNngRegistry()`（仅 ON）。共享契约测试
-  `tests/backend_contract_test.cpp` 用同一份源码分别跑内存与 NNG 两个实例。
+  `tests/contract/backend_contract_test.cpp` 用同一份源码分别跑内存与 NNG 两个实例。
 - target 拓扑：`firefly_core_objects`（零 NNG）+ 后端「角色 / 注入」object +
   聚合 `firefly::firefly`。详见 `docs/build.md`。
 
@@ -76,7 +97,7 @@ cmake -S . -B build-off -DFIREFLY_WITH_NNG=OFF -DCMAKE_TOOLCHAIN_FILE=<vcpkg too
 双向线兼容）需要：
 
 - `FIREFLY_WITH_NNG=ON`，且 `firefly_interop_helper` 已构建；
-- **Python 3**（仅标准库：`tests/run_interop_pair.py` 用 `subprocess` /
+- **Python 3**（仅标准库：`tests/integration/run_interop_pair.py` 用 `subprocess` /
   `threading`，无第三方依赖）；
 - 4 组互不重叠的发现端口 `37501–37508`，由 CTest `ENVIRONMENT` 注入，可并行；
 - `*_READY` 启动屏障：被期望成为发现主实例的进程先就绪，另一进程才启动。

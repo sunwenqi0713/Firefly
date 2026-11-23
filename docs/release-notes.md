@@ -1,5 +1,12 @@
 # Firefly 里程碑发布说明：`refactor-complete`
 
+> 后续增量（2026-11-23）：先修复三项已复现 P1（跨进程晚启动 Reader 的
+> Follower 初始快照、旧版注册响应兼容、端点创建失败 Core 泄漏），再完成
+> `include/firefly` + `src/{core,backends,runtime}` + `tests/{contract,integration,support}`
+> 目录收敛。提交：`3920ffb`（P1 修复）与紧随其后的目录搬迁提交。
+> ON 34/34、OFF 25/25；真实旧版 4aecd32 二进制双向注册互通已验证；
+> 只依赖公共头 + `firefly::firefly` 的外部消费者构建/运行通过。
+
 - **里程碑 tag**：`refactor-complete`
 - **日期**：2026-11-22
 - **分支策略**：单主干 `main`。推送前 `origin/main` 为 `46b6d0e`，本地在其上
