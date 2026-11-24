@@ -1,35 +1,33 @@
-# 接入新生产后端指南
+# 接入新生产后端
 
 > 适用对象：为 Firefly 增加**第二套生产级**数据传输 / 端点发现后端。
-> 前置阅读：`docs/build.md`（target 拓扑与验证入口）、
-> `docs/acceptance-matrix.md`（验收基线）、
+> 前置阅读：[build.md](build.md)（target 拓扑与验证入口）、
+> [../architecture/contracts.md](../architecture/contracts.md)（必须满足的行为契约）、
 > `src/core/interfaces.h`（唯一接口定义）、
-> `include/src/core/endpoint_api.h`（四角色行为契约表）。
+> `include/firefly/detail/endpoint_api.h`（四角色行为契约表）。
 
 ## 0. 一句话原则
 
 **后端 = 实现 `detail` 层接口 + 提供默认注入 + 通过同一套契约测试；Core 一行不改。**
 
-四批重构已把「通信语义」与「传输/发现实现」切开：四个 Core 只认四角色接口
-与 `IRegistry`，公共 API 与线协议不感知后端。新后端接入是**加实现**，不是
-**改语义**。
+通信语义与传输/发现实现已经切开：四个 Core 只认四角色接口与 `IRegistry`，公共 API 与线协议不感知后端。新后端接入是**加实现**，不是**改语义**。历史理由见 [ADR-0002](../decisions/0002-split-transport-and-discovery-contracts.md) 与 [ADR-0003](../decisions/0003-four-role-transport-interfaces.md)。
 
 ## 1. 最小实现面
 
 | # | 组件 | 接口 / 函数 | 参考实现 |
 | --- | --- | --- | --- |
-| 1 | 四角色工厂 | `IEndpointFactory` | `memory_transport.cc` / `src/backends/nng/transport.cc` |
+| 1 | 四角色工厂 | `IEndpointFactory` | `src/backends/memory/transport.cc` / `src/backends/nng/transport.cc` |
 | 2 | 发布者 | `Publisher` | 同上 |
 | 3 | 订阅者 | `Subscriber` | 同上 |
 | 4 | RPC 请求方 | `RpcRequester` | 同上 |
 | 5 | RPC 应答方 | `RpcResponder` | 同上 |
-| 6 | 注册中心 | `IRegistry`（记录模型） | `memory_registry.cc` / `discovery.cc` + `nng_injection.cc` |
-| 7 | 默认注入函数组 | 见 1.3 | `memory_injection.cc` / `nng_injection.cc` |
-| 8 | 显式构造导出 | `backend_access.h` 增加两行声明 | `backend_access.h` |
+| 6 | 注册中心 | `IRegistry`（记录模型） | `src/backends/memory/registry.cc` / `src/backends/nng/registry.cc` |
+| 7 | 默认注入函数组 | 见 1.3 | `src/backends/memory/injection.cc` / `src/backends/nng/injection.cc` |
+| 8 | 显式构造导出 | `backend_access.h` 增加两行声明 | `src/core/backend_access.h` |
 
-所有类型都定义在 `firefly::detail` 命名空间，位于 `src/core/` 下；
+所有类型都定义在 `firefly::detail` 命名空间，实现在 `src/backends/<name>/` 下；
 **不得**出现在任何公共头（`include/firefly/firefly.h`、`include/firefly/node/*`、`include/firefly/service/*`、
-`firefly/common/*`）中。
+`src/core/*.h` 之外）中。
 
 ### 1.1 四角色签名与必须满足的契约
 
@@ -68,7 +66,7 @@ class IEndpointFactory {
 };
 ```
 
-逐条不可打折的契约（完整表见 `endpoint_api.h` 第 23–71 行）：
+逐条不可打折的契约（完整表见 `include/firefly/detail/endpoint_api.h`）：
 
 - `Deadline` 是 `std::chrono::steady_clock::time_point` **绝对时间点**。
   `Exchange` 在连接 / 发送 / 接收每个阻塞点**之前**重算剩余预算，任一步耗尽即
@@ -83,7 +81,7 @@ class IEndpointFactory {
 - 所有后端错误**必须收口**到 `TransferStatus`
   （`kOk/kTimeout/kClosed/kWouldBlock/kIoError/kInvalidArgument`）。
   后端专有错误码（如 `NNG_EAGAIN`）不得跨过适配器边界；`Core` 侧映射见
-  `endpoint_api.h` 第 30–37 行。
+  `include/firefly/detail/endpoint_api.h` 的错误映射表。
 - 载荷是**字节串**：Pub/Sub 为序列化后的 protobuf，RPC 为 `FFRP` 帧。适配器
   **不解析**业务内容、不解析响应帧里的业务 `ErrorCode`。
 
@@ -110,7 +108,7 @@ class IRegistry {
 };
 ```
 
-不可打折的契约（完整注释见 `interfaces.h` 第 125–153 行）：
+不可打折的契约（完整注释见 `src/core/interfaces.h`）：
 
 - **按 id 注销**，同一 `kind+name` 下允许多条记录并存，`Query` 必须全部返回，
   不得互相覆盖。两个同通道 Reader 即使都用空 `address` 也各有独立记录，
@@ -124,11 +122,11 @@ class IRegistry {
 - 若需要与既有 NNG 进程混跑，线协议必须兼容：注册/注销命令与广播**在末尾追加**
   可选 `id`/`backend` 字段，旧版忽略新字段；新版对缺失字段按
   `kind+name+address` 派生稳定兼容 id；`QLIST` 不可用时回退 `LIST`。
-  详见 `docs/acceptance-matrix.md` 3.7 与已知限制 L2。
+  详见 [../architecture/wire-protocol.md](../architecture/wire-protocol.md) §3 与 [../architecture/known-gaps.md](../architecture/known-gaps.md) G12。
 
 ### 1.3 默认注入函数组（每个后端各实现一次，最终链接只出现一份）
 
-在 `src/core/<name>_injection.cc` 中实现 `interfaces.h` 声明的全部入口：
+在 `src/backends/<name>/injection.cc` 中实现 `src/core/interfaces.h` 声明的全部入口：
 
 | 函数 | 职责 |
 | --- | --- |
@@ -139,10 +137,10 @@ class IRegistry {
 | `ResolveInjection(ctx)` | 只补齐 `ctx` 中为空的字段，**不做后端选择** |
 | `DefaultEndpointFactory()` / `DefaultRegistry()` | 返回本后端的工厂与注册中心（函数级静态） |
 
-注意：这些符号**不能**在两个后端 object 中同时进入最终链接。第 4 批因此把后端
-拆成「角色 object」与「注入 object」两层：角色 object 可被同一测试进程显式
+注意：这些符号**不能**在两个后端 object 中同时进入最终链接。因此后端拆成
+「角色 object」与「注入 object」两层：角色 object 可被同一测试进程显式
 链接多次，注入 object 每个后端各一份、聚合库只选其一。参见 `CMakeLists.txt`
-`configure_firefly_object()` 与 `FIREFLY_BACKEND_OBJECTS`。
+的 `configure_firefly_object()` 与 `FIREFLY_BACKEND_OBJECTS`。
 
 ### 1.4 `backend_access.h` 导出
 
@@ -158,8 +156,8 @@ std::shared_ptr<IRegistry> Make<Name>Registry();
 
 ## 2. 构建接入（不改 target 拓扑）
 
-1. 新增 `src/core/<name>_transport.cc`、`<name>_registry.cc`、
-   `<name>_injection.cc`（若注册中心与传输紧耦合，可合并，但保持「角色」与
+1. 新增 `src/backends/<name>/transport.cc`、`registry.cc`、
+   `injection.cc`（若注册中心与传输紧耦合，可合并，但保持「角色」与
    「注入」两个 translation unit 的拆分）。
 2. 在 `CMakeLists.txt` 增加 `<name>_role_objects` 与 `<name>_injection_objects`
    两个 `OBJECT` 库，复用 `configure_firefly_object()`，并声明该后端自身的链接
@@ -170,7 +168,7 @@ std::shared_ptr<IRegistry> Make<Name>Registry();
    `firefly_core` 仍自包含且不链接任何后端专有库。
 4. `scripts/verify.sh` 的无 NNG 独立前缀方案按新依赖调整：从
    `build/vcpkg_installed` 只复制非 NNG 内容，且 OFF 构建目录与
-   `CMAKE_PREFIX_PATH` 绑定（已知限制 L11）。
+   `CMAKE_PREFIX_PATH` 绑定（见 [../architecture/known-gaps.md](../architecture/known-gaps.md) EV2）。
 
 ## 3. 必过的契约测试集
 
@@ -183,23 +181,23 @@ std::shared_ptr<IRegistry> Make<Name>Registry();
 | **跨进程双向**（`interop_helper` + `run_interop_pair.py`） | 发现、Pub/Sub、RPC 的线兼容 | 4 组：`legacy_pub→new_sub`、`new_pub→legacy_sub`、`legacy_rep→new_req`、`new_rep→legacy_req`；每组独立发现端口、`*_READY` 启动屏障、并行 CTest 稳定 |
 | 默认 ON 全量 `ctest -j6` / OFF 全量 | 整体回归 | `bash scripts/verify.sh` 一条命令 |
 
-跨进程用例的已知偶发（follower 注册 3 秒超时，L10）由 `verify.sh` 做最多
+跨进程用例的已知偶发（follower 注册 3 秒超时，EV1）由 `verify.sh` 做最多
 3 次有限重试；**不要**通过放宽断言或删除用例来「修绿」。
 
 ## 4. 「不碰 Core」边界（红线）
 
 允许修改的只有：
 
-- `src/core/` 下新增的后端实现与注入文件；
+- `src/backends/<name>/` 下新增的后端实现与注入文件；
 - `src/core/backend_access.h` 的导出声明；
 - `CMakeLists.txt` 的后端 object 与开关（**保持 target 拓扑不变**）；
 - `tests/` 下的新后端测试实例与互测辅助程序；
-- `docs/` 文档。
+- `docs/` 文档（`architecture/`、`guides/`、`decisions/`）。
 
 **禁止**：
 
 - 修改 `src/core/*_core.cc`（四个 Core）、`include/firefly/node/*`、
-  `include/firefly/service/*`、`firefly/common/*`、任何公共头；
+  `include/firefly/service/*`、任何公共头；
 - 修改公共 API 签名、`WriteStatus` / `ErrorCode` / `RequestHandle` 语义、
   `QosProfile`、回调执行模型与关停契约；
 - 修改线协议：Pub/Sub 裸 protobuf 载荷、RPC `FFRP` 响应帧、发现文本协议；
@@ -210,17 +208,17 @@ std::shared_ptr<IRegistry> Make<Name>Registry();
 - 用「顺手优化 Core」的方式绕过契约差异：若新后端无法满足某条契约，
   应先记录为已知限制并评审，而不是改 Core 去迁就后端。
 
-**互通限制（L2）**：新后端进程与既有 NNG 进程直接互通需要共同的线上协议或
+**互通限制（G12）**：新后端进程与既有 NNG 进程直接互通需要共同的线上协议或
 桥接，当前不在实现范围内；`backend` 字段可用于过滤不兼容的端点地址。
 
 ## 5. 建议实施顺序
 
-1. 先用进程内实现（参考 `memory_transport.cc` / `memory_registry.cc`）跑通
+1. 先用进程内实现（参考 `src/backends/memory/{transport,registry}.cc`）跑通
    `backend_contract_test` 的 6 个 case 与批 3 记录模型测试；
 2. 接入真实网络/发现，补 `Close()` 唤醒与绝对 deadline 的阻塞点重算；
 3. 用 `interop_helper` 补跨进程双向 4 组，独立端口 + READY 屏障；
 4. 跑 `bash scripts/verify.sh` 全量，确认默认 ON 30/30 与无 NNG OFF 路径无回归；
-5. 更新 `docs/acceptance-matrix.md` 与发布说明，记录新后端的覆盖范围与限制。
+5. 更新 [../architecture/contracts.md](../architecture/contracts.md) 附录 A 与 [../architecture/known-gaps.md](../architecture/known-gaps.md)，记录新后端的覆盖范围与不可满足项。
 
 ## 6. 自检清单
 

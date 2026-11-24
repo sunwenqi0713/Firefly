@@ -1,166 +1,115 @@
 # Firefly
 
-参考 Apollo Cyber RT 设计的 **C++17 消息中间件**。公共 API 提供发布 / 订阅
-（`Writer` / `Reader`，回调模式 + Observe 模式）与服务 / 客户端
-（`Service` / `Client`，同步 + 异步请求）。消息类型必须是
-`google::protobuf::Message` 派生类。
+Firefly 是一个 **C++17 消息通信库**，提供基于 Protocol Buffers 的类型化发布订阅、请求应答与端点发现。API 设计参考 Apollo Cyber RT，应用通过 `Node` 创建通信端点。
 
-经过四批重构，传输与发现实现已与 Core 解耦：
+默认 **NNG 后端**支持同机跨进程通信，**内存后端**支持进程内通信（示例、测试、无 NNG 构建）。两种后端使用同一套应用 API，构建时选择。
 
-- **Core 零 NNG**：四个 Core 只依赖 `Publisher` / `Subscriber` /
-  `RpcRequester` / `RpcResponder` 四角色接口与 `IRegistry`，不含 `<nng/...>`。
-- **默认 NNG 后端**：跨进程 Pub/Sub、RPC 与端点发现。
-- **内存后端**：进程内共享总线，用于契约测试与无 NNG 构建验证（**非生产推荐**）。
-- **构建可拆分**：`FIREFLY_WITH_NNG=OFF` 跳过 `find_package(nng)`，运行时自动
-  组装内存后端。
+| 能力 | API |
+| --- | --- |
+| 发布订阅 | `Writer<T>` 发布，`Reader<T>` 回调接收或从有界历史缓存读取 |
+| 请求应答 | `Service<Req, Resp>` 处理，`Client<Req, Resp>` 提供同步与可取消的异步调用 |
+| 端点发现 | 按通道名/服务名发现，`HasReader()`、`HasWriter()`、`WaitForService()` 查询 |
+| 运行统计 | `Stats()` 报告收发计数、丢弃计数与缓存深度 |
 
-## 目录结构
+## 快速开始
 
-```
-include/firefly/         公共头（仍以 "firefly/..." 路径包含）
-  firefly.h init.h common/ message/ node/ service/
-  detail/                公共模板所需句柄与工厂声明（桥接头）
-src/
-  core/                  四 Core、Node、注入契约（transport/registry/injection）
-  backends/nng/          NNG transport、registry、net、默认注入
-  backends/memory/       内存 transport、registry、默认注入
-  runtime/               init.cc / runtime.cc（默认组装入口）
-tests/
-  contract/              双后端共享行为契约与故障注入
-  integration/           公开 API 与跨进程 / 真实旧版互测
-  support/               测试消息 proto
-```
+需要 **C++17 编译器、CMake 3.21+、Protobuf（含 `protoc`）**；默认 NNG 构建还需要 **NNG 与 Python 3**（仅跨进程测试）。以下假设已安装 [vcpkg](https://github.com/microsoft/vcpkg) 并设置 `VCPKG_ROOT`。若 CMake 找不到 `protoc`，将其加入 `PATH` 或传 `-DPROTOC_EXE=...`。
 
-公共模板只包含句柄与工厂声明；传输角色与 Registry 的完整定义位于
-`src/core/`。使用方只需 `#include "firefly/firefly.h"` 并链接 `firefly::firefly`，
-无需感知内部目录划分。
-
-## 一条命令验证
+**Linux / macOS**
 
 ```bash
-bash scripts/verify.sh
+git clone https://github.com/sunwenqi0713/Firefly.git && cd Firefly
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+./build/firefly_pubsub_example && ./build/firefly_rpc_example
 ```
 
-依次完成：默认 ON 配置 + 构建 + 全量 `ctest -j6`、4 组跨进程用例确认、
-从零构造无 NNG 独立依赖前缀、OFF 配置 + 构建 + 全量测试。详见
-[`docs/build.md` 的「如何验证」](docs/build.md#6-如何验证)。
-
-## 构建选项
-
-| 选项 | 默认 | 行为 |
-| --- | --- | --- |
-| `FIREFLY_WITH_NNG=ON` | ✅ | `find_package(nng CONFIG REQUIRED)`；`firefly::firefly` = Core + NNG 后端；默认注入 NNG；构建跨进程互测与 NNG-only 测试/示例 |
-| `FIREFLY_WITH_NNG=OFF` | | **不调用** `find_package(nng)`；不编译、不链接任何 NNG 源文件与 target；默认注入内存后端；跳过 NNG-only 测试/辅助程序 |
-
-两种开关下公共 API 签名、线协议（Pub/Sub 裸 protobuf、RPC FFRP 帧、发现文本协议）
-与 target 拓扑均不变。`firefly_core` 始终自包含且从不链接 NNG。
-
-```bash
-# 默认 ON（vcpkg preset）
-cmake --preset default && cmake --build --preset default && ctest --preset default
-
-# 显式 OFF
-cmake -S . -B build-off -DFIREFLY_WITH_NNG=OFF -DCMAKE_TOOLCHAIN_FILE=<vcpkg toolchain>
-```
-
-## 双后端组装说明
-
-- 公共 API 不变。`firefly::Init()` 在运行时入口**一次**组装默认依赖
-  （NNG 或内存），四个 Core 只调用 `detail::ResolveInjection()`，不自行选择后端。
-- 测试或嵌入方需要替换时，通过 `InjectionContext` 注入
-  `IEndpointFactory`（四角色工厂）与 `IRegistry`（记录模型）。
-- `src/core/backend_access.h` 导出显式构造入口：
-  `MakeMemoryEndpointFactory()` / `MakeMemoryRegistry()`（两种开关都可用）；
-  `MakeNngEndpointFactory()` / `MakeNngRegistry()`（仅 ON）。共享契约测试
-  `tests/contract/backend_contract_test.cpp` 用同一份源码分别跑内存与 NNG 两个实例。
-- target 拓扑：`firefly_core_objects`（零 NNG）+ 后端「角色 / 注入」object +
-  聚合 `firefly::firefly`。详见 `docs/build.md`。
-
-## 内存后端定位
-
-内存后端是**进程内共享总线**，满足四角色与 `IRegistry` 的全部行为契约
-（取消、绝对截止时间、`Close()` 唤醒与幂等、响应对应、回调顺序、独立注册），
-但它**不跨进程**，也不与 NNG 进程互通。
-
-用途：
-
-- 后端无关契约测试的基准实现；
-- `FIREFLY_WITH_NNG=OFF` 的构建 / 链接 / 测试验证；
-- 未安装 NNG 的环境下的 CI 与示例运行。
-
-**非生产推荐**：多进程或跨主机部署请使用默认 NNG 后端（或按
-`docs/new-backend-guide.md` 接入新的生产后端）。
-
-## 跨进程测试前置
-
-跨进程用例（`cross_*`，验证发现 / Pub/Sub / RPC 的旧版 raw-NNG 与新版公开 API
-双向线兼容）需要：
-
-- `FIREFLY_WITH_NNG=ON`，且 `firefly_interop_helper` 已构建；
-- **Python 3**（仅标准库：`tests/integration/run_interop_pair.py` 用 `subprocess` /
-  `threading`，无第三方依赖）；
-- 4 组互不重叠的发现端口 `37501–37508`，由 CTest `ENVIRONMENT` 注入，可并行；
-- `*_READY` 启动屏障：被期望成为发现主实例的进程先就绪，另一进程才启动。
-
-已知偶发：高负载并行下 legacy 进程的 registry follower 可能遇到 3 秒 REQ
-超时（`docs/acceptance-matrix.md` L10），`scripts/verify.sh` 仅对这类失败做
-最多 3 次有限重试并留日志，其他失败立即报错。
-
-## 依赖
-
-使用 [vcpkg](https://github.com/microsoft/vcpkg) manifest 模式（本机位于
-`D:\vcpkg`）：`protobuf` + `nng`。`FIREFLY_WITH_NNG=OFF` 时不需要 `nng`，
-配置阶段也不会调用 `find_package(nng)`。
-
-还需要：CMake ≥ 3.16、Ninja、Visual Studio 2022（含 C++ 桌面开发）、
-Windows 10 SDK、Python 3。
-
-## 构建与测试（手动）
+**Windows**（VS Developer PowerShell，使用 Ninja）
 
 ```powershell
-# 一键脚本（自动加载 MSVC vcvars64 环境）
-powershell -ExecutionPolicy Bypass -File scripts/build.ps1
-powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Action configure
-powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Action test
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ```
 
-或直接使用预设（`CMakePresets.json` 已把 toolchain 指向
-`D:/vcpkg/scripts/buildsystems/vcpkg.cmake`，triplet `x64-windows`）：
+`-DFIREFLY_WITH_NNG=OFF` 会排除 NNG 的查找、编译与链接，改用内存后端（仓库的 vcpkg manifest 仍含 NNG）。只有 Protobuf 的环境请使用独立依赖前缀。
 
-```powershell
-cmake --preset default
-cmake --build --preset default
-ctest --preset default
+## 集成到 C++ 项目
+
+把 Firefly 放到应用的 `third_party/Firefly`，链接 `firefly::firefly`：
+
+```cmake
+add_subdirectory(third_party/Firefly)
+add_executable(my_app main.cpp)
+target_compile_features(my_app PRIVATE cxx_std_17)
+target_link_libraries(my_app PRIVATE firefly::firefly)
 ```
 
-受限 shell 中 `vcvars64.bat` 可能不可用，此时用 `scripts/verify.sh`
-（直接注入 MSVC `INCLUDE` / `LIB` / `PATH`，不调用 `vcvars64.bat`）。
+下面的 `main.cpp` 用 Protobuf 自带的 `Int32Value` 做一次同进程 RPC，成功输出 `42`。业务消息用 `protoc` 从自己的 `.proto` 生成并加入应用 target；消息类型须派生自 `google::protobuf::Message`。
 
-## 网络 / 代理说明
+```cpp
+#include <chrono>
+#include <iostream>
+#include <memory>
 
-protobuf 及 abseil 源码从 GitHub 下载。若网络无法直连 GitHub，请先启动代理：
+#include <google/protobuf/wrappers.pb.h>
+#include <firefly/firefly.h>
 
-```powershell
-$env:HTTP_PROXY  = "http://<proxy-host>:<port>"
-$env:HTTPS_PROXY = "http://<proxy-host>:<port>"
-cmake --preset default
+int Run() {
+  using Value = google::protobuf::Int32Value;
+  using namespace std::chrono_literals;
+
+  auto node = firefly::CreateNode("example");
+  if (!node) return 1;
+
+  auto service = node.value->CreateService<Value, Value>(
+      "double", [](const std::shared_ptr<const Value>& request) {
+        auto reply = std::make_shared<Value>();
+        reply->set_value(request->value() * 2);
+        return firefly::ServiceResult<Value>{firefly::ErrorCode::kOk, reply};
+      });
+  auto client = node.value->CreateClient<Value, Value>("double");
+  if (!service || !client || !client.value->WaitForService(2s)) return 1;
+
+  Value request;
+  request.set_value(21);
+  auto response = client.value->SendRequest(request, 2s);
+  if (!response) return 1;
+  std::cout << response->value() << '\n';
+  return 0;
+}
+
+int main() {
+  if (!firefly::Init("example")) return 1;
+  const int status = Run();
+  firefly::Clear();
+  return status;
+}
 ```
 
-SOCKS5 代理使用 `socks5://host:port` 格式。
+## 使用约定
 
-## 文档索引
+- **发布状态。** `WriteStatus::kAccepted` 表示本地传输层接受了消息，**不代表对端收到**；默认 Pub/Sub 为尽力投递，需要确认时由业务定义应答。
+- **请求取消。** 排队中的请求取消后跳过发送；一旦提交发送，取消只结束本地等待，服务端仍可能执行。
+- **网络范围。** 发现地址与数据端点默认使用回环地址，适合同机跨进程。多组进程并行时用 `FIREFLY_DISCOVERY_REP_URL`、`FIREFLY_DISCOVERY_PUB_URL` 配置发现端口。
+
+## 文档
 
 | 文档 | 内容 |
 | --- | --- |
-| `docs/build.md` | 构建拆分契约、target 拓扑、测试分组、如何验证与逐项验收记录 |
-| `docs/acceptance-matrix.md` | 四批 34 条验收标准 → 测试/构建证据/提交号的对照表与已知限制 |
-| `docs/implementation.md` | 四批重构的原始规划稿（已标注完成状态） |
-| `docs/implementation-notes.md` | 规划 vs 实际的落地差异（第 2/3 批落地说明） |
-| `docs/new-backend-guide.md` | 接入新生产后端的最小实现面、契约测试集与「不碰 Core」边界 |
-| `docs/release-notes.md` | 里程碑发布说明：逐批提交清单、验收结论、已知限制 |
+| [文档索引](docs/README.md) | 全部文档与阅读路径 |
+| [架构概览](docs/architecture/overview.md) | 分层、决策摘要、术语 |
+| [行为契约](docs/architecture/contracts.md) | 生命周期、并发、错误码、送达语义 |
+| [构建与验证](docs/guides/build.md) | 依赖、target、开关、一条命令验收 |
+| [ADR 索引](docs/decisions/README.md) | 关键决策的理由与代价 |
+| [已知差距](docs/architecture/known-gaps.md) | 限制清单与设计定位 |
 
-## 状态
+## 反馈与贡献
 
-四批重构已完成：公共 API 签名、线协议与 target 拓扑保持不变；默认 ON 全量
-30/30、无 NNG OFF 全量 24/24、并行 `ctest -j6` 稳定。已知限制见
-`docs/acceptance-matrix.md` 第 5 节与 `docs/release-notes.md`。
+请在 [GitHub Issues](https://github.com/sunwenqi0713/Firefly/issues) 提交问题，注明提交号、操作系统、编译器、后端配置与最小复现步骤。提交 PR 前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 许可证
+
+仓库目前尚未提供 `LICENSE` 文件。

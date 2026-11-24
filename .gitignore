@@ -2,9 +2,12 @@
 /build/
 /vcpkg_installed/
 
-# 第 4 批验证目录（OFF 构建与无 NNG 独立依赖前缀，由 scripts/verify.sh 重建）
+# 无 NNG 验证目录（OFF 构建与独立依赖前缀，由 scripts/verify.sh 重建）
 /build-mem/
 /build-no-nng/
+
+# 生成的 API 文档（Doxygen 产物，由 CI 生成，不入库）
+/docs/api/
 
 # 本地工具 / 验证产物（非项目源码，不入库）
 /.workbuddy/
