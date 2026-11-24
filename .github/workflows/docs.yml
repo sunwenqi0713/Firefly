@@ -1,0 +1,88 @@
+name: docs
+
+# 文档门禁。规则来源：docs/guides/documentation.md 第六步。
+# 任一必需检查失败即阻断合入；外链检查只在定时任务中运行，允许失败。
+
+on:
+  push:
+    branches: [main, refactor-compact]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1" # 每周一 03:00 UTC，仅跑外链巡检
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: 文档结构与注释门禁
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 站内链接与锚点、孤儿文档、ADR 索引一致性、失效标签、
+      # README 行数、docs/api 未入库、禁用词文件名
+      - name: 结构与内容检查
+        run: python scripts/check_docs.py --strict
+
+      - name: 安装 Doxygen 并校验版本
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y doxygen
+          ver=$(doxygen --version)
+          echo "doxygen $ver"
+          # 基线 1.9.8：版本漂移会改变告警集合，换版本须同时更新本行与 Doxyfile
+          case "$ver" in
+            1.9.*) ;;
+            *) echo "::error::Doxygen 版本与基线 1.9.x 不一致：$ver"; exit 1 ;;
+          esac
+
+      # WARN_AS_ERROR=YES：任一未文档化公开符号、参数名不匹配、@param 缺说明
+      # 都会让本步骤以非零退出码失败。
+      - name: 生成 API 文档
+        shell: bash
+        run: |
+          set -o pipefail
+          doxygen Doxyfile 2>&1 | tee doxygen.log
+
+      - name: 上传 Doxygen 日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: doxygen-log
+          path: doxygen.log
+          if-no-files-found: ignore
+
+      - name: 上传 API 文档
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-html
+          path: docs/api/html
+          if-no-files-found: ignore
+
+  external-links:
+    name: 外链巡检（允许失败）
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 检查外部链接
+        run: python scripts/check_docs.py --external

@@ -1,0 +1,47 @@
+# Firefly 公共 API 文档生成配置
+#
+# 用法：doxygen Doxyfile      # 输出到 docs/api/，不纳入版本控制
+# 规则：docs/guides/documentation.md 第三步
+# 门禁：WARN_AS_ERROR=YES，任一文档告警即失败
+
+PROJECT_NAME           = "Firefly"
+PROJECT_BRIEF          = "C++17 messaging library: typed pub/sub, request/reply, endpoint discovery"
+OUTPUT_DIRECTORY       = docs/api
+CREATE_SUBDIRS         = NO
+ALLOW_UNICODE_NAMES    = YES
+
+# 只扫描公共头；detail/ 是实现细节，不参与强制注释检查
+INPUT                  = include/firefly
+RECURSIVE              = YES
+FILE_PATTERNS          = *.h
+EXCLUDE_PATTERNS       = */detail/*
+EXCLUDE_SYMBOLS        = firefly::detail::*
+
+# 摘要与命令风格
+JAVADOC_AUTOBRIEF      = NO
+QT_AUTOBRIEF           = NO
+OPTIMIZE_OUTPUT_FOR_C  = NO
+MARKDOWN_SUPPORT       = YES
+TAB_SIZE               = 2
+ALIASES                =
+
+# 提取与告警
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = NO
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_AS_ERROR          = YES
+WARN_LOGFILE           =
+
+# 输出
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_TREEVIEW      = YES
+GENERATE_LATEX         = NO
+GENERATE_XML           = NO
+GENERATE_MAN           = NO
+
+# 输入编码
+INPUT_ENCODING         = UTF-8
