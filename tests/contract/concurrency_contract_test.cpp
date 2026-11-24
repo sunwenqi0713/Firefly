@@ -1,4 +1,4 @@
-// batch1_contract_test.cpp：第 1 批行为契约（Service 停机 / Reader 删除 / RPC 取消）。
+// concurrency_contract_test.cpp：端点停机、删除与 RPC 取消的并发时序契约。
 // 并发时序一律由 promise/future 控制，不依赖 sleep。
 #include <atomic>
 #include <chrono>
@@ -61,15 +61,15 @@ ErrorCode SettledCode(std::shared_future<T> future) {
 
 // ---------- 任务 1：释放最后一个外部引用 → 服务注销、旧客户端调用失败 ----------
 int TestServiceReleaseStopsOldClient() {
-  auto node = firefly::CreateNode("b1_svc_release_node").value;
+  auto node = firefly::CreateNode("svc_release_node").value;
   auto svc = node->CreateService<CalcRequest, CalcResponse>(
-      "b1_release_svc", [](const std::shared_ptr<const CalcRequest>& req)
+      "release_svc", [](const std::shared_ptr<const CalcRequest>& req)
                             -> firefly::ServiceResult<CalcResponse> {
         auto r = std::make_shared<CalcResponse>();
         r->set_sum(req->a() + req->b());
         return {ErrorCode::kOk, r};
       }).value;
-  auto old_client = node->CreateClient<CalcRequest, CalcResponse>("b1_release_svc").value;
+  auto old_client = node->CreateClient<CalcRequest, CalcResponse>("release_svc").value;
   if (int e = Check(old_client->WaitForService(2s), 40)) return e;
 
   std::weak_ptr<firefly::ServiceBase> weak = svc;
@@ -80,7 +80,7 @@ int TestServiceReleaseStopsOldClient() {
   if (int e = Check(!after && after.code != ErrorCode::kOk, 42)) return e;
 
   // 用一个独立名字的 Client 探测：服务名已从注册中心注销。
-  auto probe = node->CreateClient<CalcRequest, CalcResponse>("b1_probe_absent").value;
+  auto probe = node->CreateClient<CalcRequest, CalcResponse>("probe_absent").value;
   if (int e = Check(!probe->WaitForService(0ms), 43)) return e;
   probe->Shutdown();
   old_client->Shutdown();
@@ -89,7 +89,7 @@ int TestServiceReleaseStopsOldClient() {
 
 // ---------- 任务 1：回调线程内停机不 self-join ----------
 int TestServiceShutdownOnCallbackThread() {
-  auto node = firefly::CreateNode("b1_svc_callback_node").value;
+  auto node = firefly::CreateNode("svc_callback_node").value;
   std::promise<void> entered;
   std::promise<void> done;
   auto entered_future = entered.get_future().share();
@@ -106,10 +106,10 @@ int TestServiceShutdownOnCallbackThread() {
     r->set_sum(7);
     return {ErrorCode::kOk, r};
   };
-  owner = node->CreateService<CalcRequest, CalcResponse>("b1_cb_svc", callback).value;
+  owner = node->CreateService<CalcRequest, CalcResponse>("cb_svc", callback).value;
   std::weak_ptr<firefly::ServiceBase> weak = owner;
 
-  auto client = node->CreateClient<CalcRequest, CalcResponse>("b1_cb_svc").value;
+  auto client = node->CreateClient<CalcRequest, CalcResponse>("cb_svc").value;
   if (int e = Check(client->WaitForService(2s), 50)) return e;
   auto handle = client->AsyncSendRequest(MakeReq(2, 3), 1s);
 
@@ -133,9 +133,9 @@ int TestServiceShutdownOnCallbackThread() {
 
 // ---------- 任务 2：回调内并发 GetReader + 删除中名称占用 + 重建 ----------
 int TestReaderDeleteWithConcurrentGet() {
-  auto node = firefly::CreateNode("b1_reader_delete_node").value;
-  auto other = firefly::CreateNode("b1_reader_other_node").value;
-  const std::string channel = "b1_delete_ch";
+  auto node = firefly::CreateNode("reader_delete_node").value;
+  auto other = firefly::CreateNode("reader_other_node").value;
+  const std::string channel = "delete_ch";
 
   std::promise<bool> get_result;
   std::promise<void> entered;
@@ -183,14 +183,14 @@ int TestReaderDeleteWithConcurrentGet() {
 
 // ---------- 任务 3：排队中取消/到期 → 服务端 0 次执行 ----------
 int TestRpcQueuedCancelAndExpiry() {
-  auto node = firefly::CreateNode("b1_rpc_queue_node").value;
+  auto node = firefly::CreateNode("rpc_queue_node").value;
   std::promise<void> service_entered;
   std::promise<void> release;
   auto release_future = release.get_future().share();
   std::atomic<int> executed{0};
 
   auto svc = node->CreateService<CalcRequest, CalcResponse>(
-      "b1_queue_svc", [&](const std::shared_ptr<const CalcRequest>& req)
+      "queue_svc", [&](const std::shared_ptr<const CalcRequest>& req)
                           -> firefly::ServiceResult<CalcResponse> {
         const int n = executed.fetch_add(1) + 1;
         if (n == 1) {
@@ -201,7 +201,7 @@ int TestRpcQueuedCancelAndExpiry() {
         r->set_sum(req->a() + req->b());
         return {ErrorCode::kOk, r};
       }).value;
-  auto cli = node->CreateClient<CalcRequest, CalcResponse>("b1_queue_svc").value;
+  auto cli = node->CreateClient<CalcRequest, CalcResponse>("queue_svc").value;
   if (int e = Check(cli->WaitForService(2s), 70)) return e;
 
   auto first = cli->AsyncSendRequest(MakeReq(1, 1), 5s);
@@ -232,20 +232,20 @@ int TestRpcQueuedCancelAndExpiry() {
   // 被取消和过期的两个请求都不得进入服务端回调。
   if (int e = Check(executed.load() == 1, 77)) return e;
   cli->Shutdown();
-  node->DeleteService("b1_queue_svc");
+  node->DeleteService("queue_svc");
   return 0;
 }
 
 // ---------- 任务 3：每请求只兑现一次 + 队列满 + 旧句柄失效 ----------
 int TestRpcSettleOnceQueueFullAndStaleHandle() {
-  auto node = firefly::CreateNode("b1_rpc_settle_node").value;
+  auto node = firefly::CreateNode("rpc_settle_node").value;
   std::promise<void> service_entered;
   std::promise<void> release;
   auto release_future = release.get_future().share();
   std::atomic<int> calls{0};
 
   auto svc = node->CreateService<CalcRequest, CalcResponse>(
-      "b1_settle_svc", [&](const std::shared_ptr<const CalcRequest>& req)
+      "settle_svc", [&](const std::shared_ptr<const CalcRequest>& req)
                            -> firefly::ServiceResult<CalcResponse> {
         if (calls.fetch_add(1) == 0) {
           service_entered.set_value();
@@ -264,7 +264,7 @@ int TestRpcSettleOnceQueueFullAndStaleHandle() {
     return e;
   }
   auto core_result = firefly::detail::CreateClientCore(
-      "b1_rpc_settle_node", "b1_settle_svc", nullptr);
+      "rpc_settle_node", "settle_svc", nullptr);
   if (int e = Check(static_cast<bool>(core_result), 80)) return e;
   auto core = core_result.value;
 
@@ -310,25 +310,25 @@ int TestRpcSettleOnceQueueFullAndStaleHandle() {
   firefly::detail::ClientShutdownCore(core.get());
 
   // Client 销毁或重新 Init 后，旧句柄 Cancel 必须返回 false。
-  auto cli = node->CreateClient<CalcRequest, CalcResponse>("b1_settle_svc").value;
+  auto cli = node->CreateClient<CalcRequest, CalcResponse>("settle_svc").value;
   auto stale = cli->AsyncSendRequest(MakeReq(9, 9), 5s);
   cli->Shutdown();
   if (int e = Check(!stale.Cancel(), 90)) return e;
   if (int e = Check(cli->Init(), 91)) return e;
   if (int e = Check(!stale.Cancel(), 92)) return e;
   cli->Shutdown();
-  node->DeleteService("b1_settle_svc");
+  node->DeleteService("settle_svc");
   return 0;
 }
 
 // ---------- 任务 3：有界队列满 → kQueueFull（现有错误码）----------
 int TestRpcQueueFull() {
-  auto node = firefly::CreateNode("b1_rpc_full_node").value;
+  auto node = firefly::CreateNode("rpc_full_node").value;
   std::promise<void> service_entered;
   std::promise<void> release;
   auto release_future = release.get_future().share();
   auto svc = node->CreateService<CalcRequest, CalcResponse>(
-      "b1_full_svc", [&](const std::shared_ptr<const CalcRequest>& req)
+      "full_svc", [&](const std::shared_ptr<const CalcRequest>& req)
                          -> firefly::ServiceResult<CalcResponse> {
         static std::atomic<int> first{0};
         if (first.fetch_add(1) == 0) {
@@ -342,7 +342,7 @@ int TestRpcQueueFull() {
   std::string bytes;
   firefly::message::MessageTraits<CalcRequest>::Serialize(*MakeReq(1, 1), &bytes);
   auto core_result = firefly::detail::CreateClientCore(
-      "b1_rpc_full_node", "b1_full_svc", nullptr);
+      "rpc_full_node", "full_svc", nullptr);
   if (int e = Check(static_cast<bool>(core_result), 100)) return e;
   auto core = core_result.value;
   if (int e = Check(firefly::detail::ClientWaitForService(core.get(), 2s), 101)) {
@@ -364,14 +364,14 @@ int TestRpcQueueFull() {
   if (int e = Check(queue_full > 0, 103)) return e;
   release.set_value();
   firefly::detail::ClientShutdownCore(core.get());
-  node->DeleteService("b1_full_svc");
+  node->DeleteService("full_svc");
   return 0;
 }
 
 }  // namespace
 
 int main() {
-  if (!firefly::Init("batch1_contract_test")) return 1;
+  if (!firefly::Init("concurrency_contract_test")) return 1;
   struct Case {
     const char* name;
     int (*fn)();
@@ -386,12 +386,12 @@ int main() {
   };
   for (auto& c : cases) {
     if (int e = c.fn()) {
-      std::printf("batch1_contract: %s FAILED at line %d\n", c.name, e);
+      std::printf("concurrency_contract: %s FAILED at line %d\n", c.name, e);
       return e;
     }
   }
   firefly::Clear();
-  std::printf("batch1_contract: all %zu cases passed\n",
+  std::printf("concurrency_contract: all %zu cases passed\n",
               sizeof(cases) / sizeof(cases[0]));
   return 0;
 }

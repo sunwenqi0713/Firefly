@@ -1,4 +1,4 @@
-// batch3_contract_test.cpp：第 3 批发现层契约（记录模型 / 生命周期 / 注册失败）。
+// registry_contract_test.cpp：IRegistry 记录模型契约（多记录 / 生命周期 / 注册失败）。
 // 并发时序由 promise/future 控制；NNG 后端下每个用例使用独立的发现中心地址，
 // 内存后端不需要网络地址。
 #include <atomic>
@@ -98,17 +98,17 @@ bool StartCase(const char* name) {
 Chatter MakeMsg(int seq) {
   Chatter msg;
   msg.set_seq(seq);
-  msg.set_content("batch3");
+  msg.set_content("registry-contract");
   return msg;
 }
 
 // ---------- 两个同通道 Reader 分属不同 Node：删一个另一个仍收消息 ----------
 int TestTwoReadersIsolatedDeletion() {
-  if (!StartCase("b3_two_readers")) return 1;
+  if (!StartCase("two_readers")) return 1;
   {
-    auto node_a = firefly::CreateNode("b3_reader_node_a").value;
-    auto node_b = firefly::CreateNode("b3_reader_node_b").value;
-    const std::string channel = "b3/two_readers";
+    auto node_a = firefly::CreateNode("reader_node_a").value;
+    auto node_b = firefly::CreateNode("reader_node_b").value;
+    const std::string channel = "two_readers";
     auto writer = node_a->CreateWriter<Chatter>(channel).value;
     if (!writer) return 2;
 
@@ -155,10 +155,10 @@ int TestTwoReadersIsolatedDeletion() {
 
 // ---------- Reader 启动期间新增 Writer 最终被发现 ----------
 int TestWriterAddedAfterReaderStarts() {
-  if (!StartCase("b3_late_writer")) return 20;
+  if (!StartCase("late_writer")) return 20;
   {
-    auto node = firefly::CreateNode("b3_late_node").value;
-    const std::string channel = "b3/late_writer";
+    auto node = firefly::CreateNode("late_node").value;
+    const std::string channel = "late_writer";
     std::promise<void> got;
     auto got_future = got.get_future();
     std::atomic<bool> signaled{false};
@@ -195,10 +195,10 @@ int TestWriterAddedAfterReaderStarts() {
 
 // ---------- Clear / 销毁 / 再次 Init 后查不到旧记录 ----------
 int TestClearAndReinitNoStaleRecords() {
-  if (!StartCase("b3_clear_reinit")) return 30;
-  const std::string channel = "b3/stale";
+  if (!StartCase("clear_reinit")) return 30;
+  const std::string channel = "stale";
   {
-    auto node = firefly::CreateNode("b3_stale_node").value;
+    auto node = firefly::CreateNode("stale_node").value;
     auto writer = node->CreateWriter<Chatter>(channel).value;
     if (!writer) return 31;
     if (DefaultRegistry()->Query(RegistryKind::kWriter, channel).empty()) {
@@ -211,7 +211,7 @@ int TestClearAndReinitNoStaleRecords() {
     return 33;
   }
   firefly::Clear();
-  if (!StartCase("b3_clear_reinit_2")) return 34;
+  if (!StartCase("clear_reinit_2")) return 34;
   if (!DefaultRegistry()->Query(RegistryKind::kWriter, channel).empty()) {
     return 35;
   }
@@ -221,11 +221,11 @@ int TestClearAndReinitNoStaleRecords() {
 
 // ---------- 多记录 + backend 过滤 + 按 id 注销 ----------
 int TestMultiRecordAndBackendFilter() {
-  if (!StartCase("b3_backend_filter")) return 40;
+  if (!StartCase("backend_filter")) return 40;
   auto reg = DefaultRegistry();
   EndpointRecord a;
   a.kind = RegistryKind::kService;
-  a.name = "b3/filter";
+  a.name = "filter";
   a.address = "tcp://127.0.0.1:41001";
   a.backend = "nng";
   EndpointRecord b = a;
@@ -339,27 +339,27 @@ struct CountingEndpoints final : IEndpointFactory {
 };
 
 int TestRegisterFailureNoResidual() {
-  if (!StartCase("b3_register_fail")) return 50;
+  if (!StartCase("register_fail")) return 50;
   {
     auto ctx = std::make_shared<firefly::detail::InjectionContext>();
     auto endpoints = std::make_shared<CountingEndpoints>();
     auto reg = std::make_shared<FailRegistry>();
     ctx->endpoints = endpoints;
     ctx->registry = reg;
-    auto node = firefly::CreateNode("b3_fail_node", "", ctx).value;
+    auto node = firefly::CreateNode("fail_node", "", ctx).value;
     if (!node) return 51;
 
-    auto writer = node->CreateWriter<Chatter>("b3/fail");
+    auto writer = node->CreateWriter<Chatter>("fail");
     if (int e = Check(!writer && writer.code == ErrorCode::kTransport, 52)) return e;
     if (int e = Check(endpoints->publisher_closes == 1, 53)) return e;
 
-    auto reader = node->CreateReader<Chatter>("b3/fail");
+    auto reader = node->CreateReader<Chatter>("fail");
     if (int e = Check(!reader && reader.code == ErrorCode::kTransport, 54)) return e;
     if (int e = Check(endpoints->subscriber_closes == 1, 55)) return e;
     if (int e = Check(endpoints->receives == 0, 56)) return e;  // 未启动收线程
 
     auto service = node->CreateService<CalcRequest, CalcResponse>(
-        "b3_fail_svc", [](const std::shared_ptr<const CalcRequest>& req) {
+        "fail_svc", [](const std::shared_ptr<const CalcRequest>& req) {
           auto r = std::make_shared<CalcResponse>();
           r->set_sum(req->a() + req->b());
           return firefly::ServiceResult<CalcResponse>{ErrorCode::kOk, r};
@@ -387,11 +387,11 @@ int main() {
   };
   for (const auto& c : cases) {
     if (int e = c.fn()) {
-      std::printf("batch3_contract: %s FAILED at line %d\n", c.name, e);
+      std::printf("registry_contract: %s FAILED at line %d\n", c.name, e);
       return e;
     }
   }
-  std::printf("batch3_contract: all %zu cases passed\n",
+  std::printf("registry_contract: all %zu cases passed\n",
               sizeof(cases) / sizeof(cases[0]));
   return 0;
 }

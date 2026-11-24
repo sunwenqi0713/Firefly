@@ -175,8 +175,8 @@ std::shared_ptr<IRegistry> Make<Name>Registry();
 | 测试 | 覆盖 | 新后端接入要求 |
 | --- | --- | --- |
 | `tests/contract/backend_contract_test.cpp` **双实例** | 取消、绝对截止时间、`Close()` 跨线程唤醒与幂等、响应对应、回调顺序、独立注册（6 case） | 同一份源码增加 `<name>` 分支并注册 CTest 实例；与既有 `backend_contract_memory` / `backend_contract_nng` 并列，**不得复制测试逻辑** |
-| `batch1_contract_test` | Service 停机、Reader 删除并发、RPC 队列/取消 | 确认 Core 行为不回归 |
-| `batch3_contract_test` | 记录模型、多记录/backend 过滤、Watch 快照、Clear 重入、注册失败无残留 | 新 `IRegistry` 必须全绿 |
+| `concurrency_contract_test` | Service 停机、Reader 删除并发、RPC 队列/取消 | 确认 Core 行为不回归 |
+| `registry_contract_test` | 记录模型、多记录/backend 过滤、Watch 快照、Clear 重入、注册失败无残留 | 新 `IRegistry` 必须全绿 |
 | `fake_transport_test` / `no_leak_check` | 角色状态映射、公共头不泄漏后端实现 | 新后端不得让 `no_leak_check` 失败 |
 | **跨进程双向**（`interop_helper` + `run_interop_pair.py`） | 发现、Pub/Sub、RPC 的线兼容 | 4 组：`legacy_pub→new_sub`、`new_pub→legacy_sub`、`legacy_rep→new_req`、`new_rep→legacy_req`；每组独立发现端口、`*_READY` 启动屏障、并行 CTest 稳定 |
 | 默认 ON 全量 `ctest -j6` / OFF 全量 | 整体回归 | `bash scripts/verify.sh` 一条命令 |

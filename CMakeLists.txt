@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ---------------------------------------------------------------------------
-# 第 4 批构建拆分契约（详见 docs/build.md）
+# 构建拆分契约（详见 docs/guides/build.md）
 #   - firefly_core_objects：四 Core + 运行时 + 四角色接口 + IRegistry，零 NNG。
 #   - firefly_memory_objects / firefly_nng_objects：两个互斥的默认注入后端。
 #   - firefly_core：Core object + 内存后端，自包含且从不链接 NNG。
@@ -221,12 +221,12 @@ add_firefly_test(firefly_creation_failure_test tests/contract/creation_failure_t
 add_firefly_test(firefly_clear_wait_test tests/clear_wait_test.cpp)
 add_firefly_test(firefly_message_traits_test tests/message_traits_test.cpp)
 
-# 审查回归 + 第 1/3 批行为契约
+# 审查回归 + 并发时序与发现记录契约
 add_firefly_test(firefly_review_regression_test tests/review_regression_test.cpp)
-add_firefly_test(firefly_batch1_contract_test tests/contract/batch1_contract_test.cpp)
-add_firefly_test(firefly_batch3_contract_test tests/contract/batch3_contract_test.cpp)
+add_firefly_test(firefly_concurrency_contract_test tests/contract/concurrency_contract_test.cpp)
+add_firefly_test(firefly_registry_contract_test tests/contract/registry_contract_test.cpp)
 
-# 第 4 批共享后端契约：同一测试源分别用内存与 NNG 显式后端各跑一遍。
+# 共享后端契约：同一测试源分别用内存与 NNG 显式后端各跑一遍。
 add_executable(firefly_backend_contract_test tests/contract/backend_contract_test.cpp)
 target_link_libraries(firefly_backend_contract_test PRIVATE firefly test_messages)
 if(FIREFLY_WITH_NNG)
@@ -291,7 +291,7 @@ set(FIREFLY_PORT_LOCK_TESTS
     deprecated_compat_test shutdown_test request_cancel_test duplicate_test
     endpoint_lifecycle_test callback_contract_test callback_context_test
     stats_test fake_transport_test creation_failure_test clear_wait_test review_regression_test
-    batch1_contract_test batch3_contract_test)
+    concurrency_contract_test registry_contract_test)
 if(FIREFLY_WITH_NNG)
   list(APPEND FIREFLY_PORT_LOCK_TESTS discovery_test)
 endif()

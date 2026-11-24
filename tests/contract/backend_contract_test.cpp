@@ -1,4 +1,4 @@
-// backend_contract_test.cpp：第 4 批后端无关契约。
+// backend_contract_test.cpp：后端无关契约。
 // 同一个测试源用 argv[1]=memory|nng 各跑一遍，覆盖取消、绝对截止时间、
 // Close() 跨线程唤醒与幂等、响应对应、回调顺序、独立注册。
 // 并发时序由 promise/future/barrier 控制，不依赖 sleep。

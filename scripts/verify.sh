@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# scripts/verify.sh — 第 5 批 T2：一条命令完成双后端验收
+# scripts/verify.sh — 一条命令完成双后端验收
 #
 # 覆盖四条路径（默认全部执行）：
 #   1) 默认 ON（NNG）配置 + 构建 + 全量 ctest -jN（含共享契约内存/NNG 双实例）
 #   2) 跨进程互测 4 组单独确认（发现 / Pub/Sub / RPC，独立端口，并行安全）
-#   3) 从 ON 的 vcpkg_installed 剥离 NNG，构造独立依赖前缀（第 4 批方案）
+#   3) 从 ON 的 vcpkg_installed 剥离 NNG，构造独立依赖前缀（构建拆分方案）
 #   4) FIREFLY_WITH_NNG=OFF（无 NNG 环境）配置 + 构建 + 全量测试
 #
 # 前置（当前 Windows + Git Bash 环境）：
@@ -30,7 +30,7 @@ if command -v cygpath >/dev/null 2>&1; then
   ROOT_WIN="$(cygpath -w "$ROOT" | tr '\\' '/')"
 fi
 
-# ---- 可覆盖的环境变量（默认值对应本机第 4 批验证环境）----
+# ---- 可覆盖的环境变量（默认值对应本机验证环境）----
 VCPKG_ROOT="${VCPKG_ROOT:-D:/vcpkg}"
 VCPKG_TRIPLET="${VCPKG_TRIPLET:-x64-windows}"
 MSVC_TOOLS="${MSVC_TOOLS:-D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207}"
@@ -170,7 +170,7 @@ fi
 
 # ---- 2) 跨进程互测确认 -----------------------------------------------------
 # 跨进程用例已由全量 ctest 执行；默认从日志确认 4/4，不重复启动两进程，
-# 避免重复执行时的 follower 注册超时抖动（第 4 批已记录的时序脆弱点）。
+# 避免重复执行时的 follower 注册超时抖动（已知的时序脆弱点，见 docs/architecture/known-gaps.md）。
 if [ "$DO_INTEROP" = "1" ]; then
   if [ "$DO_ON" = "1" ] && [ -f "$ON_DIR/ctest-on.log" ]; then
     log "路径 2/4：确认跨进程发现 / Pub/Sub / RPC（4 组独立地址）"

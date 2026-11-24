@@ -140,22 +140,22 @@ Pub/Sub 与 RPC 请求携带 Protobuf 字节，零字节也是合法消息（全
 
 | 契约 | 守护测试 |
 | --- | --- |
-| 释放最后一个 Service 引用后服务注销、线程退出、旧客户端无法调用 | `batch1_contract_test::service_release_stops_old_client`、`endpoint_lifecycle_test` |
-| `Shutdown()` 与析构共用幂等清理路径，且可在回调线程内调用而不自 join | `batch1_contract_test::service_shutdown_on_callback_thread`、`shutdown_test`、`review_regression_test` |
-| 回调内并发 `GetReader()` 时 `DeleteReader()` 能返回，删除后可重建 | `batch1_contract_test::reader_delete_with_concurrent_get` |
-| 排队期间取消或到期，服务端执行次数为 0 | `batch1_contract_test::rpc_queued_cancel_and_expiry`、`request_cancel_test` |
-| 每个请求只兑现一次；队列满以 `kQueueFull` 明确失败 | `batch1_contract_test::rpc_settle_once_queue_full_stale_handle`、`batch1_contract_test::rpc_queue_full` |
-| Client 销毁或重建后，旧 `RequestHandle::Cancel()` 返回 false | `batch1_contract_test::rpc_settle_once_queue_full_stale_handle`、`request_cancel_test` |
-| 同步与异步共用有界队列与单 I/O 执行者；绝对 deadline 覆盖查询/连接/收发 | `batch1_contract_test`、`backend_contract_test::absolute_deadline` |
+| 释放最后一个 Service 引用后服务注销、线程退出、旧客户端无法调用 | `concurrency_contract_test::service_release_stops_old_client`、`endpoint_lifecycle_test` |
+| `Shutdown()` 与析构共用幂等清理路径，且可在回调线程内调用而不自 join | `concurrency_contract_test::service_shutdown_on_callback_thread`、`shutdown_test`、`review_regression_test` |
+| 回调内并发 `GetReader()` 时 `DeleteReader()` 能返回，删除后可重建 | `concurrency_contract_test::reader_delete_with_concurrent_get` |
+| 排队期间取消或到期，服务端执行次数为 0 | `concurrency_contract_test::rpc_queued_cancel_and_expiry`、`request_cancel_test` |
+| 每个请求只兑现一次；队列满以 `kQueueFull` 明确失败 | `concurrency_contract_test::rpc_settle_once_queue_full_stale_handle`、`concurrency_contract_test::rpc_queue_full` |
+| Client 销毁或重建后，旧 `RequestHandle::Cancel()` 返回 false | `concurrency_contract_test::rpc_settle_once_queue_full_stale_handle`、`request_cancel_test` |
+| 同步与异步共用有界队列与单 I/O 执行者；绝对 deadline 覆盖查询/连接/收发 | `concurrency_contract_test`、`backend_contract_test::absolute_deadline` |
 | 四角色 `Close()` 幂等、可跨线程唤醒阻塞 I/O；此后返回 `kClosed` | `backend_contract_test::close_and_deadline`、`fake_transport_test` |
 | 响应与请求一一对应，`ReplyToken` 不跨请求复用 | `backend_contract_test::response_matching` |
 | 同一端点的回调串行；不同端点可并行 | `backend_contract_test::callback_order`、`callback_contract_test` |
-| 同键多记录、按 `backend` 过滤、按独立 `id` 注销 | `batch3_contract_test::multi_record_and_backend_filter`、`discovery_test` |
-| 两个同通道 Reader 分属不同 Node，删一个不影响另一个 | `batch3_contract_test::two_readers_isolated_deletion` |
-| Reader 启动后新增 Writer 能被最终发现 | `batch3_contract_test::writer_added_after_reader_starts` |
-| Watch 一致初始快照与后续完整快照；`Clear()` 后迟到注销为 no-op 且可重启 | `batch3_contract_test`、`clear_wait_test`、`discovery_test`、`review_regression_test` |
-| 注册失败不留线程或监听器 | `batch3_contract_test::register_failure_no_residual`、`creation_failure_test` |
-| 启动顺序恒为 Bind → Register → 启动工作线程 | `batch3_contract_test`、`fake_transport_test` |
+| 同键多记录、按 `backend` 过滤、按独立 `id` 注销 | `registry_contract_test::multi_record_and_backend_filter`、`discovery_test` |
+| 两个同通道 Reader 分属不同 Node，删一个不影响另一个 | `registry_contract_test::two_readers_isolated_deletion` |
+| Reader 启动后新增 Writer 能被最终发现 | `registry_contract_test::writer_added_after_reader_starts` |
+| Watch 一致初始快照与后续完整快照；`Clear()` 后迟到注销为 no-op 且可重启 | `registry_contract_test`、`clear_wait_test`、`discovery_test`、`review_regression_test` |
+| 注册失败不留线程或监听器 | `registry_contract_test::register_failure_no_residual`、`creation_failure_test` |
+| 启动顺序恒为 Bind → Register → 启动工作线程 | `registry_contract_test`、`fake_transport_test` |
 | 同一份契约测试在内存与 NNG 两种组装下都通过 | `backend_contract_memory`、`backend_contract_nng`（同一 `tests/contract/backend_contract_test.cpp`） |
 | 公共头不泄漏后端实现；Core 不含 NNG 符号 | `no_leak_check`（`tools/check_no_leak.py`）、`header_check` |
 | 旧版进程与新版进程双向 Pub/Sub 与 RPC 互通 | `cross_pubsub_legacy_to_new`、`cross_pubsub_new_to_legacy`、`cross_rpc_legacy_to_new`、`cross_rpc_new_to_legacy` |

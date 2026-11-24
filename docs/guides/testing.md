@@ -6,7 +6,7 @@
 
 | 路径 | 内容 |
 | --- | --- |
-| `tests/contract/` | 行为契约。`backend_contract_test.cpp` 是唯一跨后端共享的契约测试；`batch1_contract_test`（生命周期/RPC 队列）、`batch3_contract_test`（发现记录模型）、`fake_transport_test`（角色状态映射）、`creation_failure_test`、`endpoint_lifecycle_test` |
+| `tests/contract/` | 行为契约。`backend_contract_test.cpp` 是唯一跨后端共享的契约测试；`concurrency_contract_test`（生命周期/RPC 队列）、`registry_contract_test`（发现记录模型）、`fake_transport_test`（角色状态映射）、`creation_failure_test`、`endpoint_lifecycle_test` |
 | `tests/integration/` | 端到端与跨进程。`e2e_test`、`reader_test`、`client_test`、`discovery_test`、`interop_helper.cpp` + `run_interop_pair.py` |
 | `tests/support/` | `test_messages.proto` 等共享消息定义 |
 | `tests/`（根） | 单点语义：`error_code`、`write_status`、`message_traits`、`callback_context`、`callback_contract`、`stats`、`shutdown`、`clear_wait`、`duplicate`、`empty_message`、`request_cancel`、`rpc_error`、`deprecated_compat`、`header_check`、`review_regression` |
@@ -40,7 +40,7 @@ ctest --test-dir build -R '^cross_'
 | `shared-backend-contract` | 内存实例始终；NNG 实例仅 ON | `backend_contract_memory` / `backend_contract_nng` 两份实例 |
 | `cross-process` | 仅 ON | 4 个两进程用例 |
 
-`batch3_contract_test` 两种开关都构建，NNG 相关部分用 `FIREFLY_WITH_NNG` 条件编译。
+`registry_contract_test` 两种开关都构建，NNG 相关部分用 `FIREFLY_WITH_NNG` 条件编译。
 
 ## 4. 共享契约测试的机制
 

@@ -31,7 +31,7 @@
 - **正面**：队列有界，内存增长可预测；满时失败而非无限排队。
 - **负面 / 成本**：**慢请求阻塞同一 Client 的后续请求**，慢回调延后同一端点的下一条消息。需要并发的场景必须由业务拆多个 Client。
 - **负面 / 成本**：关停时长受在途 `Exchange`、发现查询与同步拨号影响，可能出现「timeout 已到但调用方仍在等」（见 known-gaps G3）。
-- **如何验证仍被遵守**：`batch1_contract_test`（排队取消/到期不发送、只兑现一次、队列满、旧句柄失效）、`backend_contract_test::absolute_deadline` / `callback_order` / `response_matching`、`request_cancel_test`。
+- **如何验证仍被遵守**：`concurrency_contract_test`（排队取消/到期不发送、只兑现一次、队列满、旧句柄失效）、`backend_contract_test::absolute_deadline` / `callback_order` / `response_matching`、`request_cancel_test`。
 
 ## 备选方案
 
