@@ -7,8 +7,17 @@
 #include "firefly/init.h"
 #include "firefly/node/node.h"
 
+/// @file firefly.h
+/// @brief 库的单一入口头文件，包含初始化接口与节点定义。
+
+#include <memory>
+#include <string>
+
+#include "firefly/init.h"
+#include "firefly/node/node.h"
+
 /*
- * 典型用法（阶段二 API：所有工厂返回 Result，取 .value 前先判 bool）：
+ * 典型用法：所有工厂都返回 Result，取 value 前先判断 bool。
  *
  *   #include "firefly/firefly.h"
  *
@@ -22,7 +31,7 @@
  *     auto writer_r = node->CreateWriter<Chatter>("channel/chatter");
  *     if (!writer_r) return 2;
  *     auto writer = writer_r.value;
- *     writer->Write(msg);  // 返回 WriteStatus
+ *     writer->Write(msg);  // 返回 WriteStatus，kAccepted 不等于对端已收到
  *
  *     auto reader_r = node->CreateReader<Chatter>("channel/chatter",
  *         [](const firefly::MessageContext&,
@@ -30,7 +39,7 @@
  *           return firefly::CallbackResult::kOk;  // 或 kDropped
  *         });
  *
- *     // 服务 / 客户端（回调返回 ServiceResult，SendRequest 返回 ServiceResult）
+ *     // 服务 / 客户端
  *     auto service_r = node->CreateService<Req, Resp>("calc",
  *         [](const std::shared_ptr<const Req>& req) {
  *           auto resp = std::make_shared<Resp>();
@@ -39,7 +48,7 @@
  *     auto client_r = node->CreateClient<Req, Resp>("calc");
  *     auto resp = client_r.value->SendRequest(req);  // resp.code 区分失败原因
  *
- *     firefly::Shutdown();               // 主动关停
+ *     firefly::Shutdown();               // 主动触发关停，不级联关闭端点
  *     firefly::WaitForShutdownFor(std::chrono::seconds(2));
  *     firefly::Clear();
  *     return 0;

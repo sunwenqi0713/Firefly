@@ -1,41 +1,11 @@
 ﻿#ifndef FIREFLY_NODE_READER_H_
 #define FIREFLY_NODE_READER_H_
 
-// ===========================================================================
-// 回调执行模型与并发契约（阶段二契约基线；阶段三签名升级为 MessageContext）
-// ===========================================================================
-//
-// 回调类型（阶段三）：
-//   CallbackFunc<M> = std::function<CallbackResult(
-//       const MessageContext&, std::shared_ptr<const M>)>
-// MessageContext 含 channel、sequence（本 Reader 从 1 递增）、receive_time；
-// 不含 executor 字段 —— 回调仍内联派发（见下）。
-// 消息指针改为 shared_ptr<const M>：堵死"回调内改消息"的未定义行为。
-// CallbackResult::kDropped 表示本条不消费，计入 Stats().dropped。
-//
-// 执行线程：回调在 Reader 专属的单个收线程（recv_thread_）内**内联派发**，
-//   不是独立线程池，也不在调用 CreateReader 的线程执行。
-// 并发与顺序：
-//   - 同一 Reader：回调严格串行（单收线程逐条派发），顺序为消息到达顺序；
-//   - 不同 Reader：各自的收线程并行，彼此无顺序保证。
-// 回调内行为约束（违反将导致死锁或异常）：
-//   - 禁止在回调内调用**本 Reader** 的 Shutdown / DeleteReader：Shutdown 会
-//     join 收线程，而回调正运行在该线程上 → 自连接死锁；
-//   - 禁止在回调内调用**本 Client** 的 Shutdown（对 RPC 回调同理，见 client.h）；
-//   - 回调抛出的异常不会传播到任何调用方：在收线程内被捕获，记录一条带
-//     channel 名的 ERROR 日志（std::exception 附 what()）后继续收下一条。
-// 回调与 Observe 互斥（契约缺失 3）：
-//   - 构造 Reader 时传入非空 CallbackFunc → 回调模式；回调模式下消息**只**
-//     派发给回调、不写入观察队列，因此 GetAllObserved()/GetLatestObserved()/
-//     GetOldestObserved() 恒为空 / nullptr，Empty() 恒为 true。
-//   - 构造时传 nullptr → Observe 模式；消息入队，回调不触发。
-//   - 之所以仅在文档声明而未加 kInvalidState 返回：GetAllObserved() 返回
-//     std::vector 而非 Result，加码需改签名，超出范围。
-// Shutdown 与 Clear（阶段三收尾）：
-//   - Reader::Shutdown() 阻塞至在途回调返回（与 join 收线程配合）；
-//   - 全局 firefly::Clear() 遍历登记的存活 Reader/Service 等待点，阻塞至
-//     调用时刻在途的回调返回；不阻止端点未关闭时后续新回调。
-// ===========================================================================
+/// @file reader.h
+/// @brief 订阅端点 Reader<MessageT> 与回调类型 CallbackFunc。
+///
+/// 回调执行模型、两种消费模式的互斥关系与关停等待语义写在本文件各声明处；
+/// 架构层面的并发与执行位置总表见 docs/architecture/contracts.md §3。
 
 #include <cstdint>
 #include <functional>
@@ -53,7 +23,14 @@
 
 namespace firefly {
 
-// 消息到达回调：收到消息后被调用（回调模式）
+/**
+ * @brief 消息到达回调的签名。
+ *
+ * @tparam M0 消息类型，须为 google::protobuf::Message 的派生类。
+ *
+ * 消息以 shared_ptr<const M0> 传入，回调无法修改消息体；返回 kDropped 表示
+ * 本条不消费，计入 Stats().dropped。
+ */
 template <typename M0>
 using CallbackFunc = std::function<CallbackResult(
     const MessageContext&, const std::shared_ptr<const M0>&)>;
@@ -61,19 +38,48 @@ using CallbackFunc = std::function<CallbackResult(
 /**
  * @brief 订阅者：订阅一个通道。
  *
- * 支持两种消费模式：
- *  - 回调模式：创建时传入 CallbackFunc，消息到达时被调用；
- *  - Observe 模式：不传回调，用 Observe()/GetLatestObserved() 等拉取数据。
+ * 支持两种消费模式，由创建时是否传入回调决定，二者互斥：
+ * - 回调模式：消息只派发给回调，不写入观察队列，因此 GetAllObserved() 恒为空、
+ *   GetLatestObserved() 恒为 nullptr、Empty() 恒为 true；
+ * - Observe 模式：消息写入观察队列，以 Observe()/GetLatestObserved() 拉取。
+ *
+ * @tparam MessageT 消息类型，必须是 google::protobuf::Message 的派生类。
+ *
+ * @par 回调执行
+ * 回调在本 Reader 专属的单个收线程内内联派发，不在创建它的线程上执行：
+ * 同一 Reader 的回调严格串行且顺序等于消息到达顺序，不同 Reader 之间并行
+ * 且无顺序保证。回调抛出的异常不会传播给任何调用方，只会记录一条带通道名
+ * 的 ERROR 日志，然后继续收下一条。
+ *
+ * @warning 以下三种调用会自连接死锁或构成竞态，必须避免：
+ *          - 在回调内调用本 Reader 的 Shutdown() 或 Node::DeleteReader()；
+ *          - 在回调内调用本 Client 的 Shutdown()；
+ *          - 与同一 Reader 的 Shutdown() 并发调用其他成员函数。
+ *
+ * @sa docs/architecture/contracts.md §3 「并发与执行位置」
  */
 template <typename MessageT>
 class Reader : public ReaderBase {
  public:
+  /**
+   * @brief 构造订阅者，此时尚未接入通道。
+   *
+   * @param[in] config 通道名与 QoS 配置；qos_profile.depth 决定观察队列深度。
+   * @param[in] func   回调；传 nullptr 进入 Observe 模式。
+   * @param[in] ctx    测试注入点；传 nullptr 使用默认后端与默认注册中心。
+   * @note 正常业务路径应使用 Node::CreateReader()，它负责 Init() 并把失败
+   *       原因回填到 Result 中。
+   */
   Reader(const ReaderConfig& config,
          const CallbackFunc<MessageT>& func = nullptr,
          const std::shared_ptr<detail::InjectionContext>& ctx = nullptr)
       : config_(config), func_(func), ctx_(ctx) {}
+  /// @brief 析构订阅者；不隐式关闭通道，需要确定停机时先调用 Shutdown()。
   ~Reader() override = default;
 
+  /// @brief 接入通道并开始接收。
+  /// @return 成功返回 true；失败返回 false，原因由 InitErrorCode() 给出。
+  /// @post 成功后 IsInit() 为 true，收线程已启动。
   bool Init() override {
     if (init_) {
       return true;
@@ -102,46 +108,85 @@ class Reader : public ReaderBase {
     return true;
   }
 
-  // 供 Node::CreateReader 回填 Result 的诊断信息
+  /// @brief Init() 失败时的错误码，供 Node::CreateReader() 回填 Result。
+  /// @return 最近一次 Init() 的错误码；成功时为 kOk。
   ErrorCode InitErrorCode() const noexcept { return init_code_; }
+
+  /// @brief Init() 失败时的定位线索。
+  /// @return 最近一次 Init() 的错误信息；成功时为空串。
   const std::string& InitErrorMessage() const noexcept { return init_message_; }
 
-  // @post 阻塞至在途回调返回并关闭收线程；调用后本 Reader 不可再用。
+  /**
+   * @brief 关闭订阅端点。
+   *
+   * @post 收线程已退出、注册已注销，在途回调已返回；本 Reader 不可再用。
+   * @warning 不得在回调内调用（见类注释）：Shutdown() 会 join 收线程，而回调
+   *          正运行在该线程上。
+   */
   void Shutdown() override {
     detail::ReaderShutdownCore(impl_.get());
     impl_.reset();
     init_ = false;
   }
 
-  // @threadsafe-if 在 impl_ 未被并发 Shutdown 的前提下线程安全。
-  // 契约：不得与同一 Reader 的 Shutdown() 并发调用。
-  void Observe() override {}  // Observe 模式下数据在收线程直接入队
+  /// @brief 空实现：Observe 模式下消息在收线程直接入队，无需显式拉取。
+  /// @note 保留以满足 ReaderBase 接口与既有调用方。
+  void Observe() override {}
+
+  /// @brief 清空观察队列中的全部缓存。
+  /// @par 线程安全
+  /// 队列由内部锁保护，可与收线程并发调用。
   void ClearData() override { detail::ReaderClearData(impl_.get()); }
 
+  /// @brief 观察队列是否为空。
+  /// @return 无缓存消息时返回 true；回调模式下恒为 true。
   bool Empty() const override { return detail::ReaderEmpty(impl_.get()); }
+
+  /// @brief 自上次清空后是否收到过消息。
   bool HasReceived() const override {
     return detail::ReaderHasReceived(impl_.get());
   }
+
+  /// @brief 距最近一次收到消息的时间间隔。
+  /// @return 秒数；从未收到过消息时返回 -1。
   double GetDelaySec() const override {
     return detail::ReaderGetDelaySec(impl_.get());
   }
 
-  // 阶段三：实时积压由 Stats().queue_depth 提供；假 getter PendingQueueSize 已删除。
-  // @threadsafe 计数与队列深度均由 core 内锁/原子量维护。
-  // kDropped 回调与队列满丢弃合并计入 dropped；速率统计未实现（phase4）。
+  /**
+   * @brief 取累计统计快照。
+   *
+   * @return recv 为收到条数，dropped 为回调返回 kDropped 的条数（观察队列被
+   *         深度截断的旧消息不计入），queue_depth 为观察队列当前积压条数。
+   * @par 线程安全
+   * 计数由内部原子量与队列锁维护，可从任意线程调用；不得与 Shutdown() 并发，
+   * 因为 Shutdown() 会释放内部句柄。
+   */
   EndpointStats Stats() const { return detail::ReaderStats(impl_.get()); }
 
+  /// @brief 通道当前是否有 Writer 在发布。
+  /// @return 有至少一个已注册的 Writer 时返回 true。
   bool HasWriter() override { return detail::ReaderHasWriter(impl_.get()); }
 
+  /// @brief 取本 Reader 订阅的通道名。
+  /// @return 构造时传入的通道名。
   const std::string& GetChannelName() const override {
     return config_.channel_name;
   }
+
+  /// @brief 是否已成功 Init() 且未 Shutdown()。
   bool IsInit() const override { return init_; }
 
   // ---------- Observe 模式 ----------
 
-  // @threadsafe 队列由 core 内 queue_mutex_ 保护，可与收线程并发调用。
-  // @note 回调模式下恒返回空 vector（见文件头"回调与 Observe 互斥"）。
+  /**
+   * @brief 取观察队列中的全部消息，按到达顺序排列。
+   *
+   * @return 已反序列化的消息列表；队列为空或处于回调模式时返回空 vector。
+   * @note 反序列化失败的消息会被静默跳过，不进入返回值。
+   * @par 线程安全
+   * 队列由内部锁保护，可与收线程并发调用。
+   */
   std::vector<std::shared_ptr<MessageT>> GetAllObserved() const {
     std::vector<std::shared_ptr<MessageT>> out;
     for (const auto& bytes : detail::ReaderGetAllBytes(impl_.get())) {
@@ -152,19 +197,33 @@ class Reader : public ReaderBase {
     }
     return out;
   }
+
+  /// @brief 取观察队列中最新的一条消息。
+  /// @return 消息指针；队列为空或处于回调模式时返回 nullptr。
   std::shared_ptr<MessageT> GetLatestObserved() const {
     auto all = GetAllObserved();
     return all.empty() ? nullptr : all.back();
   }
+
+  /// @brief 取观察队列中最旧的一条消息。
+  /// @return 消息指针；队列为空或处于回调模式时返回 nullptr。
   std::shared_ptr<MessageT> GetOldestObserved() const {
     auto all = GetAllObserved();
     return all.empty() ? nullptr : all.front();
   }
 
-  // 设置/获取缓存深度：与 QosProfile::depth 同源（阶段三统一）
+  /**
+   * @brief 设置观察队列深度，与 QosProfile::depth 同源。
+   *
+   * @param[in] depth 保留的最近消息条数；传 0 会在队列截断时按 1 处理。
+   * @post 后续入队按新深度截断，已缓存的多余消息在下次入队时被丢弃。
+   */
   void SetHistoryDepth(std::uint32_t depth) {
     detail::ReaderSetHistoryDepth(impl_.get(), depth);
   }
+
+  /// @brief 取观察队列深度。
+  /// @return 当前生效的深度值，初值来自 QosProfile::depth。
   std::uint32_t GetHistoryDepth() const {
     return detail::ReaderGetHistoryDepth(impl_.get());
   }

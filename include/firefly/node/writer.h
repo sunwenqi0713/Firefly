@@ -1,39 +1,11 @@
 ﻿#ifndef FIREFLY_NODE_WRITER_H_
 #define FIREFLY_NODE_WRITER_H_
 
-// ===========================================================================
-// Write 送达语义（显式契约，阶段一；本阶段不实现 ack/重传机制）
-// ===========================================================================
-//
-// WriteStatus 的每个值的精确含义：
-//   kAccepted          消息已成功交给**本地传输层**（nng PUB socket 的发送队列）。
-//                      **不代表对端收到**：nng PUB/SUB 没有 ack，消息可能在
-//                      网络/对端丢弃，调用方不得据此认为业务已送达。
-//   kNoSubscriber      当前通道无任何 Reader（注册中心中无订阅者）；消息未发送。
-//   kQueueFull         本地发送队列满（nng 返回 EAGAIN）；消息未发送。
-//   kSerializationError 序列化失败（protobuf SerializeToString 返回 false）。
-//   kTransportError    其他 nng 层错误；底层错误码写入日志。
-//
-// QosProfile::reliability 两种取值下 kAccepted 的行为差异（如实描述现状）：
-//   kBestEffort：与当前 nng PUB/SUB 的实际行为一致 —— at-most-once，无 ack、
-//                无重传、无持久化；kAccepted 仅表示已交给本地传输层。
-//   kReliable  ：**本阶段与 kBestEffort 行为完全相同**。nng PUB/SUB 没有 ack，
-//                当前实现不提供任何重传/确认机制，kAccepted 同样是 at-most-once。
-//                TODO(phase4): 传输层可靠性增强后在此处更新契约；如需端到端确认，
-//                现阶段请在应用层使用 Service/Client 的请求-响应模式并自行重发。
-//
-// 投递顺序保证：
-//   同一 Writer 上的多次 Write 按调用顺序进入本地发送队列；但 nng PUB/SUB
-//   **不保证跨 Writer、跨进程、跨订阅者的到达顺序**，当前实现不做任何排序。
-//   需要顺序时请由业务在消息体中携带序号并在接收端重排。
-//
-// 状态机约束：
-//   Write 只接受已 Init 且未 Shutdown 的 Writer；未初始化时返回 kTransportError。
-//   两种 Write 重载语义一致，仅入参所有权不同（值语义会拷贝一次消息）。
-//
-// 阶段三（任务 2）：本模板只做 protobuf 序列化 shim，nng 交互全部下沉到
-// detail/writer_core.cc；公共头不再包含任何 detail/*_impl.h 或 nng 头。
-// ===========================================================================
+/// @file writer.h
+/// @brief 发布端点 Writer<MessageT> 的声明。
+///
+/// 送达语义只在 Write() 的注释里说明一次；架构层面的所有权、关停次序与
+/// 错误映射见 docs/architecture/contracts.md。
 
 #include <memory>
 #include <string>
@@ -48,19 +20,34 @@
 namespace firefly {
 
 /**
- * @class Writer<MessageT>
  * @brief 发布者：向指定通道发布类型为 MessageT 的消息。
  *
- * @tparam MessageT 消息类型，必须是 google::protobuf::Message 派生类
+ * 由 Node::CreateWriter() 创建并返回 shared_ptr；Node 析构不销毁端点，
+ * 须由持有者调用 Node::DeleteWriter() 或释放最后一个引用。
+ *
+ * @tparam MessageT 消息类型，必须是 google::protobuf::Message 的派生类。
+ * @sa docs/architecture/contracts.md 「发布送达语义」
  */
 template <typename MessageT>
 class Writer : public WriterBase {
  public:
+  /**
+   * @brief 构造发布者，此时尚未接入通道。
+   *
+   * @param[in] config 通道名与 QoS 配置。
+   * @param[in] ctx    测试注入点；传 nullptr 使用默认后端与默认注册中心。
+   * @note 正常业务路径应使用 Node::CreateWriter()，它负责 Init() 并把失败
+   *       原因回填到 Result 中。
+   */
   explicit Writer(const ChannelConfig& config,
                   const std::shared_ptr<detail::InjectionContext>& ctx = nullptr)
       : config_(config), ctx_(ctx) {}
+  /// @brief 析构发布者；不隐式关闭通道，需要确定停机时先调用 Shutdown()。
   ~Writer() override = default;
 
+  /// @brief 接入通道并完成注册。
+  /// @return 成功返回 true；失败返回 false，原因由 InitErrorCode() 给出。
+  /// @post 成功后 IsInit() 为 true，可开始 Write()。
   bool Init() override {
     if (init_) {
       return true;
@@ -76,31 +63,68 @@ class Writer : public WriterBase {
     return true;
   }
 
-  // 供 Node::CreateWriter 回填 Result 的诊断信息
+  /// @brief Init() 失败时的错误码，供 Node::CreateWriter() 回填 Result。
+  /// @return 最近一次 Init() 的错误码；成功时为 kOk。
   ErrorCode InitErrorCode() const noexcept { return init_code_; }
+
+  /// @brief Init() 失败时的定位线索。
+  /// @return 最近一次 Init() 的错误信息；成功时为空串。
   const std::string& InitErrorMessage() const noexcept { return init_message_; }
 
-  // @post 调用后本 Writer 不可再用；后续 Write 返回 kTransportError
-  // （WriteStatus 无 kNotReady 码，按阶段一契约折叠为传输错误）、HasReader 返回 false。
-  // 非幂等副作用：impl_ 被 reset；如需重建请由 Node::CreateWriter 新建。
+  /**
+   * @brief 关闭发布端点。
+   *
+   * @post 本 Writer 不可再用：Write() 返回 kTransportError，HasReader() 返回 false。
+   * @note 非幂等副作用仅限释放内部句柄（重复调用安全）；需要重新发布时
+   *       应由 Node::CreateWriter() 新建。
+   * @warning 不得与同一 Writer 的 Write() 并发调用。
+   */
   void Shutdown() override {
     detail::WriterShutdown(impl_.get());
     impl_.reset();
     init_ = false;
   }
 
-  // @threadsafe 多个调用方可并发 Write：底层 socket 与注入的 Registry 查询
-  // 均无共享可变状态竞争。契约：不得与同一 Writer 的 Shutdown() 并发。
-  /** @brief 发布一条消息（值语义，内部拷贝为 shared_ptr） */
+  /**
+   * @brief 向本通道发布一条消息，按值传入并在内部拷贝一次。
+   *
+   * @param[in] msg 待发布消息。
+   * @return 本次写入的受理结果，取值含义见接收 shared_ptr 的重载。
+   */
   WriteStatus Write(const MessageT& msg) {
     auto msg_ptr = std::make_shared<MessageT>(msg);
     return Write(msg_ptr);
   }
 
-  /** @brief 发布一条消息（共享指针语义） */
+  /**
+   * @brief 向本通道发布一条消息，共享指针语义，不额外拷贝消息体。
+   *
+   * kAccepted 只表示消息已交给本地传输层，**不表示对端已收到**：传输不提供
+   * 确认，消息可能在对端或网络中被丢弃。QosProfile::reliability 的两种取值
+   * 当前行为相同，均不提供重传或持久化；需要端到端确认时请改用
+   * Service/Client 的请求-应答模式并由业务自行重发。
+   *
+   * @param[in] msg_ptr 待发布消息；为空指针时行为未定义，调用方须保证非空。
+   * @return 本次写入的受理结果。
+   * @retval kAccepted           已交给本地传输层，不构成送达承诺。
+   * @retval kNoSubscriber       通道当前无 Reader，消息未发送。
+   * @retval kQueueFull          本地发送队列已满，消息未发送。
+   * @retval kSerializationError 序列化失败，消息未发送。
+   * @retval kTransportError     Writer 未初始化、已关停，或底层传输失败。
+   *
+   * @pre Writer 已成功 Init()。
+   * @post 失败时 Writer 仍可用，调用方可直接重试。
+   *
+   * @par 线程安全
+   * 可与同一 Writer 的其他 Write() 并发；不得与 Shutdown() 并发。
+   *
+   * @note 同一 Writer 的多次 Write() 按调用顺序进入本地发送队列；跨 Writer、
+   *       跨进程、跨订阅者均不保证到达顺序，需要顺序时由业务在消息体中携带
+   *       序号并在接收端重排。
+   */
   WriteStatus Write(const std::shared_ptr<const MessageT>& msg_ptr) {
     if (!init_ || !impl_) {
-      return WriteStatus::kTransportError;  // kNotReady 语义折叠为传输错误
+      return WriteStatus::kTransportError;
     }
     if (!detail::WriterHasReader(impl_.get())) {
       return WriteStatus::kNoSubscriber;
@@ -112,16 +136,28 @@ class Writer : public WriterBase {
     return detail::WriterWriteBytes(impl_.get(), bytes);
   }
 
-  // @threadsafe 累计计数由 core 内原子变量维护；queue_depth 对 Writer 恒为 0。
-  // 速率统计（mps）未实现，见 common/types.h EndpointStats 注释。
+  /**
+   * @brief 取累计统计快照。
+   *
+   * @return sent 为成功交给传输层的条数，dropped 为本地队列满丢弃的条数，
+   *         queue_depth 对 Writer 恒为 0。
+   * @par 线程安全
+   * 计数由内部原子量维护，可从任意线程调用；不得与 Shutdown() 并发，
+   * 因为 Shutdown() 会释放内部句柄。
+   */
   EndpointStats Stats() const { return detail::WriterStats(impl_.get()); }
 
+  /// @brief 通道当前是否有 Reader。
+  /// @return 有至少一个已注册的 Reader 时返回 true；关停后恒为 false。
   bool HasReader() override { return detail::WriterHasReader(impl_.get()); }
 
+  /// @brief 取本 Writer 绑定的通道名。
+  /// @return 构造时传入的通道名。
   const std::string& GetChannelName() const override {
     return config_.channel_name;
   }
 
+  /// @brief 是否已成功 Init() 且未 Shutdown()。
   bool IsInit() const override { return init_; }
 
  private:

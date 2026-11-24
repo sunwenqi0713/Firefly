@@ -1,23 +1,31 @@
 #ifndef FIREFLY_DETAIL_HANDLES_H_
 #define FIREFLY_DETAIL_HANDLES_H_
 
+/// @file handles.h
+/// @brief 端点内部实现句柄的抽象基类。
+///
+/// 用于 pimpl 类型擦除：公共模板只持有基类指针，具体实现由后端定义在本文件
+/// 之外。业务代码不应依赖本文件中的任何类型。
+
 namespace firefly {
 namespace detail {
 
-// 不透明实现句柄基类：具体实现由底层传输层持有（见 *_impl.h）。
-// 仅用于 pimpl 类型擦除，接口层不同实现细节。
+/// @brief 发布端点内部实现的抽象基类。
 struct WriterHandle {
   virtual ~WriterHandle() = default;
 };
 
+/// @brief 订阅端点内部实现的抽象基类。
 struct ReaderHandle {
   virtual ~ReaderHandle() = default;
 };
 
+/// @brief 服务端点内部实现的抽象基类。
 struct ServiceHandle {
   virtual ~ServiceHandle() = default;
 };
 
+/// @brief 客户端端点内部实现的抽象基类。
 struct ClientHandle {
   virtual ~ClientHandle() = default;
 };

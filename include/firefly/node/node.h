@@ -1,6 +1,12 @@
 ﻿#ifndef FIREFLY_NODE_NODE_H_
 #define FIREFLY_NODE_NODE_H_
 
+/// @file node.h
+/// @brief 节点 Node 及其端点工厂的声明。
+///
+/// 节点是通信的载体：Writer、Reader、Service、Client 都在节点上创建。
+/// 所有权与查重范围见 Node 类注释；整体契约见 docs/architecture/contracts.md。
+
 #include <map>
 #include <memory>
 #include <mutex>
@@ -22,19 +28,38 @@ namespace firefly {
 class Node;
 
 namespace detail {
-struct InjectionContext;  // 定义于 src/core/injection.h（注入点，阶段三）
+/// @brief 测试注入点定义所在位置；业务代码不应直接使用。
+struct InjectionContext;
 }
 
-// 创建节点（节点是通信的载体：读写者、服务/客户端都在节点上创建）。
-// 阶段二：返回 Result —— 进程内节点名重复时返回 ErrorCode::kDuplicate。
-// 合法性（空名/非法字符）返回 kInvalidName；成功时 value 非空。
+/**
+ * @brief 创建一个节点。
+ *
+ * @param[in] node_name  节点名；须非空、不超过 255 字节、不含控制字符或空格，
+ *                       且在**当前进程内**唯一。
+ * @param[in] name_space 命名空间，仅用于日志与属性记录，不参与查重。
+ * @return 创建结果。
+ * @retval kOk          成功，value 为节点所有权（unique_ptr）。
+ * @retval kInvalidName 节点名为空、过长或含非法字符。
+ * @retval kDuplicate   当前进程内已存在同名且存活的节点。
+ *
+ * @sa CreateNode(const std::string&, const std::string&,
+ *                const std::shared_ptr<detail::InjectionContext>&)
+ */
 Result<std::unique_ptr<Node>> CreateNode(const std::string& node_name,
                                          const std::string& name_space = "");
 
-// 阶段三：带注入点的工厂重载。fake 注入发生在 CreateXxx 工厂层；端点仍由
-// 外部 shared_ptr 独立持有（阶段二方案 b），Node 生命周期不控制端点存亡。
-// ctx 为空时所有端点退化为默认后端 + 默认 Registry
-// （FIREFLY_WITH_NNG=ON 为 NNG，OFF 为内存），行为完全不变。
+/**
+ * @brief 创建一个带注入点的节点，供测试替换默认后端与注册中心。
+ *
+ * @param[in] node_name  节点名，约束同上。
+ * @param[in] name_space 命名空间，约束同上。
+ * @param[in] ctx        注入点；为空时所有端点使用默认后端与默认注册中心，
+ *                       行为与另一个重载完全一致。
+ * @return 创建结果，返回码含义同上。
+ * @note 端点的所有权不随节点转移：注入只决定端点由哪个后端实现，节点析构
+ *       不会销毁端点。
+ */
 Result<std::unique_ptr<Node>> CreateNode(
     const std::string& node_name, const std::string& name_space,
     const std::shared_ptr<detail::InjectionContext>& ctx);
@@ -42,8 +67,12 @@ Result<std::unique_ptr<Node>> CreateNode(
 namespace detail {
 
 // ---------------------------------------------------------------------------
-// 名称与配置校验（阶段一：Create 前置校验，失败返回 kInvalidName/kInvalidConfig）
+// 名称与配置校验
 // ---------------------------------------------------------------------------
+
+/// @brief 判断端点名是否合法。
+/// @param[in] name 待校验名称。
+/// @return 非空、不超过 255 字节且不含控制字符与空格时返回 true。
 inline bool IsLegalEndpointName(const std::string& name) {
   if (name.empty() || name.size() > 255) {
     return false;
@@ -56,13 +85,20 @@ inline bool IsLegalEndpointName(const std::string& name) {
   return true;
 }
 
+/// @brief 判断字符串是否以指定后缀结尾。
+/// @param[in] s      待检查字符串。
+/// @param[in] suffix 后缀；不得为空指针。
+/// @return 以 suffix 结尾时返回 true。
 inline bool EndsWith(const std::string& s, const char* suffix) {
   const std::string suf(suffix);
   return s.size() >= suf.size() &&
          s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
 
-// 通道名不得命中服务内部通道的后缀保留字
+/// @brief 校验通道名。
+/// @param[in] name 通道名。
+/// @return 合法返回 kOk；否则返回 kInvalidName。
+/// @note 通道名不得命中服务内部通道的保留后缀，否则与服务实现冲突。
 inline ErrorCode ValidateChannelName(const std::string& name) {
   if (!IsLegalEndpointName(name) || EndsWith(name, SRV_CHANNEL_REQ_SUFFIX) ||
       EndsWith(name, SRV_CHANNEL_RES_SUFFIX)) {
@@ -71,15 +107,24 @@ inline ErrorCode ValidateChannelName(const std::string& name) {
   return ErrorCode::kOk;
 }
 
+/// @brief 校验服务名。
+/// @param[in] name 服务名。
+/// @return 合法返回 kOk；否则返回 kInvalidName。
+/// @note 服务名不受通道保留后缀限制。
 inline ErrorCode ValidateServiceName(const std::string& name) {
   return IsLegalEndpointName(name) ? ErrorCode::kOk : ErrorCode::kInvalidName;
 }
 
-// 节点名校验：阶段二 CreateNode 进程内查重前置校验（与服务名同一套合法性）
+/// @brief 校验节点名。
+/// @param[in] name 节点名。
+/// @return 合法返回 kOk；否则返回 kInvalidName。
 inline ErrorCode ValidateNodeName(const std::string& name) {
   return IsLegalEndpointName(name) ? ErrorCode::kOk : ErrorCode::kInvalidName;
 }
 
+/// @brief 校验 QoS 配置。
+/// @param[in] qos 待校验配置。
+/// @return 合法返回 kOk；depth 为 0 时返回 kInvalidConfig。
 inline ErrorCode ValidateQos(const QosProfile& qos) {
   if (qos.depth == 0) {
     return ErrorCode::kInvalidConfig;  // depth==0 无意义，fail-fast
@@ -87,7 +132,12 @@ inline ErrorCode ValidateQos(const QosProfile& qos) {
   return ErrorCode::kOk;
 }
 
-// Impl 层未填 message 时兜底，保证任何失败路径 message 非空。
+/// @brief 拼接创建失败时的定位线索，保证任何失败路径的 message 非空。
+/// @param[in] op           操作名，如 `"CreateWriter"`。
+/// @param[in] key          对象名（通道名或服务名）。
+/// @param[in] code         失败原因码。
+/// @param[in] impl_message 实现层给出的细节；为空时用占位文案替代。
+/// @return 形如 `CreateWriter[channel='x']: <细节> (code=kInvalidName)` 的字符串。
 inline std::string CreateFailMessage(const char* op, const std::string& key,
                                      ErrorCode code,
                                      const std::string& impl_message) {
@@ -99,26 +149,30 @@ inline std::string CreateFailMessage(const char* op, const std::string& key,
 }  // namespace detail
 
 /**
- * @class Node
- * @brief 通信的基本单元。一个模块通过 Node 定义读写者与/或服务客户端。
+ * @brief 通信的基本单元：一个模块通过 Node 创建读写者与/或服务客户端。
  *
- * 名称唯一性契约（阶段二起，精确描述每类对象的查重范围）：
- *   - Node      ：进程内唯一（复用 ShutdownManager 注册表），重复返回 kDuplicate；
- *                 节点析构时释放名字。不同进程间同名节点互不冲突。
- *   - Reader    ：单 Node 内同一通道唯一，重复返回 kDuplicate（阶段一已有）。
- *   - Writer    ：单 Node 内同一通道唯一（按 channel_name），重复返回 kDuplicate。
- *   - Service   ：单 Node 内服务名唯一，重复返回 kDuplicate。
- *   - Client    ：单 Node 内同一服务名唯一，重复返回 kDuplicate。
- *   跨进程同名：发现协议不处理名字冲突；不同进程的 Writer/Service 可以同名
- *   静默共存（订阅方/客户端会看到多个端点，选择其中一个连接）。这是已知缺口，
- *   需要发现协议扩展才能拦截，本阶段不修。
- *   "单 Node 内查重"仅比较仍存活（weak_ptr 未过期）的端点；端点被外部释放或
- *   DeleteXxx 后名字可回收再建。
+ * @par 名称唯一性
+ * - Node：进程内唯一，重名返回 kDuplicate，析构时释放名字；不同进程的同名
+ *   节点互不冲突。
+ * - Reader、Writer：单个 Node 内同一通道唯一，重复返回 kDuplicate。
+ * - Service、Client：单个 Node 内同一服务名唯一，重复返回 kDuplicate。
+ * - 跨进程同名不由框架拦截：不同进程的 Writer/Service 可以同名共存，订阅方
+ *   与客户端会看到多个端点并任选其一。这属已知缺口，见
+ *   docs/architecture/known-gaps.md。
+ * - 单 Node 内的查重只比较仍存活的端点；端点被外部释放或被 DeleteXxx 之后，
+ *   名字可再次使用。
  *
- * 四个 Create 工厂统一返回 Result：
- *   - 成功：r.value 非空，r.code == kOk；
- *   - 失败：r.value 为 nullptr，r.code 指明原因，r.message 必含定位线索；
- *   - 调用方应使用 if (r) / if (!r) 判断，不要直接比较 code。
+ * @par 所有权
+ * 节点持有它创建的 Reader，并在析构时关闭它们。Writer、Service、Client 由
+ * 调用方通过 shared_ptr 持有，节点只保存弱引用用于查重与 DeleteXxx 定位，
+ * 析构节点不会关闭它们。
+ *
+ * @par 创建结果
+ * 四个 Create 工厂统一返回 Result：成功时 value 非空、code 为 kOk；失败时
+ * value 为空、code 指明原因、message 必含定位线索。调用方应使用 `if (r)` /
+ * `if (!r)` 判断，不要直接比较 code。
+ *
+ * @sa docs/architecture/contracts.md §1 「资源所有权」
  */
 class Node {
  public:
@@ -128,71 +182,183 @@ class Node {
       const std::string&, const std::string&,
       const std::shared_ptr<detail::InjectionContext>&);
 
-  // 定义于 node.cc（实现阶段补充），以保证唯一指针 impl_ 在完整类型处析构
+  /**
+   * @brief 析构节点。
+   *
+   * 关闭本节点创建的全部 Reader，并释放节点名。Writer、Service、Client 不受
+   * 影响，仍由其持有者负责关闭。
+   */
   virtual ~Node();
 
+  /// @brief 取节点名。
   const std::string& Name() const { return node_name_; }
+
+  /// @brief 取命名空间。
   const std::string& NameSpace() const { return name_space_; }
 
   // ---------------- 发布 / 订阅 ----------------
 
-  // 创建发布者（按通道名，使用默认 QoS）
+  /**
+   * @brief 在指定通道上创建发布者，使用默认 QoS。
+   *
+   * @tparam MessageT 消息类型，须为 google::protobuf::Message 的派生类。
+   * @param[in] channel_name 通道名。
+   * @return 创建结果，返回码含义见接收 ChannelConfig 的重载。
+   */
   template <typename MessageT>
   Result<std::shared_ptr<Writer<MessageT>>> CreateWriter(
       const std::string& channel_name);
 
-  // 创建发布者（按通道配置，可指定 QoS）
+  /**
+   * @brief 在指定通道上创建发布者，可指定 QoS。
+   *
+   * @tparam MessageT 消息类型，须为 google::protobuf::Message 的派生类。
+   * @param[in] config 通道名与 QoS 配置。
+   * @return 创建结果。
+   * @retval kOk            成功，value 为发布者。
+   * @retval kNotReady      firefly::Init() 未调用，或 Clear() 已执行。
+   * @retval kInvalidName   通道名为空、过长、含非法字符，或命中服务通道保留后缀。
+   * @retval kInvalidConfig QoS 非法，即 depth 为 0。
+   * @retval kDuplicate     本节点内该通道已有存活的 Writer。
+   * @retval 其它            端点初始化失败时透传底层错误码，message 含细节。
+   */
   template <typename MessageT>
   Result<std::shared_ptr<Writer<MessageT>>> CreateWriter(
       const ChannelConfig& config);
 
-  // 创建订阅者（按通道名，使用默认配置；可传回调）
+  /**
+   * @brief 在指定通道上创建订阅者，使用默认配置。
+   *
+   * @tparam MessageT 消息类型，须为 google::protobuf::Message 的派生类。
+   * @param[in] channel_name 通道名。
+   * @param[in] reader_func  回调；为 nullptr 时进入 Observe 模式。
+   * @return 创建结果，返回码含义见接收 ReaderConfig 的重载。
+   */
   template <typename MessageT>
   Result<std::shared_ptr<Reader<MessageT>>> CreateReader(
       const std::string& channel_name,
       const CallbackFunc<MessageT>& reader_func = nullptr);
 
-  // 创建订阅者（按 ReaderConfig 配置）
+  /**
+   * @brief 在指定通道上创建订阅者，可指定 QoS 与回调。
+   *
+   * @tparam MessageT 消息类型，须为 google::protobuf::Message 的派生类。
+   * @param[in] config      通道名与 QoS 配置；depth 决定观察队列深度。
+   * @param[in] reader_func 回调；为 nullptr 时进入 Observe 模式。
+   * @return 创建结果。
+   * @retval kOk            成功，value 为订阅者。
+   * @retval kNotReady      firefly::Init() 未调用，或 Clear() 已执行。
+   * @retval kInvalidName   通道名非法。
+   * @retval kInvalidConfig QoS 非法，即 depth 为 0。
+   * @retval kDuplicate     本节点内该通道已有存活的 Reader，或同名 Reader 正在删除。
+   * @retval 其它            端点初始化失败时透传底层错误码，message 含细节。
+   */
   template <typename MessageT>
   Result<std::shared_ptr<Reader<MessageT>>> CreateReader(
       const ReaderConfig& config,
       const CallbackFunc<MessageT>& reader_func = nullptr);
 
-  // 删除订阅者（不存在返回 false）
-  // 删除中契约（第 1 批）：锁内在 readers_deleting_ 标记"正在删除"，但暂不
-  // 释放 readers_ 表项；释放节点锁后才调用 Reader::Shutdown()（会 join 收
-  // 线程并等待在途回调，回调内可并发调用 GetReader/Observe），完成后才在
-  // 锁内移除标记与表项。因此：回调内 GetReader 不会死锁且仍拿到旧 Reader；
-  // 删除中的同名 CreateReader 返回 kDuplicate；Shutdown 返回后可重建同名。
+  /**
+   * @brief 删除本节点创建并持有的订阅者。
+   *
+   * 删除过程分两段：先在锁内标记「正在删除」但保留表项，释放节点锁后才执行
+   * Reader::Shutdown()（join 收线程并等待在途回调），完成后移除表项与标记。
+   * 因此在回调内并发调用 GetReader() 不会死锁，且仍能拿到旧的 Reader。
+   *
+   * @param[in] channel_name 通道名。
+   * @return 成功关闭并移除返回 true；不存在或已在删除中返回 false。
+   * @post 返回 true 后该通道名可重新创建 Reader。
+   */
   bool DeleteReader(const std::string& channel_name);
 
-  // 删除发布者 / 服务 / 客户端（阶段二，返回 Result<void>）：
-  //   成功 → kOk 并对该端点调用 Shutdown；不存在（或外部已释放）→ kNotReady。
-  // 删除后 Node 不再持有该名字；同名可重新创建。
+  /**
+   * @brief 删除本节点注册的发布者，并对其调用 Shutdown()。
+   *
+   * @param[in] channel_name 通道名。
+   * @return 成功为 kOk；名字不存在或端点已被外部释放时为 kNotReady。
+   * @post 名字可重新用于创建 Writer。
+   */
   Result<void> DeleteWriter(const std::string& channel_name);
+
+  /**
+   * @brief 删除本节点注册的服务，并对其调用 Shutdown()。
+   *
+   * @param[in] service_name 服务名。
+   * @return 成功为 kOk；名字不存在或端点已被外部释放时为 kNotReady。
+   * @post 名字可重新用于创建 Service。
+   */
   Result<void> DeleteService(const std::string& service_name);
+
+  /**
+   * @brief 删除本节点注册的客户端，并对其调用 Shutdown()。
+   *
+   * @param[in] service_name 服务名。
+   * @return 成功为 kOk；名字不存在或端点已被外部释放时为 kNotReady。
+   * @post 名字可重新用于创建 Client。
+   */
   Result<void> DeleteClient(const std::string& service_name);
 
-  // 获取已创建的 Reader，不存在或类型不符返回 nullptr
+  /**
+   * @brief 取本节点创建的订阅者。
+   *
+   * @tparam MessageT 期望的消息类型。
+   * @param[in] channel_name 通道名。
+   * @return 订阅者指针；不存在或实际类型与 MessageT 不符时返回 nullptr。
+   * @par 线程安全
+   * 可与其他成员函数并发调用，也可在 Reader 回调内调用。
+   */
   template <typename MessageT>
   std::shared_ptr<Reader<MessageT>> GetReader(const std::string& channel_name);
 
-  // 把节点下所有 Reader 的新消息拉取到已观察缓存
-  // @threadsafe readers_ 由 readers_mutex_ 保护；逐个调用 Reader::Observe()
-  // （收线程内已由 queue_mutex_ 保护），可并发调用。
+  /**
+   * @brief 对全部 Reader 触发一次拉取。
+   *
+   * @note 保留以兼容既有调用方与 ReaderBase 接口：本实现中消息在收线程直接
+   *       入队，Reader::Observe() 是空实现，因此本方法当前不产生额外效果。
+   * @par 线程安全
+   * Reader 表由内部互斥量保护，可并发调用。
+   */
   void Observe();
-  // 清空节点下所有 Reader 的缓存数据
+
+  /// @brief 清空本节点全部 Reader 的观察缓存。
+  /// @par 线程安全
+  /// Reader 表由内部互斥量保护，可并发调用。
   void ClearData();
 
   // ---------------- 服务 / 客户端 ----------------
 
-  // 创建服务（service_callback 处理请求并填充响应）
+  /**
+   * @brief 创建服务。
+   *
+   * @tparam Request  请求消息类型，须为 google::protobuf::Message 的派生类。
+   * @tparam Response 响应消息类型，同上。
+   * @param[in] service_name     服务名。
+   * @param[in] service_callback 业务回调，不得为空。
+   * @return 创建结果。
+   * @retval kOk           成功，value 为服务。
+   * @retval kNotReady     firefly::Init() 未调用，或 Clear() 已执行。
+   * @retval kInvalidName  服务名为空、过长或含非法字符。
+   * @retval kDuplicate    本节点内已有同名且存活的 Service。
+   * @retval 其它           端点初始化失败时透传底层错误码，message 含细节。
+   */
   template <typename Request, typename Response>
   Result<std::shared_ptr<Service<Request, Response>>> CreateService(
       const std::string& service_name,
       const typename Service<Request, Response>::ServiceCallback& service_callback);
 
-  // 创建指向指定服务的客户端
+  /**
+   * @brief 创建指向指定服务的客户端。
+   *
+   * @tparam Request  请求消息类型，须为 google::protobuf::Message 的派生类。
+   * @tparam Response 响应消息类型，同上。
+   * @param[in] service_name 目标服务名。
+   * @return 创建结果。
+   * @retval kOk           成功，value 为客户端。
+   * @retval kNotReady     firefly::Init() 未调用，或 Clear() 已执行。
+   * @retval kInvalidName  服务名非法。
+   * @retval kDuplicate    本节点内已有同名且存活的 Client。
+   * @retval 其它           端点初始化失败时透传底层错误码，message 含细节。
+   */
   template <typename Request, typename Response>
   Result<std::shared_ptr<Client<Request, Response>>> CreateClient(
       const std::string& service_name);
@@ -211,16 +377,16 @@ class Node {
   // 重建同名端点或旧端点注销误伤新端点。
   std::set<std::string> readers_deleting_;
 
-  // 阶段二：Writer/Service/Client 的弱引用注册表，仅用于单 Node 查重与
-  // DeleteXxx 定位。弱引用不改变"端点由外部 shared_ptr 持有、独立存活"的
-  // 所有权现状；析构时如需关闭端点遵循下面的 Node 契约。
+  // Writer/Service/Client 的弱引用注册表，仅用于单 Node 查重与 DeleteXxx 定位。
+  // 弱引用不改变「端点由外部 shared_ptr 持有、独立存活」的所有权：节点析构
+  // 不关闭这些端点。
   // key 编码为 "W:"+channel / "S:"+service / "C:"+service（类型隔离命名空间）。
   mutable std::mutex endpoints_mutex_;
   std::map<std::string, std::weak_ptr<WriterBase>> writers_;
   std::map<std::string, std::weak_ptr<ServiceBase>> services_;
   std::map<std::string, std::weak_ptr<ClientBase>> clients_;
 
-  // 内部实现（拓扑注册、服务发现等），实现阶段补充
+  // 内部实现：拓扑注册与服务发现等元信息。
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

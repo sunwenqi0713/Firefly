@@ -1,68 +1,70 @@
 ﻿#ifndef FIREFLY_INIT_H_
 #define FIREFLY_INIT_H_
 
+/// @file init.h
+/// @brief 框架初始化、就绪判定与关停接口。
+
 #include <chrono>
 
 namespace firefly {
 
-// ===========================================================================
-// 初始化与就绪语义（显式契约，阶段一；关停语义阶段二补全）
-// ===========================================================================
-// Init() 完成时，注册中心**尚未就绪**：当前实现为惰性启动 —— 首次
-// Register/List/Subscribe（由 CreateWriter/CreateReader/CreateService 触发）
-// 时才真正 bind/dial（见 init.cc）。因此 Init() 返回 true 不代表拓扑发现
-// 可用；客户端应显式调用 Client::WaitForService() 等待服务就绪。
-//
-// binary_name 参数当前未使用（runtime.cc 中 (void)binary_name），保留以兼容
-// 现有签名。Init 幂等：重复调用返回 true。Init 在运行时入口一次组装默认
-// 端点工厂与 NNG Registry；测试可通过 detail::InjectionContext 注入替身，
-// 发现中心地址可由 detail::ConfigureDiscovery 或环境变量
-// FIREFLY_DISCOVERY_REP_URL / FIREFLY_DISCOVERY_PUB_URL 在首次使用前配置。
-//
-// ---- 关停语义（Shutdown / WaitForShutdown / WaitForShutdownFor / Clear） ----
-// Shutdown()：主动触发全局关停，复用 ShutdownManager 的 shutdown_ 状态位
-//   （与 Ctrl+C 信号同一路径），幂等。触发后的可观察效果（如实描述现状）：
-//     1) WaitForShutdown() 解除阻塞并返回；IsShutdown()==true；OK()==false。
-//     2) 此后 Create* 工厂返回 ErrorCode::kNotReady（阶段一已有的 OK() 检查）。
-//     3) 已创建端点：Shutdown() **只置全局标志，不主动关闭任何端点 socket、
-//        不停止端点线程**。Writer::Write 仍会尝试发送到已绑定的 socket；
-//        Reader/Service 的收/工作线程循环只看各自 running_ 标志，不看全局
-//        shutdown_，故回调**仍会继续触发**，直到该端点被单独 Shutdown/析构。
-//        Registry 的 REP/SUB 线程例外：其循环检查 IsShutdown()，会退出。
-//        结论：全局 Shutdown() 不是"停止所有通信"，调用方须自行 Shutdown
-//        或析构各端点。全局关停级联关闭所有端点仍属未来机制，不在本阶段范围。
-// WaitForShutdownFor(timeout)：带期限等待，false=超时仍未关停。
-// Clear()：调用 Registry::Stop() 并置 inited_=false（间接 RequestShutdown）。
-//   - 与在途回调：Clear() 先停 Registry，再遍历所有存活端点登记的等待点，
-//     阻塞至**调用时刻已在途**的 Reader/Service 回调返回（阶段三已实现）。
-//     边界：全局关停并不关闭端点线程，Clear() 返回后新到达的消息仍可能触发
-//     新回调；调用方若要彻底停止回调，需单独 Shutdown/析构对应端点。
-//     Service 回调等待同样通过等待点登记；Reader::Shutdown() 自身也会等待。
-//   - Clear() 后可再次 Init()：state 机为 inited_/shutdown_ 两原子位，Clear()
-//     将 inited_ 置 false 并 RequestShutdown()；再次 Init() 把 inited_ 置回
-//     true、shutdown_ 置回 false（见 runtime.cc Init）。注册中心为惰性启动，
-//     下次 Register/List 时重新 start。
-// ===========================================================================
-
-// 初始化框架（初始化日志、调度器、关停管理器；注册中心惰性启动）
+/**
+ * @brief 初始化框架：日志、调度与关停管理。
+ *
+ * @param[in] binary_name 可执行文件名；当前保留但未使用，传 argv[0] 即可。
+ * @return 当前实现恒返回 true，且幂等：重复调用不会再做任何组装。不要用返回值
+ *         判断框架是否可用，应使用 OK()。
+ * @post Init() 返回后注册中心**尚未就绪**：它为惰性启动，首次 Register、List
+ *       或 Subscribe（由 CreateWriter、CreateReader、CreateService 触发）时才
+ *       真正建立连接。因此 Init() 成功不代表拓扑发现可用，客户端应显式调用
+ *       Client::WaitForService() 等待服务就绪。
+ * @note 幂等：重复调用直接返回 true。发现服务地址可在首次使用前通过
+ *       detail::ConfigureDiscovery() 或环境变量 FIREFLY_DISCOVERY_REP_URL、
+ *       FIREFLY_DISCOVERY_PUB_URL 配置；测试可通过注入点替换端点实现。
+ */
 bool Init(const char* binary_name);
 
-// 框架是否运行正常
+/// @brief 框架当前是否正常运行（已 Init 且未进入关停流程）。
 bool OK();
 
-// 是否已进入关停流程
+/// @brief 是否已进入关停流程。
 bool IsShutdown();
 
-// 主动触发全局关停（幂等；等价于信号触发的 RequestShutdown）
+/**
+ * @brief 主动触发全局关停，与信号触发的关停走同一路径。
+ *
+ * @post WaitForShutdown() 解除阻塞，IsShutdown() 为 true，OK() 为 false；
+ *       此后所有 Create 工厂返回 kNotReady。
+ * @warning 本调用只置全局标志，不关闭任何已创建的端点，也不停止端点线程：
+ *          Writer 仍会向已绑定的端点发送，Reader 与 Service 的回调仍会继续
+ *          触发，直到该端点被单独 Shutdown() 或析构。需要停止通信时，调用方
+ *          必须自行关闭各端点。详见 docs/architecture/known-gaps.md。
+ * @note 幂等。
+ */
 void Shutdown();
 
-// 阻塞等待框架关停
+/// @brief 阻塞等待框架进入关停状态。
 void WaitForShutdown();
 
-// 带超时等待框架关停：true=已关停，false=超时
+/**
+ * @brief 带期限等待框架进入关停状态。
+ *
+ * @param[in] timeout 等待上限。
+ * @return 已关停返回 true；超时未关停返回 false。
+ */
 bool WaitForShutdownFor(std::chrono::milliseconds timeout);
 
-// 清理并释放框架资源
+/**
+ * @brief 清理框架资源，允许之后重新 Init()。
+ *
+ * 先停止注册中心，再遍历全部存活端点登记的等待点，阻塞至**调用时刻已在途**
+ * 的 Reader 与 Service 回调返回。
+ *
+ * @post inited_ 置为 false 并触发关停；再次 Init() 会重建组装。
+ * @warning 全局关停不关闭端点线程，本调用返回后新到达的消息仍可能触发新回调。
+ *          要彻底停止回调，须单独 Shutdown() 或析构对应端点。
+ * @note 端点析构时触发的迟到注销在此之后为 no-op。
+ */
 void Clear();
 
 }  // namespace firefly
