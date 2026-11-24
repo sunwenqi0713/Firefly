@@ -37,7 +37,7 @@
 
 拆成「角色 object」与「注入 object」两层的唯一原因是**注入符号每个后端各一份、最终链接只能出现一份**，而角色 object 需要被同一测试进程显式链接多次（共享契约测试同时构造内存与 NNG 实例）。新增后端时沿用这一结构，见 [guides/adding-backend.md](../guides/adding-backend.md)。
 
-`configure_firefly_object()` 统一设置 include 根（`include/`、`src/`）与编译选项；目标由 `FIREFLY_BACKEND_OBJECTS` 决定聚合库取哪一套。
+`configure_firefly_object()` 为 object 目标设置**私有** include 根（`include/`、`src/`）与编译选项，目标由 `FIREFLY_BACKEND_OBJECTS` 决定聚合库取哪一套；`firefly` / `firefly_core` / `firefly_nng` 对消费者只暴露 `include/`，需要内部头的测试经 `firefly_internal` 显式声明。
 
 ## 4. 新增文件的落位规则
 

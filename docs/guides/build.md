@@ -51,7 +51,9 @@ ctest --test-dir build --output-on-failure
 
 设计原因：注入符号每个后端各一份、最终链接只能出现一份；角色 object 需要被同一测试进程显式链接多次，以便共享契约测试同时构造内存与 NNG 实例。聚合库直接复用 object，避免同一静态库被归档两次导致符号冲突。
 
-`configure_firefly_object(target)` 统一设置 include 根（`include/`、`src/`）与编译选项；聚合库取哪套对象由 `FIREFLY_BACKEND_OBJECTS` 决定。
+`configure_firefly_object(target)` 为 object 目标设置**私有** include 根（`include/`、`src/`）与编译选项；聚合库取哪套对象由 `FIREFLY_BACKEND_OBJECTS` 决定。
+
+对外边界只有 `include/`：`firefly`、`firefly_core`、`firefly_nng` 的 `INTERFACE_INCLUDE_DIRECTORIES` 不含 `src/`，消费者无法包含 `core/*.h`、`backends/*`。需要内部头的测试与辅助程序显式链接 `firefly_internal`（`use_firefly_internal(<target>)`），这是测试特权。配置阶段有断言守着这条边界：把 `src/` 加回 PUBLIC 会直接配置失败。
 
 ## 4. 开关语义
 

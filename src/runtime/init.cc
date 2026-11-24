@@ -1,9 +1,8 @@
 #include "firefly/init.h"
 
-#include "firefly/common/log.h"
-#include "backends/nng/registry.h"
-#include "core/interfaces.h"
+#include "core/injection.h"
 #include "core/runtime.h"
+#include "firefly/common/log.h"
 
 namespace firefly {
 

@@ -43,7 +43,7 @@ const char* KindToString(Kind k);
 // 轻量注册中心客户端（进程单例；detail 层可由 NngRegistry 适配成 IRegistry）。
 // - 第一个成功 bind 的进程为主注册中心（REP 服务端 + PUB 广播）；
 // - 其余进程为从实例（REQ 查询/注册 + SUB 接收广播）。
-// 实现见 discovery.cc（基于 NNG）。记录模型与 Watch 快照语义见 interfaces.h
+// 实现见 registry.cc（基于 NNG）。记录模型与 Watch 快照语义见 interfaces.h
 // 的 IRegistry 契约注释；Start/Stop 保留给发现层单测与 Clear 使用。
 class Registry final : public IRegistry {
  public:
@@ -52,7 +52,7 @@ class Registry final : public IRegistry {
   // 在首次 Start 前设置发现中心 REP/PUB 地址；空串保持默认端口。
   static void Configure(const std::string& rep_url, const std::string& pub_url);
 
-  // 实现细节（定义于 discovery.cc），仅用于 pimpl
+  // 实现细节（定义于 registry.cc），仅用于 pimpl
   struct Impl;
 
   Registry(const Registry&) = delete;

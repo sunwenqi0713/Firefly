@@ -434,17 +434,20 @@ std::string RemoteRequest(Registry::Impl& impl, const std::string& line) {
   return RecvToString(impl.req_sock_);
 }
 
-std::vector<EndpointRecord> ParseRecords(const std::string& resp, Kind kind,
-                                         const std::string& name) {
-  std::vector<EndpointRecord> out;
+// 解析 "OK <count>\n<id>\t<backend>\t<address>\n..."。返回 false 表示响应不是
+// 一次成功查询（超时/空响应/ERR）：调用方据此区分"查询失败"与"查询成功但
+// 结果为空"，后者是权威的空快照。
+bool ParseRecords(const std::string& resp, Kind kind, const std::string& name,
+                  std::vector<EndpointRecord>* out) {
+  out->clear();
   std::istringstream in(resp);
   std::string status;
   std::size_t count = 0;
-  in >> status >> count;
-  if (status != "OK") return out;
+  if (!(in >> status >> count)) return false;
+  if (status != "OK") return false;
   std::string line;
   std::getline(in, line);  // 吞掉行尾
-  while (out.size() < count && std::getline(in, line)) {
+  while (out->size() < count && std::getline(in, line)) {
     if (line.empty()) continue;
     std::istringstream fields(line);
     EndpointRecord rec;
@@ -457,24 +460,24 @@ std::vector<EndpointRecord> ParseRecords(const std::string& resp, Kind kind,
     std::getline(fields, rec.backend, '\t');
     std::getline(fields, rec.address, '\t');
     rec.id = id_text.empty() ? 0 : std::stoull(id_text);
-    out.push_back(std::move(rec));
+    out->push_back(std::move(rec));
   }
-  return out;
+  return true;
 }
 
 // 旧主实例（或尚未升级的进程）不认识 QLIST：回退原 LIST 文本协议并派生
 // 兼容字段。与 Registry::Query 的回退逻辑保持一致。
-std::vector<EndpointRecord> ParseLegacyList(const std::string& resp, Kind kind,
-                                            const std::string& name,
-                                            const std::string& backend) {
-  std::vector<EndpointRecord> out;
+bool ParseLegacyList(const std::string& resp, Kind kind, const std::string& name,
+                     const std::string& backend,
+                     std::vector<EndpointRecord>* out) {
+  out->clear();
   std::istringstream in(resp);
   std::string status;
   std::size_t count = 0;
-  in >> status >> count;
-  if (status != "OK") return out;
+  if (!(in >> status >> count)) return false;
+  if (status != "OK") return false;
   std::string address;
-  while (out.size() < count && std::getline(in, address, '\n')) {
+  while (out->size() < count && std::getline(in, address, '\n')) {
     if (address.empty()) continue;
     EndpointRecord rec;
     rec.kind = kind;
@@ -482,37 +485,99 @@ std::vector<EndpointRecord> ParseLegacyList(const std::string& resp, Kind kind,
     rec.address = address;
     rec.backend = kDefaultBackend;
     rec.id = LegacyId(kind, name, address);
-    if (backend.empty() || backend == rec.backend) out.push_back(rec);
+    if (backend.empty() || backend == rec.backend) out->push_back(rec);
   }
-  return out;
+  return true;
 }
 
 // 从实例直接向主实例取快照：Watch 的初始集合与定期对账共用。
-std::vector<EndpointRecord> QueryRemote(Registry::Impl& impl, Kind kind,
-                                        const std::string& name,
-                                        const std::string& backend) {
+// 返回 false 表示查询失败（主实例不可达、超时或响应不可解析），此时 *out
+// 不代表任何权威状态，调用方必须保留本地记录；返回 true 时 *out 是该键的
+// 完整快照，可能为空——空集合意味着这些端点确实已不存在。
+bool QueryRemote(Registry::Impl& impl, Kind kind, const std::string& name,
+                 const std::string& backend,
+                 std::vector<EndpointRecord>* out) {
+  out->clear();
   std::ostringstream line;
   line << "QLIST\t" << KindToString(kind) << '\t' << name << '\t' << backend;
-  std::string resp = RemoteRequest(impl, line.str());
-  auto records = ParseRecords(resp, kind, name);
-  if (!records.empty() || resp.rfind("OK ", 0) == 0) return records;
+  if (ParseRecords(RemoteRequest(impl, line.str()), kind, name, out)) return true;
+  // 旧主实例不识别 QLIST，会回 ERR；此处再走一次 LIST 文本协议。
   line.str(std::string());
   line.clear();
   line << "LIST\t" << KindToString(kind) << '\t' << name;
-  return ParseLegacyList(RemoteRequest(impl, line.str()), kind, name, backend);
+  const std::string resp = RemoteRequest(impl, line.str());
+  if (resp.empty()) return false;
+  return ParseLegacyList(resp, kind, name, backend, out);
+}
+
+// 发现键内的记录身份：地址 + 后端。同一 kind+name 下地址唯一标识一个端点，
+// 反向对账据此判断"远端仍有这条记录"。无地址记录（Reader 占位）不能这样
+// 认同——多个 Reader 共用空地址——只能按 id 精确匹配。
+std::string DiscoveryKeyOf(const EndpointRecord& rec) {
+  return rec.address + '\n' +
+         (rec.backend.empty() ? kDefaultBackend : rec.backend);
+}
+
+// 远端权威快照的身份索引：id 集合用于精确匹配（无地址记录只能靠它），
+// (地址, 后端) 集合用于兼容新旧协议下 id 不一致但地址相同的同一条登记。
+struct RemoteIdentity {
+  std::set<EndpointRecordId> ids;
+  std::set<std::string> addresses;
+};
+
+bool ListedInRemote(const EndpointRecord& local, const RemoteIdentity& remote) {
+  if (remote.ids.count(local.id) != 0) return true;
+  if (local.address.empty()) return false;
+  return remote.addresses.count(DiscoveryKeyOf(local)) != 0;
+}
+
+// 调用前持有 dispatch_mutex_ 与 data_mutex_。反向对账：本地存在、权威快照
+// 里却没有的记录，说明注销广播丢了；只删除查询开始前未被本地更新的记录
+// （id_revision_ <= query_revision），避免误删查询期间到达的新增或变更。
+bool RemoveStaleLocked(Registry::Impl& impl, Kind kind,
+                       const std::string& name,
+                       const RemoteIdentity& remote,
+                       std::uint64_t query_revision) {
+  const auto index = impl.by_key_.find(Key(kind, name));
+  if (index == impl.by_key_.end()) return false;
+  std::vector<EndpointRecord> stale;
+  for (EndpointRecordId id : index->second) {
+    const auto rec = impl.records_.find(id);
+    if (rec == impl.records_.end()) continue;
+    const auto revised = impl.id_revision_.find(id);
+    if (revised != impl.id_revision_.end() &&
+        revised->second > query_revision) {
+      continue;  // 查询开始后本地才新增/变更：以本地为准
+    }
+    if (ListedInRemote(rec->second, remote)) continue;
+    stale.push_back(rec->second);
+  }
+  bool changed = false;
+  for (const auto& rec : stale) {
+    EndpointRecord victim = rec;  // ApplyLocked 会从表里擦除，传副本
+    ApplyLocked(impl, victim, false);
+    changed = true;
+  }
+  return changed;
 }
 
 // 调用前持有 dispatch_mutex_；内部取 data_mutex_。query_revision 是发起远端
 // 查询之前的本地修订号：查询期间到达的广播（新增或注销）修订号更大，必须
 // 优先于快照，否则晚启动 Reader 可能先拿到旧快照再被过期记录污染。
+// 双向合并：补远端有、本地缺的记录，删远端无、本地仍留的记录。
 bool MergeSnapshotLocked(Registry::Impl& impl, Kind kind,
                          const std::string& name,
                          const std::vector<EndpointRecord>& remote,
                          std::uint64_t query_revision) {
   bool changed = false;
   std::lock_guard<std::mutex> data(impl.data_mutex_);
+  RemoteIdentity identity;
   for (const auto& rec : remote) {
     if (rec.id == 0) continue;
+    // 远端仍列出该记录（哪怕本次因修订号更高而不采用），就算"在册"，
+    // 反向对账不得删它。
+    identity.ids.insert(rec.id);
+    if (!rec.address.empty()) identity.addresses.insert(DiscoveryKeyOf(rec));
     const auto removed = impl.removed_revision_.find(rec.id);
     if (removed != impl.removed_revision_.end() &&
         removed->second > query_revision) {
@@ -532,11 +597,15 @@ bool MergeSnapshotLocked(Registry::Impl& impl, Kind kind,
     ApplyLocked(impl, rec, true);
     changed = true;
   }
+  if (RemoveStaleLocked(impl, kind, name, identity, query_revision)) {
+    changed = true;
+  }
   return changed;
 }
 
 // 定期重连/漏广播对账：只处理当前有 Watch 的键，且仅在合并确实改变记录
-// 集合时派发回调，避免每轮无谓地触发 UpdatePublishers。
+// 集合时派发回调，避免每轮无谓地触发 UpdatePublishers。查询失败（主实例
+// 暂时不可达）不改变本地记录；查询成功但为空是权威结果，必须据此清空。
 void ReconcileWatches(Registry::Impl& impl) {
   if (impl.primary || !impl.running_.load()) return;
   std::set<std::pair<Kind, std::string>> keys;
@@ -550,8 +619,10 @@ void ReconcileWatches(Registry::Impl& impl) {
       std::lock_guard<std::mutex> data(impl.data_mutex_);
       start_revision = impl.revision_;
     }
-    auto remote = QueryRemote(impl, key.first, key.second, std::string());
-    if (remote.empty()) continue;
+    std::vector<EndpointRecord> remote;
+    if (!QueryRemote(impl, key.first, key.second, std::string(), &remote)) {
+      continue;
+    }
     std::lock_guard<std::mutex> dispatch(impl.dispatch_mutex_);
     if (MergeSnapshotLocked(impl, key.first, key.second, remote,
                             start_revision)) {
@@ -763,17 +834,26 @@ std::vector<EndpointRecord> Registry::Query(RegistryKind kind,
                                             const std::string& name,
                                             const std::string& backend) {
   if (!Start()) return {};
-  if (!impl_->primary) return QueryRemote(*impl_, kind, name, backend);
+  if (!impl_->primary) {
+    std::vector<EndpointRecord> remote;
+    if (!QueryRemote(*impl_, kind, name, backend, &remote)) return {};
+    return remote;
+  }
   std::ostringstream line;
   line << "QLIST\t" << KindToString(kind) << '\t' << name << '\t' << backend;
-  std::string resp = Execute(*impl_, line.str());
-  auto records = ParseRecords(resp, kind, name);
-  if (!records.empty() || resp.rfind("OK ", 0) == 0) return records;
+  std::vector<EndpointRecord> records;
+  if (ParseRecords(Execute(*impl_, line.str()), kind, name, &records)) {
+    return records;
+  }
   // 旧版主实例不认识 QLIST：退回原 LIST 文本协议并派生兼容字段。
   line.str(std::string());
   line.clear();
   line << "LIST\t" << KindToString(kind) << '\t' << name;
-  return ParseLegacyList(Execute(*impl_, line.str()), kind, name, backend);
+  if (!ParseLegacyList(Execute(*impl_, line.str()), kind, name, backend,
+                       &records)) {
+    return {};
+  }
+  return records;
 }
 
 bool Registry::Has(Kind kind, const std::string& name) {
@@ -794,12 +874,14 @@ int Registry::Watch(Kind kind, const std::string& name, WatchCallback&& cb) {
   // 修订号裁决，保证初始快照不覆盖更新的增量。
   std::vector<EndpointRecord> remote;
   std::uint64_t query_revision = 0;
+  bool have_snapshot = false;
   if (!impl_->primary) {
     {
       std::lock_guard<std::mutex> data(impl_->data_mutex_);
       query_revision = impl_->revision_;
     }
-    remote = QueryRemote(*impl_, kind, name, std::string());
+    have_snapshot =
+        QueryRemote(*impl_, kind, name, std::string(), &remote);
   }
   {
     std::lock_guard<std::mutex> dispatch(impl_->dispatch_mutex_);
@@ -808,7 +890,8 @@ int Registry::Watch(Kind kind, const std::string& name, WatchCallback&& cb) {
       id = impl_->next_watch_id_++;
       impl_->watches_.push_back(WatchEntry{id, kind, name, std::move(cb)});
     }
-    if (!remote.empty()) {
+    // 查询失败时保留本地缓存：失败不代表端点不存在，等下一轮对账。
+    if (have_snapshot) {
       MergeSnapshotLocked(*impl_, kind, name, remote, query_revision);
     }
     {

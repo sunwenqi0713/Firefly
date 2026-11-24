@@ -27,6 +27,14 @@ else()
   set(FIREFLY_WITH_NNG_DEFINE 0)
 endif()
 
+# ---------------- 公开头边界 ----------------
+# 对外只暴露 include/：src/ 是构建内部布局，不属于消费方可见的 include 根。
+# 测试与辅助程序确实需要内部头时显式链接 firefly_internal（测试特权），
+# 这样"消费者只依赖 include/"是可检查的，而不是靠约定。
+add_library(firefly_internal INTERFACE)
+target_include_directories(firefly_internal INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+
 # ---------------- Core object 集合：不得出现 <nng/...> 或 NNG 符号 ----------------
 add_library(firefly_core_objects OBJECT
     src/runtime/init.cc
@@ -38,9 +46,9 @@ add_library(firefly_core_objects OBJECT
     src/core/service_core.cc
     src/core/client_core.cc
     src/core/node.cc)
-target_include_directories(firefly_core_objects PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+target_include_directories(firefly_core_objects PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(firefly_core_objects PUBLIC
     protobuf::libprotobuf Threads::Threads)
 target_compile_definitions(firefly_core_objects PUBLIC
@@ -50,9 +58,9 @@ target_compile_definitions(firefly_core_objects PUBLIC
 # 角色 object 可被同一测试进程显式链接两次（内存 + NNG），默认注入 object
 # 每个后端各一份，最终链接只能出现一份。
 function(configure_firefly_object target)
-  target_include_directories(${target} PUBLIC
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+  target_include_directories(${target} PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(${target} PUBLIC Threads::Threads)
   target_compile_definitions(${target} PUBLIC
       FIREFLY_WITH_NNG=${FIREFLY_WITH_NNG_DEFINE})
@@ -102,8 +110,7 @@ add_library(firefly_core STATIC
     $<TARGET_OBJECTS:firefly_memory_role_objects>
     $<TARGET_OBJECTS:firefly_memory_injection_objects>)
 target_include_directories(firefly_core PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(firefly_core PUBLIC protobuf::libprotobuf Threads::Threads)
 target_compile_definitions(firefly_core PUBLIC
     FIREFLY_WITH_NNG=${FIREFLY_WITH_NNG_DEFINE})
@@ -114,8 +121,7 @@ if(FIREFLY_WITH_NNG)
       $<TARGET_OBJECTS:firefly_nng_role_objects>
       $<TARGET_OBJECTS:firefly_nng_injection_objects>)
   target_include_directories(firefly_nng PUBLIC
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
   target_link_libraries(firefly_nng PUBLIC
       nng::nng protobuf::libprotobuf Threads::Threads)
   add_library(firefly::nng ALIAS firefly_nng)
@@ -134,8 +140,7 @@ add_library(firefly STATIC
     ${FIREFLY_BACKEND_OBJECTS})
 add_library(firefly::firefly ALIAS firefly)
 target_include_directories(firefly PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(firefly PUBLIC protobuf::libprotobuf Threads::Threads)
 target_compile_definitions(firefly PUBLIC
     FIREFLY_WITH_NNG=${FIREFLY_WITH_NNG_DEFINE})
@@ -145,6 +150,28 @@ endif()
 if(MSVC)
   target_compile_options(firefly PUBLIC /utf-8 /EHsc)
 endif()
+
+# 公开边界自检：对外 target 的 INTERFACE include 只能是 include/。若日后有人
+# 把 src/ 加回 PUBLIC，配置阶段直接失败，避免"消费者悄悄依赖私有布局"。
+function(firefly_assert_public_includes target)
+  if(NOT TARGET ${target})
+    return()
+  endif()
+  get_target_property(_public_includes ${target}
+                      INTERFACE_INCLUDE_DIRECTORIES)
+  foreach(_dir IN LISTS _public_includes)
+    string(FIND "${_dir}" "${CMAKE_CURRENT_SOURCE_DIR}/src" _src_pos)
+    if(NOT _src_pos EQUAL -1)
+      message(FATAL_ERROR
+          "${target} 对外暴露了 ${CMAKE_CURRENT_SOURCE_DIR}/src；"
+          "内部头路径只能经 firefly_internal 提供给测试")
+    endif()
+  endforeach()
+endfunction()
+
+firefly_assert_public_includes(firefly)
+firefly_assert_public_includes(firefly_core)
+firefly_assert_public_includes(firefly_nng)
 
 enable_testing()
 
@@ -161,6 +188,11 @@ function(add_firefly_test name source)
   target_link_libraries(${name} PRIVATE firefly test_messages)
   string(REGEX REPLACE "^firefly_" "" testname "${name}")
   add_test(NAME ${testname} COMMAND ${name})
+endfunction()
+
+# 测试特权：确需包含 core/、backends/ 内部头的用例显式声明，消费者拿不到。
+function(use_firefly_internal target)
+  target_link_libraries(${target} PRIVATE firefly_internal)
 endfunction()
 
 add_executable(firefly_header_check tests/header_check.cpp)
@@ -194,6 +226,7 @@ target_link_libraries(test_messages PUBLIC protobuf::libprotobuf)
 # 发现中心 / Reader / Service / Client 单元测试
 if(FIREFLY_WITH_NNG)
   add_firefly_test(firefly_discovery_test tests/integration/discovery_test.cpp)
+  use_firefly_internal(firefly_discovery_test)
 endif()
 add_firefly_test(firefly_e2e_test tests/integration/e2e_test.cpp)
 add_firefly_test(firefly_reader_test tests/integration/reader_test.cpp)
@@ -201,8 +234,11 @@ add_firefly_test(firefly_client_test tests/integration/client_test.cpp)
 
 # 阶段一验收：错误码 / Write 状态 / RPC 错误 / 空消息 / 旧 API
 add_firefly_test(firefly_error_code_test tests/error_code_test.cpp)
+use_firefly_internal(firefly_error_code_test)
 add_firefly_test(firefly_write_status_test tests/write_status_test.cpp)
+use_firefly_internal(firefly_write_status_test)
 add_firefly_test(firefly_rpc_error_test tests/rpc_error_test.cpp)
+use_firefly_internal(firefly_rpc_error_test)
 add_firefly_test(firefly_empty_message_test tests/empty_message_test.cpp)
 add_firefly_test(firefly_deprecated_compat_test tests/deprecated_compat_test.cpp)
 
@@ -217,7 +253,9 @@ add_firefly_test(firefly_callback_contract_test tests/callback_contract_test.cpp
 add_firefly_test(firefly_callback_context_test tests/callback_context_test.cpp)
 add_firefly_test(firefly_stats_test tests/stats_test.cpp)
 add_firefly_test(firefly_fake_transport_test tests/contract/fake_transport_test.cpp)
+use_firefly_internal(firefly_fake_transport_test)
 add_firefly_test(firefly_creation_failure_test tests/contract/creation_failure_test.cpp)
+use_firefly_internal(firefly_creation_failure_test)
 add_firefly_test(firefly_clear_wait_test tests/clear_wait_test.cpp)
 add_firefly_test(firefly_message_traits_test tests/message_traits_test.cpp)
 
@@ -225,10 +263,26 @@ add_firefly_test(firefly_message_traits_test tests/message_traits_test.cpp)
 add_firefly_test(firefly_review_regression_test tests/review_regression_test.cpp)
 add_firefly_test(firefly_concurrency_contract_test tests/contract/concurrency_contract_test.cpp)
 add_firefly_test(firefly_registry_contract_test tests/contract/registry_contract_test.cpp)
+use_firefly_internal(firefly_registry_contract_test)
+
+# G1 回归：Follower 定期对账必须能移除漏掉注销广播的过期记录，且查询
+# 失败时不得清空本地缓存。两个模式各自独立，进程内用临时端口，可并行。
+if(FIREFLY_WITH_NNG)
+  add_executable(firefly_follower_reconcile_test
+      tests/contract/follower_reconcile_test.cpp)
+  target_link_libraries(firefly_follower_reconcile_test
+      PRIVATE firefly test_messages)
+  use_firefly_internal(firefly_follower_reconcile_test)
+  add_test(NAME follower_reconcile_delete
+           COMMAND firefly_follower_reconcile_test delete)
+  add_test(NAME follower_reconcile_query_fail
+           COMMAND firefly_follower_reconcile_test query-fail)
+endif()
 
 # 共享后端契约：同一测试源分别用内存与 NNG 显式后端各跑一遍。
 add_executable(firefly_backend_contract_test tests/contract/backend_contract_test.cpp)
 target_link_libraries(firefly_backend_contract_test PRIVATE firefly test_messages)
+use_firefly_internal(firefly_backend_contract_test)
 if(FIREFLY_WITH_NNG)
   # 默认聚合库含 NNG 注入；这里补上内存角色 object（不含注入）避免符号重复。
   target_link_libraries(firefly_backend_contract_test PRIVATE
@@ -249,6 +303,7 @@ endif()
 if(FIREFLY_WITH_NNG)
   add_executable(firefly_interop_helper tests/integration/interop_helper.cpp)
   target_link_libraries(firefly_interop_helper PRIVATE firefly test_messages)
+  use_firefly_internal(firefly_interop_helper)
 
   # 跨进程两组用例：每组独立发现地址，可并行运行，不共享 RESOURCE_LOCK。
   if(NOT Python3_Interpreter_FOUND)

@@ -104,7 +104,7 @@ stateDiagram-v2
 
 默认 NNG 组合使用 Primary 与 Follower：第一个绑定发现地址的进程提供 REP 查询与 PUB 变更广播，其余进程用 REQ 查询并经 SUB 接收变更。Follower 首次 Watch 从 Primary 主动取得快照，并用本地修订记录保护查询期间已收到的变更。
 
-- 同一发现键的快照与增量应在有序派发域交付。查询开始后已观察到的更新或注销优先于旧快照。定期对账（3 秒）补充漏掉的新增记录；删除修复有缺口，见 [known-gaps.md](known-gaps.md) G1。
+- 同一发现键的快照与增量应在有序派发域交付。查询开始后已观察到的更新或注销优先于旧快照。定期对账（3 秒）以主实例的权威快照**双向**对账：补上漏广播的新增，并移除远端已不存在的记录；只有「查询成功」才具权威性，查询失败（超时/不可达）保留本地记录等下一轮。
 - `Query()`、Watch 记录与就绪判定需共同维护兼容性。`backend` 字段支持过滤，但 Core 的连接与就绪路径尚未统一应用（G2）。
 - `Clear()` 清理默认发现的记录与订阅，之后重新初始化可重启默认依赖。内存 Registry 可见范围限于进程内。数据端点绑定回环地址，发现 REP/PUB 地址由 `FIREFLY_DISCOVERY_REP_URL`、`FIREFLY_DISCOVERY_PUB_URL` 配置（后者只控制发现地址）。
 - Primary/Follower 角色在启动时确定。协议使用显式注册与注销，缺少进程租约回收与运行中 Primary 自动切换；部署时应把发现中心存续与端点存续视为独立状态。
@@ -154,10 +154,12 @@ Pub/Sub 与 RPC 请求携带 Protobuf 字节，零字节也是合法消息（全
 | 两个同通道 Reader 分属不同 Node，删一个不影响另一个 | `registry_contract_test::two_readers_isolated_deletion` |
 | Reader 启动后新增 Writer 能被最终发现 | `registry_contract_test::writer_added_after_reader_starts` |
 | Watch 一致初始快照与后续完整快照；`Clear()` 后迟到注销为 no-op 且可重启 | `registry_contract_test`、`clear_wait_test`、`discovery_test`、`review_regression_test` |
+| 漏掉注销广播后，定期对账以权威空快照移除过期记录；查询失败时保留本地记录 | `follower_reconcile_delete`、`follower_reconcile_query_fail`（`tests/contract/follower_reconcile_test.cpp`） |
 | 注册失败不留线程或监听器 | `registry_contract_test::register_failure_no_residual`、`creation_failure_test` |
 | 启动顺序恒为 Bind → Register → 启动工作线程 | `registry_contract_test`、`fake_transport_test` |
 | 同一份契约测试在内存与 NNG 两种组装下都通过 | `backend_contract_memory`、`backend_contract_nng`（同一 `tests/contract/backend_contract_test.cpp`） |
 | 公共头不泄漏后端实现；Core 不含 NNG 符号 | `no_leak_check`（`tools/check_no_leak.py`）、`header_check` |
+| 消费方只能包含 `include/` 下的公共头，`src/` 不进入 INTERFACE include | 配置期 `firefly_assert_public_includes()`；`header_check` 与示例仅用公共 include 编译 |
 | 旧版进程与新版进程双向 Pub/Sub 与 RPC 互通 | `cross_pubsub_legacy_to_new`、`cross_pubsub_new_to_legacy`、`cross_rpc_legacy_to_new`、`cross_rpc_new_to_legacy` |
 
 测试分组、运行命令与跨进程端口约定见 [guides/testing.md](../guides/testing.md)。
