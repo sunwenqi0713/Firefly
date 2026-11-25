@@ -60,6 +60,7 @@ ctest --test-dir build --output-on-failure
 | 开关 | 默认 | ON | OFF |
 | --- | --- | --- | --- |
 | `FIREFLY_WITH_NNG` | `ON` | `find_package(nng CONFIG REQUIRED)`，构建 `firefly_nng*`，默认注入 NNG | **不调用** `find_package(nng)`；默认注入内存后端；跳过直接依赖 NNG 的测试与示例 |
+| `BUILD_TESTING` | `ON` | 生成测试、契约用例与两个示例（示例复用 `tests/support` 的 proto） | **不查找 `protoc`**，不生成 `test_messages`、测试与示例，只产出 `firefly` / `firefly_core` / `firefly_nng` 三个库 |
 
 配置日志必须出现对应一行，这是排查「链接到了预期后端之外的东西」的第一判据：
 
@@ -88,7 +89,9 @@ ctest --test-dir build --output-on-failure
 | `core-tests` | 两种开关 | 不直接依赖 NNG 的测试；OFF 时默认注入为内存 |
 | `nng-tests` | 仅 ON | `discovery_test`、`interop_helper`、共享契约的 NNG 实例 |
 | `shared-backend-contract` | 内存实例始终；NNG 实例仅 ON | 同一份 `tests/contract/backend_contract_test.cpp` 两实例 |
-| `cross-process` | 仅 ON | 4 个两进程 CTest，端口对 37501–37508，`*_READY` 启动屏障 |
+| `cross-process` | 仅 ON | 7 个两进程 CTest，端口对 37501–37514，`*_READY` 启动屏障，计数由 `scripts/verify.sh` 从 CTest 注册表读取 |
+
+`-DBUILD_TESTING=OFF` 时以上分组全部不生成，`ctest` 显示 `Total Tests: 0`。
 
 细节与运行方式见 [testing.md](testing.md)。
 
@@ -132,6 +135,8 @@ bash scripts/verify.sh
 - [ ] 同一套上层调用在 NNG / 内存两种组装下通过同一套契约测试。
 - [ ] `ctest -j6` 连续两轮稳定；两个示例退出码 0。
 - [ ] 公共 API 签名、FFRP 帧、发现文本协议、payload 格式均未变。
+- [ ] `-DBUILD_TESTING=OFF` 的配置不查找 `protoc`，`ctest -N` 为 0 个用例。
+- [ ] `cmake --install` 产出头、三个库与包配置，独立工程 `find_package(firefly CONFIG)` 能构建并运行。
 
 测试抖动与环境限制见 [../architecture/known-gaps.md](../architecture/known-gaps.md) §三。
 
@@ -141,4 +146,23 @@ bash scripts/verify.sh
 doxygen Doxyfile          # 输出到 docs/api/，不入版本控制
 ```
 
-`Doxyfile` 只扫描 `include/firefly`，`WARN_AS_ERROR=YES`：文档告警即失败。注释规范见 [documentation.md](documentation.md) 第三步。
+`Doxyfile` 只扫描 `include/firefly`，`WARN_AS_ERROR=YES`：文档告警即失败。注释规范见 [documentation.md](documentation.md) 第三步。门禁镜像固定在 Ubuntu 24.04（Doxygen 1.9.x 基线），版本漂移会先于文档生成失败。
+
+## 10. 集成与安装
+
+两种接入方式共用同一份消费者代码，target 名一致：
+
+| 方式 | 用法 | 说明 |
+| --- | --- | --- |
+| `add_subdirectory` | `set(BUILD_TESTING OFF)` 后 `add_subdirectory(Firefly)`，链接 `firefly::firefly` | 不要求 `protoc`；`firefly_internal` 只对测试可见 |
+| `find_package` | `cmake --install build --prefix <prefix>`，再 `find_package(firefly CONFIG REQUIRED)` | 安装头、`lib/firefly{,_core,_nng}.lib` 与 `lib/cmake/firefly/` 包配置 |
+
+```cmake
+find_package(firefly CONFIG REQUIRED)
+target_link_libraries(app PRIVATE firefly::firefly)   # 默认后端
+# target_link_libraries(app PRIVATE firefly::core)    # 只含内存后端，从不依赖 NNG
+```
+
+包配置会 `find_dependency` 出 `protobuf`、`Threads`，ON 时还有 `nng`：消费方需自备这些依赖的 CMake 包（vcpkg 工具链即可）。
+
+**不要同时链接 `firefly::firefly` 与 `firefly::core`**：两者都包含 Core object，会重复定义符号；同理不要同时链接 `firefly::firefly` 与 `firefly::nng`。

@@ -219,7 +219,7 @@ class Node {
    * @retval kNotReady      firefly::Init() 未调用，或 Clear() 已执行。
    * @retval kInvalidName   通道名为空、过长、含非法字符，或命中服务通道保留后缀。
    * @retval kInvalidConfig QoS 非法，即 depth 为 0。
-   * @retval kDuplicate     本节点内该通道已有存活的 Writer。
+   * @retval kDuplicate     本节点内该通道已有存活的 Writer，或另一线程正在创建同名端点。
    * @retval 其它            端点初始化失败时透传底层错误码，message 含细节。
    */
   template <typename MessageT>
@@ -338,7 +338,7 @@ class Node {
    * @retval kOk           成功，value 为服务。
    * @retval kNotReady     firefly::Init() 未调用，或 Clear() 已执行。
    * @retval kInvalidName  服务名为空、过长或含非法字符。
-   * @retval kDuplicate    本节点内已有同名且存活的 Service。
+   * @retval kDuplicate    本节点内已有同名且存活的 Service，或另一线程正在创建同名端点。
    * @retval 其它           端点初始化失败时透传底层错误码，message 含细节。
    */
   template <typename Request, typename Response>
@@ -356,7 +356,7 @@ class Node {
    * @retval kOk           成功，value 为客户端。
    * @retval kNotReady     firefly::Init() 未调用，或 Clear() 已执行。
    * @retval kInvalidName  服务名非法。
-   * @retval kDuplicate    本节点内已有同名且存活的 Client。
+   * @retval kDuplicate    本节点内已有同名且存活的 Client，或另一线程正在创建同名端点。
    * @retval 其它           端点初始化失败时透传底层错误码，message 含细节。
    */
   template <typename Request, typename Response>
@@ -386,6 +386,57 @@ class Node {
   std::map<std::string, std::weak_ptr<ServiceBase>> services_;
   std::map<std::string, std::weak_ptr<ClientBase>> clients_;
 
+  // 进行中的创建占位，受 endpoints_mutex_ 保护。查重与占位必须在同一把锁内
+  // 完成：否则「查重通过 → 初始化 → 落表」这段窗口里，多个线程会各自通过
+  // 查重、各自创建成功，弱引用表最终只留下最后一个，DeleteXxx 再也定位不到
+  // 其余实例，同名查重也就永久失效了。
+  std::set<std::string> endpoints_creating_;
+
+  /// @brief 查重并占位；返回 false 表示已有存活端点或另一线程正在创建同名端点。
+  template <typename Map>
+  bool ReserveEndpoint(const std::string& key, const Map& endpoints) {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    if (endpoints_creating_.count(key) != 0) return false;
+    auto it = endpoints.find(key);
+    if (it != endpoints.end() && !it->second.expired()) return false;
+    endpoints_creating_.insert(key);
+    return true;
+  }
+
+  /// @brief 释放占位（创建失败或提前返回）。
+  void AbandonEndpoint(const std::string& key) {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    endpoints_creating_.erase(key);
+  }
+
+  /// @brief 创建成功：落表并释放占位。同一把锁内完成，不存在「无占位也未落表」的可见窗口。
+  template <typename Map, typename Endpoint>
+  void PublishEndpoint(const std::string& key, Map* endpoints,
+                       const std::shared_ptr<Endpoint>& endpoint) {
+    std::lock_guard<std::mutex> lg(endpoints_mutex_);
+    (*endpoints)[key] = endpoint;
+    endpoints_creating_.erase(key);
+  }
+
+  /// @brief 占位的作用域守卫：未 Disarm() 时析构即释放占位。
+  class Reservation {
+   public:
+    Reservation(Node* owner, std::string key)
+        : owner_(owner), key_(std::move(key)) {}
+    ~Reservation() {
+      if (active_) owner_->AbandonEndpoint(key_);
+    }
+    Reservation(const Reservation&) = delete;
+    Reservation& operator=(const Reservation&) = delete;
+    /// @brief 落表成功后解除守卫，避免重复释放（可能误删后来者的占位）。
+    void Disarm() { active_ = false; }
+
+   private:
+    Node* owner_;
+    std::string key_;
+    bool active_ = true;
+  };
+
   // 内部实现：拓扑注册与服务发现等元信息。
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -404,15 +455,12 @@ Result<std::shared_ptr<Writer<MessageT>>> Node::CreateWriter(
     const ChannelConfig& config) {
   using R = Result<std::shared_ptr<Writer<MessageT>>>;
   const std::string key = "W:" + config.channel_name;
-  {
-    std::lock_guard<std::mutex> lg(endpoints_mutex_);
-    auto it = writers_.find(key);
-    if (it != writers_.end() && !it->second.expired()) {
-      return R{nullptr, ErrorCode::kDuplicate,
-               "CreateWriter[channel='" + config.channel_name + "', node='" +
-                   node_name_ + "']: a Writer already exists on this channel"};
-    }
+  if (!ReserveEndpoint(key, writers_)) {
+    return R{nullptr, ErrorCode::kDuplicate,
+             "CreateWriter[channel='" + config.channel_name + "', node='" +
+                 node_name_ + "']: a Writer already exists on this channel"};
   }
+  Reservation reservation(this, key);
   if (!OK()) {
     return R{nullptr, ErrorCode::kNotReady,
              "CreateWriter: firefly::Init() has not been called (or Clear() "
@@ -438,10 +486,8 @@ Result<std::shared_ptr<Writer<MessageT>>> Node::CreateWriter(
              detail::CreateFailMessage("CreateWriter", config.channel_name, ec,
                                        writer->InitErrorMessage())};
   }
-  {
-    std::lock_guard<std::mutex> lg(endpoints_mutex_);
-    writers_[key] = writer;
-  }
+  PublishEndpoint(key, &writers_, writer);
+  reservation.Disarm();
   return R{writer, ErrorCode::kOk, ""};
 }
 
@@ -511,15 +557,12 @@ Result<std::shared_ptr<Service<Request, Response>>> Node::CreateService(
     const typename Service<Request, Response>::ServiceCallback& service_callback) {
   using R = Result<std::shared_ptr<Service<Request, Response>>>;
   const std::string key = "S:" + service_name;
-  {
-    std::lock_guard<std::mutex> lg(endpoints_mutex_);
-    auto it = services_.find(key);
-    if (it != services_.end() && !it->second.expired()) {
-      return R{nullptr, ErrorCode::kDuplicate,
-               "CreateService[service='" + service_name + "', node='" +
-                   node_name_ + "']: a Service already exists with this name"};
-    }
+  if (!ReserveEndpoint(key, services_)) {
+    return R{nullptr, ErrorCode::kDuplicate,
+             "CreateService[service='" + service_name + "', node='" +
+                 node_name_ + "']: a Service already exists with this name"};
   }
+  Reservation reservation(this, key);
   if (!OK()) {
     return R{nullptr, ErrorCode::kNotReady,
              "CreateService: firefly::Init() has not been called (or Clear() "
@@ -539,10 +582,8 @@ Result<std::shared_ptr<Service<Request, Response>>> Node::CreateService(
              detail::CreateFailMessage("CreateService", service_name, ec,
                                        service->InitErrorMessage())};
   }
-  {
-    std::lock_guard<std::mutex> lg(endpoints_mutex_);
-    services_[key] = service;
-  }
+  PublishEndpoint(key, &services_, service);
+  reservation.Disarm();
   return R{service, ErrorCode::kOk, ""};
 }
 
@@ -551,15 +592,12 @@ Result<std::shared_ptr<Client<Request, Response>>> Node::CreateClient(
     const std::string& service_name) {
   using R = Result<std::shared_ptr<Client<Request, Response>>>;
   const std::string key = "C:" + service_name;
-  {
-    std::lock_guard<std::mutex> lg(endpoints_mutex_);
-    auto it = clients_.find(key);
-    if (it != clients_.end() && !it->second.expired()) {
-      return R{nullptr, ErrorCode::kDuplicate,
-               "CreateClient[service='" + service_name + "', node='" +
-                   node_name_ + "']: a Client already exists for this service"};
-    }
+  if (!ReserveEndpoint(key, clients_)) {
+    return R{nullptr, ErrorCode::kDuplicate,
+             "CreateClient[service='" + service_name + "', node='" +
+                 node_name_ + "']: a Client already exists for this service"};
   }
+  Reservation reservation(this, key);
   if (!OK()) {
     return R{nullptr, ErrorCode::kNotReady,
              "CreateClient: firefly::Init() has not been called (or Clear() "
@@ -579,10 +617,8 @@ Result<std::shared_ptr<Client<Request, Response>>> Node::CreateClient(
              detail::CreateFailMessage("CreateClient", service_name, ec,
                                        client->InitErrorMessage())};
   }
-  {
-    std::lock_guard<std::mutex> lg(endpoints_mutex_);
-    clients_[key] = client;
-  }
+  PublishEndpoint(key, &clients_, client);
+  reservation.Disarm();
   return R{client, ErrorCode::kOk, ""};
 }
 

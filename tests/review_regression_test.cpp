@@ -84,7 +84,9 @@ static int TestCancelBeforeSend() {
   // 第一条请求占用连接（同步发送，后台线程持有 io_mutex_）。
   auto h1 = cli->AsyncSendRequest(MakeReq(1, 1), std::chrono::milliseconds(3000));
   // 等 h1 真正进入服务端回调（executed 已计 1），确保第二条会排队。
-  for (int i = 0; i < 300 && !first_entered.load(); ++i) {
+  // 这是"等待条件成立"而不是断言时长：给 3s 上限只为消除高负载下的启动抖动
+  // （-j6 时 300ms 曾出现偶发失败），请求没送到服务端仍然会失败。
+  for (int i = 0; i < 3000 && !first_entered.load(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   if (int e = Check(first_entered.load(), 51)) return e;

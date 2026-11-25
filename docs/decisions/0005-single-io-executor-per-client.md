@@ -19,19 +19,21 @@
 边界：
 
 1. 每个 Client 队列最多保留 **64 条待取请求**，另有一条可由执行者处理；队列满以 `kQueueFull` 明确失败，不阻塞调用方。
-2. 入队时确定**绝对 deadline**（`steady_clock::time_point`），覆盖排队、发现查询、连接、发送、接收全流程；出队时先检查剩余预算。
-3. 请求状态机 `kQueued → kSending → kDone`，终态兑现且仅兑现一次；`kCancelled` 是本地终态，不进入协议帧。
-4. 取消分两阶段：排队中取消 = 请求跳过传输；已进入 `kSending` 后取消 = 只结束本地等待，服务端仍可能执行。
+2. 入队时确定**绝对 deadline**（`steady_clock::time_point`），覆盖排队、发现查询、连接、发送、接收全流程；排队到期由**独立的到期线程**在该时间点兑现，出队时再检查剩余预算。
+3. 请求状态机 `kQueued → kStarting → kSending → kDone`，终态兑现且仅兑现一次；`kCancelled` 是本地终态，不进入协议帧。
+4. 取消按**唯一提交点**（`CommitSend`）分两阶段：提交前取消（排队或发现阶段）= 请求跳过传输，服务端执行次数为 0；越过提交点后取消 = 只结束本地等待，服务端仍可能执行。
 5. 端点是并行单位：不同 Client、不同 Reader、不同 Service 之间可并行；同一端点内串行。
-6. `Close()` 不得提前关闭 socket：必须等在途 `Exchange` 返回后再关 requester，否则在途请求的响应会丢在没有 socket 的窗口里。
+6. 关停时**先取消并兑现**全部请求，再关闭 requester 以唤醒仍在 `Exchange` 里的 I/O，最后 join 执行者。关闭 socket 不再等待请求自然到期：兑现权已被取消取走，丢失的迟到响应无人关心（2026-11-25 修订，原第 6 条要求等 `Exchange` 返回后再关）。
 
 ## 后果
 
 - **正面**：不需要在「发送」与「兑现」之间做复杂同步；请求关联与回调顺序由单端点定义，用户可预期。
 - **正面**：队列有界，内存增长可预测；满时失败而非无限排队。
 - **负面 / 成本**：**慢请求阻塞同一 Client 的后续请求**，慢回调延后同一端点的下一条消息。需要并发的场景必须由业务拆多个 Client。
-- **负面 / 成本**：关停时长受在途 `Exchange`、发现查询与同步拨号影响，可能出现「timeout 已到但调用方仍在等」（见 known-gaps G3）。
-- **如何验证仍被遵守**：`concurrency_contract_test`（排队取消/到期不发送、只兑现一次、队列满、旧句柄失效）、`backend_contract_test::absolute_deadline` / `callback_order` / `response_matching`、`request_cancel_test`。
+- **负面 / 成本**：同一 Client 的请求仍串行占用执行者；但排队请求在各自的 deadline 兑现 `kTimeout`，不必等前一条完成。
+- **负面 / 成本**：每个 Client 多一条到期线程，用固定成本换取"排队到期与执行者进度解耦"。
+- **负面 / 成本**：关停已能唤醒在途 I/O；剩余偏差来自 `IRegistry::Query` 不接收 deadline，发现查询最长可阻塞到发现层超时（known-gaps G3）。
+- **如何验证仍被遵守**：`concurrency_contract_test`（排队取消/到期不发送、只兑现一次、队列满、旧句柄失效）、`rpc_timing_test`（排队到期按 deadline 兑现、提交点前取消零发送、关停唤醒在途 I/O）、`backend_contract_test::absolute_deadline` / `late_response_isolation` / `callback_order` / `response_matching`、`request_cancel_test`。
 
 ## 备选方案
 
@@ -46,3 +48,4 @@
 | 日期 | 变更 | 原因 |
 | --- | --- | --- |
 | 2026-11-24 | 初版（从架构文档与规划稿抽取） | 决策单独留存，现状留在 contracts.md |
+| 2026-11-25 | 增加 `kStarting` 与唯一提交点；排队到期改由独立到期线程兑现；第 6 条反转为"关停先兑现再关适配器" | 原实现让排队请求等执行者空闲后才兑现、`kSending` 在发现查询前建立、关停要等在途 Exchange 自然到期，调用方等待时间与取消承诺都无法验证 |

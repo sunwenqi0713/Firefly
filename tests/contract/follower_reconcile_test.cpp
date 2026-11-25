@@ -6,8 +6,11 @@
 //                 Reader 会一直 dial 过期地址。
 //   query-fail —— 主实例暂时不可达（查询超时）。这时的空结果是"没查到"，
 //                 不是"没有记录"，Follower 必须保留本地缓存，等下一轮再试。
+//   escaped-name —— 广播字段必须能承载含 '|' 与 '\' 的通道名（公开名称校验
+//                 只拒绝控制字符与空格）。旧实现直接按 '|' 切分，这种名称
+//                 会字段错位、std::stoull 抛异常终止发现线程。
 //
-// 用法：follower_reconcile_test [delete|query-fail]
+// 用法：follower_reconcile_test [delete|query-fail|escaped-name]
 #include "backends/nng/registry.h"
 
 #include <atomic>
@@ -73,6 +76,12 @@ class FakePrimary {
 
   const std::string& rep_url() const { return rep_url_; }
   const std::string& pub_url() const { return pub_url_; }
+
+  // 在 PUB 端口上发一条广播（Follower 未连上时 PUB 会丢弃，调用方需重试）。
+  void Publish(const std::string& note) {
+    if (pub_.id == 0) return;
+    nng_send(pub_, const_cast<char*>(note.data()), note.size(), 0);
+  }
 
  private:
   void Serve() {
@@ -159,6 +168,11 @@ class WatchProbe {
     return Size() == expected;
   }
 
+  EndpointRecord Last() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_.empty() ? EndpointRecord{} : last_.front();
+  }
+
  private:
   std::mutex mutex_;
   std::vector<EndpointRecord> last_;
@@ -170,25 +184,59 @@ class WatchProbe {
 
 int main(int argc, char** argv) {
   const std::string mode = argc > 1 ? argv[1] : "delete";
+  const bool escaped = mode == "escaped-name";
 
   FakePrimary primary;
   if (!primary.Start()) return 1;
-  primary.SetRecords({{7, "tcp://127.0.0.1:40901"}});
+  // escaped-name 依赖广播建立记录，初始快照必须为空；其余模式用一条既有记录
+  // 验证初始快照来自对主实例的主动查询。
+  if (!escaped) primary.SetRecords({{7, "tcp://127.0.0.1:40901"}});
 
   Registry::Configure(primary.rep_url(), primary.pub_url());
   Registry& reg = Registry::instance();
   if (!reg.Start()) return 2;
 
+  // 通道名含 '|' 与 '\'：公开名称校验允许它们，广播必须转义字段才不会错位。
+  const std::string escaped_name = "loss|delete\\x";
+  const std::string watch_name = escaped ? escaped_name : "lost-delete";
+
   WatchProbe probe;
   const int watch = reg.Watch(
-      Kind::kWriter, "lost-delete",
+      Kind::kWriter, watch_name,
       [&probe](const std::vector<EndpointRecord>& snapshot) {
         probe.Update(snapshot);
       });
   if (watch == 0) return 3;
 
-  // 初始快照必须来自主实例的主动查询（本地只有空缓存）。
-  if (!probe.WaitSize(1, 5000ms)) return 4;
+  if (escaped) {
+    // 线上帧（已转义）：A|writer|loss\|delete\\x|tcp://...|4242|nng
+    const std::string address = "tcp://127.0.0.1:40902";
+    const std::string note =
+        "A|writer|loss\\|delete\\\\x|" + address + "|4242|nng";
+    bool seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + 5000ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+      primary.Publish(note);  // 未连上时 PUB 丢弃，重试直到订阅生效
+      if (probe.WaitSize(1, 100ms)) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) return 11;
+    const EndpointRecord rec = probe.Last();
+    // 名称与地址必须原样还原：任一处没有转义，字段就会切错位。
+    if (rec.name != escaped_name) return 12;
+    if (rec.address != address) return 13;
+    if (rec.id != 4242 || rec.backend != "nng") return 14;
+    // 让主实例也列出该记录，确认它能在随后一轮对账中存活（名称含 '|' 也
+    // 不影响按 id/地址对账）。
+    primary.SetRecords({{4242, address}});
+    std::this_thread::sleep_for(4000ms);
+    if (probe.Size() != 1) return 15;
+  } else if (!probe.WaitSize(1, 5000ms)) {
+    // 初始快照必须来自主实例的主动查询（本地只有空缓存）。
+    return 4;
+  }
 
   if (mode == "delete") {
     // 端点已注销、删除广播丢失：主实例的权威快照为空。
@@ -206,6 +254,8 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(5000ms);
     if (probe.SawEmpty()) return 8;
     if (probe.Size() != 1) return 9;
+  } else if (escaped) {
+    // 断言已在上面的广播分支里完成。
   } else {
     return 10;
   }

@@ -26,7 +26,7 @@ flowchart TD
 | 公共接口用 Protobuf 类型表达消息，Core 与后端一律以字节处理 | 调用方获得类型化 API，Core 与具体消息类解耦。通信两端仍需自行保持消息 schema 兼容 | [ADR-0002](../decisions/0002-split-transport-and-discovery-contracts.md) |
 | 传输与发现分别注入 | 同一发现实现可被不同传输配置复用，也可分别替换与测试。跨后端部署需在发现记录中标识兼容的数据平面 | [ADR-0002](../decisions/0002-split-transport-and-discovery-contracts.md) |
 | 传输按四种通信角色建模（发布/订阅/请求/应答） | Core 直接表达四类需求；适配器自行管理 socket、连接与协议状态，并承担与 Firefly 语义之间的转换 | [ADR-0003](../decisions/0003-four-role-transport-interfaces.md) |
-| 每 Client 单 I/O 执行者，每 Reader 与 Service 串行处理 | 请求关联与回调顺序由单端点定义。慢请求阻塞同一 Client 的后续请求，慢回调延后同一端点的下一条消息；不同端点并行 | [ADR-0005](../decisions/0005-single-io-executor-per-client.md) |
+| 每 Client 单 I/O 执行者，每 Reader 与 Service 串行处理 | 请求关联与回调顺序由单端点定义。慢请求占用执行者，后续请求仍在各自 deadline 上兑现 `kTimeout`；慢回调延后同一端点的下一条消息；不同端点并行 | [ADR-0005](../decisions/0005-single-io-executor-per-client.md) |
 | 默认后端由链接配置选定 | 应用使用同一公开入口，测试可显式构造多个后端实例；每个链接产物只包含一套同名的默认注入符号 | [ADR-0003](../decisions/0003-four-role-transport-interfaces.md) |
 | 发现层用 `EndpointRecord` 记录模型，按 `id` 注销 | 同键多记录、Reader 无地址也能独立登记；代价是发现侧协议需要携带可选 `id`/`backend` 字段 | [ADR-0004](../decisions/0004-endpoint-record-discovery-model.md) |
 | 不引入第三套生产后端（ZeroMQ） | 第二后端已证明传输可替换；第三后端只带来部署面收益与永久翻倍维护成本 | [ADR-0006](../decisions/0006-no-third-backend-zmq.md) |

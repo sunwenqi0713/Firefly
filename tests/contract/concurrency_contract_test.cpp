@@ -217,17 +217,16 @@ int TestRpcQueuedCancelAndExpiry() {
     return e;
   }
   auto expired = cli->AsyncSendRequest(MakeReq(3, 3), 50ms);
-  // 执行者忙时，排队请求在截止时间之后才会因出队检查而兑现；此处先确认它
-  // 仍未被兑现，再放行首个请求，确保它出队时已过期。
-  if (int e = Check(expired.future.wait_for(100ms) == std::future_status::timeout,
+  // 执行者被首个请求占住时，排队到期由独立的到期线程兑现：future 必须在
+  // 截止时间附近就绪，而不是等第一个请求放行后才发现已经过期。
+  if (int e = Check(expired.future.wait_for(500ms) == std::future_status::ready,
                     74)) {
     return e;
   }
-  release.set_value();
-  // 排队中的过期请求出队时即被丢弃，服务端 0 次执行。
   if (int e = Check(SettledCode(expired.future) == ErrorCode::kTimeout, 75)) {
     return e;
   }
+  release.set_value();
   if (int e = Check(SettledCode(first.future) == ErrorCode::kOk, 76)) return e;
   // 被取消和过期的两个请求都不得进入服务端回调。
   if (int e = Check(executed.load() == 1, 77)) return e;

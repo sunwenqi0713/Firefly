@@ -14,13 +14,15 @@
 
 节点名在进程内查重。端点名查重以 **Node、端点角色、逻辑名称**为范围。跨进程同名服务可共存。
 
+**并发创建同名端点只有一次成功。** 查重与占位在同一临界区内完成，创建成功后再落表；因此在「查重 → 初始化 → 落表」窗口内到达的同名请求不会一起成功，而是返回 `kDuplicate`。落表前释放占位，落表后名字即可被 `DeleteXxx()` 或最后一个外部引用释放所回收。
+
 **全局 `Shutdown()` 只置标志，不级联关闭端点。** 应用需自行停止端点再调用 `Clear()`；该限制见 [known-gaps.md](known-gaps.md) G7。
 
 ## 2. 启动与关停次序
 
 1. `Init()` 引导默认依赖。NNG Registry 在首次发现操作时启动。Writer 与 Service 先取得监听地址再登记，Reader 先独立登记再建立 Watch。Worker 启动失败时，已建立的监听、注册与订阅须回滚。
 2. 停止 Reader 或 Service：先阻止接收循环继续运行，调用角色 `Close()` 唤醒阻塞操作，再等待非当前工作线程退出并解除发现关系。若在自身回调线程上触发关闭，跳过等待自身的步骤，循环在回调返回后退出。
-3. Client 关闭：停止接纳，取消并兑现待处理请求，清空队列。等待在途 `Exchange` 返回后才关闭 requester，因此关停时长还受发现查询与传输等待影响。
+3. Client 关闭：停止接纳，以 `kCancelled` 兑现全部排队与在途请求（每条只兑现一次），关闭适配器唤醒仍在 `Exchange` 里的 I/O，再等待执行者退出。关停不等待在途请求自然到期，因此也不受发现查询与传输等待支配。
 4. 全局 `Shutdown()` 触发进程级信号；应用用端点级关闭控制已有通信，随后调用 `Clear()`。全局清理重置默认发现并等待已登记的 Reader 与 Service 的在途回调。释放资源后要停止后续派发，应先关闭相应端点。
 
 ## 3. 并发与执行位置
@@ -75,26 +77,32 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Queued: 接纳请求
-    Queued --> Done: 取消获胜
-    Queued --> Sending: 执行者取得请求
+    [*] --> Queued: 接纳请求（确定绝对 deadline）
+    Queued --> Starting: 执行者取得请求
+    Queued --> Done: 排队到期 / 排队中取消
+    Starting --> Sending: CommitSend（唯一提交点）
+    Starting --> Done: 发现阶段取消
     Sending --> Done: 响应或失败
-    Sending --> Done: 本地取消获胜
+    Sending --> Done: 本地取消（远端可能已执行）
     Done --> [*]
 ```
 
-同步请求等待内部 future；异步请求返回带 ID、future 与取消操作的句柄。每个 Client 队列最多保留 **64 条待取请求**，另有一条可由执行者处理。入队时确定绝对 deadline，执行者依次检查剩余预算、查询服务并执行 `Exchange()`；Requester 用同一绝对时间点计算剩余收发预算。Responder 交给 Core 的 `ReplyToken` 对应本次请求，完成后由原 Responder 消费。
+同步请求等待内部 future；异步请求返回带 ID、future 与取消操作的句柄。每个 Client 队列最多保留 **64 条待取请求**，另有一条可由执行者处理。入队时确定唯一的绝对 deadline：排队到期由**独立的到期线程**在该时间点兑现 `kTimeout`，与执行者是否被前一条请求占住无关；执行者出队后重算剩余预算，再查询服务，`CommitSend` 之后调用 `Exchange()`。Requester 用同一绝对时间点计算连接、发送、接收的剩余预算。Responder 交给 Core 的 `ReplyToken` 对应本次请求，完成后由原 Responder 消费。
 
 | 事件 | 调用方结果 | 对端执行边界 |
 | --- | --- | --- |
+| 排队期间到期 | future 以 `kTimeout` 兑现，按 deadline 兑现 | 该请求跳过传输 |
 | 排队期间取消获胜 | future 以 `kCancelled` 兑现 | 该请求跳过传输 |
-| 进入 `kSending` 后取消获胜 | future 以 `kCancelled` 兑现，迟到结果被丢弃 | 服务端仍可能执行。`kSending` 在发现查询前建立，实际 socket 发送可能尚未发生 |
-| 出队时已过期 | `kTimeout` | 该请求跳过传输 |
+| `kStarting`（发现阶段）取消获胜 | future 以 `kCancelled` 兑现 | `CommitSend` 失败，**后端发送次数为 0** |
+| 提交点处预算已耗尽 | `kTimeout` | 该请求跳过传输 |
+| 进入 `kSending` 后取消 | future 以 `kCancelled` 兑现，迟到结果被丢弃 | 服务端可能已执行。提交点已越过，本地不再阻止发送 |
 | `Exchange` 等待响应超时或连接失配 | `kTimeout` 或映射后的传输错误 | 远端执行结果可能未知。NNG 在失配后重建请求 socket；内存后端用每请求响应对象隔离结果 |
 | 当前服务无记录或队列已满 | `kServiceNotFound` 或 `kQueueFull` | 请求未提交到服务端 |
 | 收到合法响应 | 成功值或响应携带的业务错误码 | 只兑现当前请求一次。帧格式或解码失败返回 `kSerialization` |
 
-**时间边界。** 排队请求的过期由执行者出队检查，发现查询不接收请求 deadline，NNG 首次拨号也是同步调用；传入的 timeout 因此可能短于调用方实际等待时间。后端接入须保留响应关联与绝对预算传递。有副作用的请求应使用幂等键或明确的重试策略。
+**时间边界。** `CommitSend` 是唯一提交点：之前的取消保证服务端 0 次执行；之后只能结束本地等待，远端结果未知。排队到期不依赖执行者进度，因此传入的 timeout 就是调用方的等待上限。发现查询本身不接收 deadline（`IRegistry::Query` 无时间参数），一次调用最长可阻塞到发现层自身超时后再被判过期，这是 G3 的剩余部分。后端接入须保留响应关联与绝对预算传递。有副作用的请求应使用幂等键或明确的重试策略。
+
+**关停。** `Client::Shutdown()` 先以 `kCancelled` 兑现全部排队与在途请求（每条只兑现一次），再关闭适配器唤醒仍在 `Exchange` 里的 I/O，最后等待执行者退出；不等待在途请求自然到期。
 
 **服务可用性。** `ServiceIsReady()` 与 `WaitForService()` 基于发现记录。发起调用时 Client 重新查询并使用结果的第一条服务地址；有记录只表示服务可被发现，连接与调用结果由随后的 `Exchange` 决定。
 
@@ -146,7 +154,10 @@ Pub/Sub 与 RPC 请求携带 Protobuf 字节，零字节也是合法消息（全
 | 排队期间取消或到期，服务端执行次数为 0 | `concurrency_contract_test::rpc_queued_cancel_and_expiry`、`request_cancel_test` |
 | 每个请求只兑现一次；队列满以 `kQueueFull` 明确失败 | `concurrency_contract_test::rpc_settle_once_queue_full_stale_handle`、`concurrency_contract_test::rpc_queue_full` |
 | Client 销毁或重建后，旧 `RequestHandle::Cancel()` 返回 false | `concurrency_contract_test::rpc_settle_once_queue_full_stale_handle`、`request_cancel_test` |
-| 同步与异步共用有界队列与单 I/O 执行者；绝对 deadline 覆盖查询/连接/收发 | `concurrency_contract_test`、`backend_contract_test::absolute_deadline` |
+| 同步与异步共用有界队列与单 I/O 执行者；绝对 deadline 覆盖查询/连接/收发 | `concurrency_contract_test`、`backend_contract_test::absolute_deadline`、`rpc_timing_test::queued_deadline_settles_on_time` |
+| 提交点之前的取消不产生任何后端发送 | `rpc_timing_test::cancel_before_commit_no_send`、`review_regression_test`、`backend_contract_test::cancelled_request` |
+| 关停唤醒在途 I/O，且每条请求只兑现一次 | `rpc_timing_test::shutdown_releases_inflight`、`concurrency_contract_test::rpc_settle_once_queue_full_stale_handle`、`request_cancel_test` |
+| 超时后到达的响应不得污染下一条请求 | `backend_contract_test::late_response_isolation`、`response_matching` |
 | 四角色 `Close()` 幂等、可跨线程唤醒阻塞 I/O；此后返回 `kClosed` | `backend_contract_test::close_and_deadline`、`fake_transport_test` |
 | 响应与请求一一对应，`ReplyToken` 不跨请求复用 | `backend_contract_test::response_matching` |
 | 同一端点的回调串行；不同端点可并行 | `backend_contract_test::callback_order`、`callback_contract_test` |
@@ -155,6 +166,8 @@ Pub/Sub 与 RPC 请求携带 Protobuf 字节，零字节也是合法消息（全
 | Reader 启动后新增 Writer 能被最终发现 | `registry_contract_test::writer_added_after_reader_starts` |
 | Watch 一致初始快照与后续完整快照；`Clear()` 后迟到注销为 no-op 且可重启 | `registry_contract_test`、`clear_wait_test`、`discovery_test`、`review_regression_test` |
 | 漏掉注销广播后，定期对账以权威空快照移除过期记录；查询失败时保留本地记录 | `follower_reconcile_delete`、`follower_reconcile_query_fail`（`tests/contract/follower_reconcile_test.cpp`） |
+| 并发创建同名端点只有一次成功，其余返回 `kDuplicate`；释放后可重建 | `duplicate_test`（`concurrent_duplicate`） |
+| 广播帧字段转义：名称含 `\|` 与 `\` 时按原样落表，且不终止发现线程 | `follower_reconcile_escaped_name` |
 | 注册失败不留线程或监听器 | `registry_contract_test::register_failure_no_residual`、`creation_failure_test` |
 | 启动顺序恒为 Bind → Register → 启动工作线程 | `registry_contract_test`、`fake_transport_test` |
 | 同一份契约测试在内存与 NNG 两种组装下都通过 | `backend_contract_memory`、`backend_contract_nng`（同一 `tests/contract/backend_contract_test.cpp`） |

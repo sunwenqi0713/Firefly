@@ -18,7 +18,9 @@ jobs:
   gate:
     name: 文档结构与注释门禁
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    # 固定镜像：ubuntu-24.04 的软件源提供 Doxygen 1.9.8（门禁基线 1.9.x）；
+    # ubuntu-latest 已滚动到 1.15，会让版本校验先于文档生成失败。
+    runs-on: ubuntu-24.04
     steps:
       - name: 检出
         uses: actions/checkout@v4

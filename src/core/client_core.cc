@@ -44,20 +44,29 @@ ErrorCode MapExchangeStatus(TransferStatus status) noexcept {
 }
 
 // 请求状态机（stage 与 on_settled 由同一把锁保护）：
-//   kQueued --TryStartSending--> kSending --> kDone（Settle）
-//   kQueued / kSending --Cancel--> kDone（立即兑现 kCancelled）
-// 因此"取消与发送谁先发生"只有一次裁决，且每请求只兑现一次。
-// 排队中取消：TryStartSending 返回 false，请求从发送路径移除，服务端 0 次。
-// 已提交发送后取消：只结束本地等待，发送与接收继续进行，服务端仍可能执行。
+//   kQueued --Begin--> kStarting --CommitSend--> kSending --> kDone（Settle）
+//   kQueued / kStarting --Cancel--> kDone（未提交，服务端 0 次）
+//   kSending --Cancel--> kDone（已提交，只结束本地等待，远端可能执行）
+// 因此"取消能否阻止发送"只有一次裁决：CommitSend 是唯一提交点。提交之前的
+// 取消一定不会触碰传输；提交之后本地仍可提前结束等待，但远端是否执行未知。
 struct PendingCall {
-  enum class Stage { kQueued, kSending, kDone };
+  enum class Stage { kQueued, kStarting, kSending, kDone };
 
   explicit PendingCall(OnSettledFunc cb) : on_settled(std::move(cb)) {}
 
-  // 执行者出队后、真正 Send 前调用。
-  bool TryStartSending() {
+  // 执行者出队后取得处理权；返回 false 表示排队期间已被取消。
+  bool Begin() {
     std::lock_guard<std::mutex> lock(state_mutex);
     if (stage != Stage::kQueued) return false;
+    stage = Stage::kStarting;
+    return true;
+  }
+
+  // 提交点：预算检查与服务发现已通过、即将调用后端 Exchange。返回 false
+  // 表示取消在此前获胜，调用方不得发送。
+  bool CommitSend() {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    if (stage != Stage::kStarting) return false;
     stage = Stage::kSending;
     return true;
   }
@@ -104,9 +113,13 @@ struct ClientCore final : ClientHandle {
     ShutdownInternal();
     // 仅当析构发生在 I/O 线程内（兑现回调释放最后引用）时无法 join 自身。
     if (io_thread_.joinable()) io_thread_.detach();
+    if (expiry_thread_.joinable()) expiry_thread_.detach();
   }
 
-  void StartIo() { io_thread_ = std::thread([this] { IoLoop(); }); }
+  void StartIo() {
+    io_thread_ = std::thread([this] { IoLoop(); });
+    expiry_thread_ = std::thread([this] { ExpiryLoop(); });
+  }
 
   static int RemainingMs(Deadline deadline) {
     const auto now = std::chrono::steady_clock::now();
@@ -115,35 +128,32 @@ struct ClientCore final : ClientHandle {
                                 deadline - now).count());
   }
 
-  // 一次请求的 Core 侧 I/O 路径：服务查询与整体预算在 Core，连接/重连/
-  // 发送/接收以及各步剩余预算在 RpcRequester 适配器内。PendingCall 的取消
-  // 裁决仍在 IoLoop 中完成，适配器完全不感知取消状态。
-  WireResponse Exchange(const std::string& bytes, Deadline deadline) {
-    WireResponse out;
+  // 阶段一：预算检查与服务发现。不触碰传输，因此这一阶段获胜的取消必然
+  // 让服务端执行次数为 0。发现查询本身不接收 deadline（见 known-gaps G3），
+  // 但返回后立刻重算预算：一旦过期就不再提交发送。
+  ErrorCode ResolveTarget(const QueuedCall& call, std::string* address) {
     if (shutdown_requested_.load(std::memory_order_acquire)) {
-      out.code = ErrorCode::kNotReady;
-      return out;
+      return ErrorCode::kNotReady;
     }
-    if (RemainingMs(deadline) <= 0) {
-      out.code = ErrorCode::kTimeout;
-      return out;
-    }
+    if (RemainingMs(call.deadline) <= 0) return ErrorCode::kTimeout;
     auto records = registry->Query(RegistryKind::kService, service_name);
-    if (RemainingMs(deadline) <= 0) {
-      out.code = ErrorCode::kTimeout;
-      return out;
-    }
-    if (records.empty()) {
-      out.code = ErrorCode::kServiceNotFound;
-      return out;
-    }
     if (shutdown_requested_.load(std::memory_order_acquire)) {
-      out.code = ErrorCode::kNotReady;
-      return out;
+      return ErrorCode::kNotReady;
     }
+    if (RemainingMs(call.deadline) <= 0) return ErrorCode::kTimeout;
+    if (records.empty()) return ErrorCode::kServiceNotFound;
+    *address = records.front().address;
+    return ErrorCode::kOk;
+  }
+
+  // 阶段二：已过提交点。连接/重连/发送/接收以及各步剩余预算由适配器在
+  // 同一绝对 deadline 上完成；Core 只映射返回值与解帧。
+  WireResponse ExchangeCommitted(const std::string& address,
+                                 const std::string& bytes, Deadline deadline) {
+    WireResponse out;
     std::string frame;
     TransferStatus status =
-        requester->Exchange(records.front().address, bytes, deadline, &frame);
+        requester->Exchange(address, bytes, deadline, &frame);
     if (status != TransferStatus::kOk) {
       out.code = MapExchangeStatus(status);
       return out;
@@ -161,6 +171,20 @@ struct ClientCore final : ClientHandle {
     out.code = frame_code;
     out.payload = std::move(payload);
     return out;
+  }
+
+  // 一次请求的完整路径：发现 → 提交点 → 传输。返回 kCancelled 表示提交前
+  // 已被取消（此时服务端未收到任何数据）。
+  WireResponse RunCall(const QueuedCall& call) {
+    WireResponse out{ErrorCode::kCancelled, ""};
+    std::string address;
+    const ErrorCode resolved = ResolveTarget(call, &address);
+    if (resolved != ErrorCode::kOk) {
+      out.code = resolved;
+      return out;
+    }
+    if (!call.pending->CommitSend()) return out;  // 取消已获胜，不发送
+    return ExchangeCommitted(address, call.bytes, call.deadline);
   }
 
   // 同步与异步唯一入队口。锁序恒为 pending_mutex_ → queue_mutex_，与
@@ -191,7 +215,8 @@ struct ClientCore final : ClientHandle {
       pending->Settle(failure, "");
       return 0;
     }
-    queue_cv_.notify_one();
+    // notify_all：到期线程与执行者都等在这条条件变量上。
+    queue_cv_.notify_all();
     return id;
   }
 
@@ -206,15 +231,67 @@ struct ClientCore final : ClientHandle {
         queue_.pop_front();
       }
       WireResponse out{ErrorCode::kCancelled, ""};
-      // 唯一的"取消 vs 发送"裁决点：排队中已取消则不触碰连接。
-      if (call.pending->TryStartSending()) {
-        out = RemainingMs(call.deadline) <= 0
-                  ? WireResponse{ErrorCode::kTimeout, ""}
-                  : Exchange(call.bytes, call.deadline);
-        if (out.code == ErrorCode::kCancelled) out.code = ErrorCode::kTimeout;
-      }
+      // 排队期间已被取消（Begin 失败）时整条路径都不执行：服务端 0 次。
+      if (call.pending->Begin()) out = RunCall(call);
       Finish(call.id, call.pending.get(), out);
     }
+  }
+
+  // 到期线程：只负责"排队中"的请求，与执行者是否被前一条请求占住无关。
+  // 这样排队请求在截止时间点兑现 kTimeout，而不是等执行者腾出手来才发现
+  // 已经过期。在途请求（已提交）由适配器在同一绝对 deadline 上结束。
+  void ExpiryLoop() {
+    for (;;) {
+      std::vector<QueuedCall> expired;
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        for (;;) {
+          if (io_stopping_) return;
+          if (queue_.empty()) {
+            queue_cv_.wait(lock);
+            continue;
+          }
+          const auto earliest = EarliestDeadlineLocked();
+          const auto now = std::chrono::steady_clock::now();
+          if (now < earliest) {
+            queue_cv_.wait_until(lock, earliest);
+            continue;
+          }
+          std::deque<QueuedCall> kept;
+          for (auto& call : queue_) {
+            if (call.deadline <= now) {
+              expired.push_back(std::move(call));
+            } else {
+              kept.push_back(std::move(call));
+            }
+          }
+          queue_.swap(kept);
+          break;
+        }
+      }
+      // 兑现与计数回收都在 queue_mutex_ 之外完成，回调可在其中调用 Cancel。
+      for (auto& call : expired) ExpireQueued(call);
+    }
+  }
+
+  // 调用前持有 queue_mutex_。
+  Deadline EarliestDeadlineLocked() const {
+    Deadline earliest = Deadline::max();
+    for (const auto& call : queue_) {
+      if (call.deadline < earliest) earliest = call.deadline;
+    }
+    return earliest;
+  }
+
+  // 与 Finish 相同：先退出 pending 表、递减计数，再兑现，避免 in_flight_ 泄漏。
+  void ExpireQueued(QueuedCall& call) {
+    {
+      std::lock_guard<std::mutex> lock(pending_mutex_);
+      if (pending_.erase(call.id) != 0 && in_flight_ > 0 && --in_flight_ == 0) {
+        idle_cv_.notify_all();
+      }
+    }
+    call.pending->Settle(ErrorCode::kTimeout, "");
   }
 
   // 先退出 pending 表、递减计数，再兑现：兑现回调可安全调用 Cancel/Shutdown。
@@ -252,16 +329,21 @@ struct ClientCore final : ClientHandle {
     }
     queue_cv_.notify_all();
 
-    // 不提前 close socket：在途请求受统一 deadline 约束，关停按阶段二契约
-    // 等待其自然兑现（或超时），避免调用方被无限期挂起。
+    // 关闭适配器，让仍在 Exchange 里的请求立即以 kClosed 返回，而不是等它
+    // 自然到期。兑现权在上一段已由 Cancel 取走（统一兑现 kCancelled），这里
+    // 的返回值只会被 Finish 丢弃，因此不影响"每请求只兑现一次"。
+    if (requester) requester->Close();
+
     const bool on_io = io_thread_.joinable() &&
                        io_thread_.get_id() == std::this_thread::get_id();
+    if (expiry_thread_.joinable() &&
+        expiry_thread_.get_id() != std::this_thread::get_id()) {
+      expiry_thread_.join();
+    }
     if (!on_io && io_thread_.joinable()) io_thread_.join();
     if (!on_io) {
       std::unique_lock<std::mutex> lock(pending_mutex_);
       idle_cv_.wait(lock, [this] { return in_flight_ == 0; });
-      // 关停契约：先等在途请求自然兑现，再关闭适配器并唤醒任何残留 I/O。
-      if (requester) requester->Close();
     }
   }
 
@@ -276,6 +358,7 @@ struct ClientCore final : ClientHandle {
   std::deque<QueuedCall> queue_;
   bool io_stopping_ = false;  // 受 queue_mutex_ 保护
   std::thread io_thread_;
+  std::thread expiry_thread_;
 
   std::mutex pending_mutex_;
   std::map<std::uint64_t, std::shared_ptr<PendingCall>> pending_;

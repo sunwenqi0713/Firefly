@@ -3,7 +3,7 @@
 #
 # 覆盖四条路径（默认全部执行）：
 #   1) 默认 ON（NNG）配置 + 构建 + 全量 ctest -jN（含共享契约内存/NNG 双实例）
-#   2) 跨进程互测 4 组单独确认（发现 / Pub/Sub / RPC，独立端口，并行安全）
+#   2) 跨进程互测确认（用例数取自 CTest 注册表：发现 / Pub/Sub / RPC / 旧版互操作，独立端口，并行安全）
 #   3) 从 ON 的 vcpkg_installed 剥离 NNG，构造独立依赖前缀（构建拆分方案）
 #   4) FIREFLY_WITH_NNG=OFF（无 NNG 环境）配置 + 构建 + 全量测试
 #
@@ -162,22 +162,28 @@ if [ "$DO_ON" = "1" ]; then
     || die "ON 配置日志未确认启用 NNG 后端"
 
   cmake --build "$ON_DIR_WIN" --config Debug --parallel "$JOBS"
-  log "路径 1/4：默认 ON 全量 ctest -j$JOBS（已含 4 组跨进程用例）"
+  log "路径 1/4：默认 ON 全量 ctest -j$JOBS（已含跨进程用例）"
   run_on_ctest || die "默认 ON 全量 ctest 失败，详见 $ON_DIR/ctest-on.log"
 else
   log "路径 1/4：已跳过（--skip-on）"
 fi
 
 # ---- 2) 跨进程互测确认 -----------------------------------------------------
-# 跨进程用例已由全量 ctest 执行；默认从日志确认 4/4，不重复启动两进程，
+# 跨进程用例已由全量 ctest 执行；默认从日志确认全部通过，不重复启动两进程，
 # 避免重复执行时的 follower 注册超时抖动（已知的时序脆弱点，见 docs/architecture/known-gaps.md）。
 if [ "$DO_INTEROP" = "1" ]; then
   if [ "$DO_ON" = "1" ] && [ -f "$ON_DIR/ctest-on.log" ]; then
-    log "路径 2/4：确认跨进程发现 / Pub/Sub / RPC（4 组独立地址）"
+    # 期望值直接取自 CTest 注册表，新增跨进程用例时不需要再改本脚本。
+    cross_expected="$(ctest --test-dir "$ON_DIR_WIN" -N -R '^cross_' \
+      | grep -cE 'Test #[0-9]+: cross_' || true)"
+    [ "$cross_expected" -gt 0 ] || die \
+      "未在 CTest 注册表中找到 cross_* 用例，检查构建配置"
+    log "路径 2/4：确认跨进程发现 / Pub/Sub / RPC（$cross_expected 组独立地址）"
     cross_count="$(grep -cE 'Test #[0-9]+: cross_.*Passed' "$ON_DIR/ctest-on.log" || true)"
-    [ "$cross_count" -eq 4 ] || die \
-      "全量 ctest 中跨进程用例未全部通过（$cross_count/4），详见 $ON_DIR/ctest-on.log"
-    printf '  4/4 跨进程用例在全量 ctest -j%s 中通过\n' "$JOBS"
+    [ "$cross_count" -eq "$cross_expected" ] || die \
+      "全量 ctest 中跨进程用例未全部通过（$cross_count/$cross_expected），详见 $ON_DIR/ctest-on.log"
+    printf '  %s/%s 跨进程用例在全量 ctest -j%s 中通过\n' \
+      "$cross_count" "$cross_expected" "$JOBS"
   else
     log "路径 2/4：单独执行跨进程用例（--skip-on 场景）"
     export PATH="$ON_DIR/vcpkg_installed/$VCPKG_TRIPLET/debug/bin:$ON_DIR/vcpkg_installed/$VCPKG_TRIPLET/bin:$BASE_PATH"
@@ -256,15 +262,12 @@ if [ "$DO_OFF" = "1" ]; then
   [ -f "$DEPS/tools/protobuf/protoc.exe" ] || [ -f "$DEPS/tools/protobuf/protoc" ] || die \
     "依赖前缀缺少 protoc：$DEPS/tools/protobuf"
 
-  local_protoc="$DEPS_WIN/tools/protobuf/protoc.exe"
-  [ -f "$DEPS/tools/protobuf/protoc.exe" ] || local_protoc="$DEPS_WIN/tools/protobuf/protoc"
-
   cmake -S "$ROOT_WIN" -B "$OFF_BUILD_WIN" -G Ninja \
     -DCMAKE_CXX_COMPILER="$MSVC_TOOLS/bin/Hostx64/x64/cl.exe" \
     -DCMAKE_RC_COMPILER="$WINSDK_ROOT/bin/$WINSDK_VER/x64/rc.exe" \
     -DCMAKE_MT="$WINSDK_ROOT/bin/$WINSDK_VER/x64/mt.exe" \
     -DCMAKE_PREFIX_PATH="$DEPS_WIN" \
-    -DPROTOC_EXE="$local_protoc" \
+    -DBUILD_TESTING=ON \
     -DCMAKE_BUILD_TYPE=Debug \
     -DCMAKE_MAKE_PROGRAM="$NINJA" \
     -DFIREFLY_WITH_NNG=OFF \

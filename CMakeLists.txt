@@ -110,7 +110,8 @@ add_library(firefly_core STATIC
     $<TARGET_OBJECTS:firefly_memory_role_objects>
     $<TARGET_OBJECTS:firefly_memory_injection_objects>)
 target_include_directories(firefly_core PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
 target_link_libraries(firefly_core PUBLIC protobuf::libprotobuf Threads::Threads)
 target_compile_definitions(firefly_core PUBLIC
     FIREFLY_WITH_NNG=${FIREFLY_WITH_NNG_DEFINE})
@@ -121,7 +122,8 @@ if(FIREFLY_WITH_NNG)
       $<TARGET_OBJECTS:firefly_nng_role_objects>
       $<TARGET_OBJECTS:firefly_nng_injection_objects>)
   target_include_directories(firefly_nng PUBLIC
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
   target_link_libraries(firefly_nng PUBLIC
       nng::nng protobuf::libprotobuf Threads::Threads)
   add_library(firefly::nng ALIAS firefly_nng)
@@ -140,7 +142,8 @@ add_library(firefly STATIC
     ${FIREFLY_BACKEND_OBJECTS})
 add_library(firefly::firefly ALIAS firefly)
 target_include_directories(firefly PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
 target_link_libraries(firefly PUBLIC protobuf::libprotobuf Threads::Threads)
 target_compile_definitions(firefly PUBLIC
     FIREFLY_WITH_NNG=${FIREFLY_WITH_NNG_DEFINE})
@@ -173,7 +176,12 @@ firefly_assert_public_includes(firefly)
 firefly_assert_public_includes(firefly_core)
 firefly_assert_public_includes(firefly_nng)
 
-enable_testing()
+# BUILD_TESTING 由 CTest 定义（默认 ON）。作为 add_subdirectory 的被集成方时，
+# 上层常常把 BUILD_TESTING 关掉：此时不应再要求 protoc、不应生成测试与示例，
+# 只产出库。协议生成的 test_messages 也一并只在开启测试时构造。
+include(CTest)
+
+if(BUILD_TESTING)
 
 # 零泄漏脚本化验收：公共头不得 include nng/*_impl.h/discovery
 find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -265,6 +273,11 @@ add_firefly_test(firefly_concurrency_contract_test tests/contract/concurrency_co
 add_firefly_test(firefly_registry_contract_test tests/contract/registry_contract_test.cpp)
 use_firefly_internal(firefly_registry_contract_test)
 
+# RPC 时序：排队到期、提交点取消、关停唤醒在途 I/O（可控 Registry + 计数
+# Requester，固定时序而不依赖真实服务端的 sleep 竞猜）。
+add_firefly_test(firefly_rpc_timing_test tests/contract/rpc_timing_test.cpp)
+use_firefly_internal(firefly_rpc_timing_test)
+
 # G1 回归：Follower 定期对账必须能移除漏掉注销广播的过期记录，且查询
 # 失败时不得清空本地缓存。两个模式各自独立，进程内用临时端口，可并行。
 if(FIREFLY_WITH_NNG)
@@ -277,6 +290,9 @@ if(FIREFLY_WITH_NNG)
            COMMAND firefly_follower_reconcile_test delete)
   add_test(NAME follower_reconcile_query_fail
            COMMAND firefly_follower_reconcile_test query-fail)
+  # P1 回归：广播字段转义（名称含 '|' 与 '\' 时不得切错位、不得让发现线程抛异常）。
+  add_test(NAME follower_reconcile_escaped_name
+           COMMAND firefly_follower_reconcile_test escaped-name)
 endif()
 
 # 共享后端契约：同一测试源分别用内存与 NNG 显式后端各跑一遍。
@@ -354,8 +370,49 @@ set_tests_properties(${FIREFLY_PORT_LOCK_TESTS}
     PROPERTIES RESOURCE_LOCK firefly_registry_port)
 
 # ---------------- 使用示例 ----------------
+# 示例复用 tests/support 的 proto 消息，因此与测试一起构建；关掉 BUILD_TESTING
+# 只得到库，这正是 add_subdirectory 集成方想要的形态。
 add_executable(firefly_pubsub_example examples/pubsub_chat.cpp)
 target_link_libraries(firefly_pubsub_example PRIVATE firefly test_messages)
 
 add_executable(firefly_rpc_example examples/rpc_calculator.cpp)
 target_link_libraries(firefly_rpc_example PRIVATE firefly test_messages)
+
+endif()  # BUILD_TESTING
+
+# ---------------- 安装与包配置 ----------------
+# 三个 target 各自自包含（firefly 聚合 / firefly_core 无 NNG / firefly_nng 仅
+# 后端），消费方按需链接其中一个，不要同时链接 firefly 与 firefly_core：两者
+# 都包含 Core object，会重复定义符号。
+set(FIREFLY_INSTALL_TARGETS firefly firefly_core)
+if(FIREFLY_WITH_NNG)
+  list(APPEND FIREFLY_INSTALL_TARGETS firefly_nng)
+endif()
+
+install(TARGETS ${FIREFLY_INSTALL_TARGETS}
+        EXPORT FireflyTargets
+        ARCHIVE DESTINATION lib
+        LIBRARY DESTINATION lib
+        RUNTIME DESTINATION bin
+        INCLUDES DESTINATION include)
+install(DIRECTORY include/ DESTINATION include)
+
+install(EXPORT FireflyTargets
+        FILE FireflyTargets.cmake
+        NAMESPACE firefly::
+        DESTINATION lib/cmake/firefly)
+
+include(CMakePackageConfigHelpers)
+set(FIREFLY_CONFIG_WITH_NNG ${FIREFLY_WITH_NNG})
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/fireflyConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/fireflyConfig.cmake"
+    INSTALL_DESTINATION lib/cmake/firefly)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/fireflyConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/fireflyConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/fireflyConfigVersion.cmake"
+        DESTINATION lib/cmake/firefly)

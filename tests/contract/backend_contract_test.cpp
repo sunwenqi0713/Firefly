@@ -187,7 +187,7 @@ int TestCancelledRequest(const std::string& backend,
   return 0;
 }
 
-// ---------- 绝对截止时间：排队请求出队时已到期 ----------
+// ---------- 绝对截止时间：排队期间到期即兑现，不等执行者空闲 ----------
 int TestAbsoluteDeadline(const std::string& backend,
                          const std::shared_ptr<InjectionContext>& ctx) {
   const std::string service = "bc_" + backend + "_deadline_svc";
@@ -216,11 +216,47 @@ int TestAbsoluteDeadline(const std::string& backend,
   auto first = client->AsyncSendRequest(MakeReq(3, 4), 5s);
   if (entered.get_future().wait_for(2s) != std::future_status::ready) return 143;
   auto expired = client->AsyncSendRequest(MakeReq(5, 6), 50ms);
-  if (expired.future.wait_for(100ms) != std::future_status::timeout) return 144;
+  // 前一条请求仍占着执行者，排队请求必须按自己的截止时间兑现。
+  if (expired.future.wait_for(500ms) != std::future_status::ready) return 144;
   release.set_value();
   if (SettledCode(expired.future) != ErrorCode::kTimeout) return 145;
   if (SettledCode(first.future) != ErrorCode::kOk) return 146;
   if (executed.load() != 1) return 147;
+  client->Shutdown();
+  node->DeleteService(service);
+  return 0;
+}
+
+// ---------- 超时后的迟到响应不污染下一条请求 ----------
+// 第一条请求的预算只有 50ms，服务端却在 200ms 后才回包：该响应必须被丢弃
+// （NNG 重建请求 socket / 内存后端按请求隔离响应对象），第二条请求仍要拿回
+// 自己的结果。
+int TestLateResponseIsolation(const std::string& backend,
+                              const std::shared_ptr<InjectionContext>& ctx) {
+  const std::string service = "bc_" + backend + "_late_svc";
+  auto node = firefly::CreateNode("bc_" + backend + "_late_node", "", ctx).value;
+  if (!node) return 175;
+  auto service_ptr = node->CreateService<CalcRequest, CalcResponse>(
+      service, [](const std::shared_ptr<const CalcRequest>& req)
+                   -> firefly::ServiceResult<CalcResponse> {
+        if (req->a() == 1) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        auto resp = std::make_shared<CalcResponse>();
+        resp->set_sum(req->a() * 1000 + req->b());
+        return {ErrorCode::kOk, resp};
+      }).value;
+  if (!service_ptr) return 176;
+  auto client = node->CreateClient<CalcRequest, CalcResponse>(service).value;
+  if (!client->WaitForService(3s)) return 177;
+
+  auto first = client->AsyncSendRequest(MakeReq(1, 5), 50ms);
+  if (SettledCode(first.future) != ErrorCode::kTimeout) return 178;
+  // 等迟到响应真正回到客户端路径，再发下一条。
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  auto second = client->SendRequest(MakeReq(2, 6), 2s);
+  if (!second || second.code != ErrorCode::kOk) return 179;
+  if (second->sum() != 2006) return 180;  // 不是第一条的 1005
   client->Shutdown();
   node->DeleteService(service);
   return 0;
@@ -336,6 +372,7 @@ int main(int argc, char** argv) {
   const Case cases[] = {
       {"cancelled_request", TestCancelledRequest},
       {"absolute_deadline", TestAbsoluteDeadline},
+      {"late_response_isolation", TestLateResponseIsolation},
       {"response_matching", TestResponseMatching},
       {"callback_order", TestCallbackOrder},
       {"independent_registration", TestIndependentRegistration},

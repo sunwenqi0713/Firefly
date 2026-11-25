@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -84,6 +85,54 @@ bool KindFromString(const std::string& s, Kind* out) {
   } else if (s == "service") {
     *out = Kind::kService;
   } else {
+    return false;
+  }
+  return true;
+}
+
+// 广播字段转义。公开的名称校验只拒绝控制字符与空格（见 node.h 的
+// IsLegalEndpointName），因此 '|' 与 '\' 都是合法名称字符，但 '|' 正是广播
+// 的字段分隔符。编码侧必须自己保证字段边界：'\' 与 '|' 前统一加 '\'。
+std::string EscapeField(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  for (char c : in) {
+    if (c == '\\' || c == '|') out.push_back('\\');
+    out.push_back(c);
+  }
+  return out;
+}
+
+// 与 EscapeField 对称：按 '|' 切分并把 '\x' 还原成 'x'。旧版主实例（不做
+// 转义）发来的字段不含 '\'，切分结果与原样一致；只有本来就无法正确解析的
+// 名称会出现差异。
+std::vector<std::string> SplitEscaped(const std::string& line) {
+  std::vector<std::string> fields;
+  std::string current;
+  for (std::size_t i = 0; i < line.size(); ++i) {
+    const char c = line[i];
+    if (c == '\\' && i + 1 < line.size()) {
+      current.push_back(line[++i]);
+      continue;
+    }
+    if (c == '|') {
+      fields.push_back(std::move(current));
+      current.clear();
+      continue;
+    }
+    current.push_back(c);
+  }
+  fields.push_back(std::move(current));
+  return fields;
+}
+
+// id 字段解析：远端可能发来空串或非法文本（旧版/被截断的帧）。解析失败时
+// 返回 false，调用方据此走兼容派生路径，绝不让异常逃出发现线程。
+bool ParseIdField(const std::string& text, EndpointRecordId* out) {
+  if (text.empty()) return false;
+  try {
+    *out = std::stoull(text);
+  } catch (...) {
     return false;
   }
   return true;
@@ -248,8 +297,9 @@ EndpointRecordId ApplyLocked(Registry::Impl& impl, const EndpointRecord& in,
 
 std::string BroadcastNote(const EndpointRecord& rec, bool added) {
   std::ostringstream out;
-  out << (added ? "A|" : "R|") << KindToString(rec.kind) << '|' << rec.name
-      << '|' << rec.address << '|' << rec.id << '|' << rec.backend;
+  out << (added ? "A|" : "R|") << KindToString(rec.kind) << '|'
+      << EscapeField(rec.name) << '|' << EscapeField(rec.address) << '|'
+      << rec.id << '|' << EscapeField(rec.backend);
   return out.str();
 }
 
@@ -289,7 +339,8 @@ std::string Execute(Registry::Impl& impl, const std::string& req) {
     if (name.empty()) return "ERR bad name\n";
 
     EndpointRecord rec;
-    rec.id = id_text.empty() ? 0 : std::stoull(id_text);
+    rec.id = 0;
+    ParseIdField(id_text, &rec.id);
     rec.kind = k;
     rec.name = name;
     rec.address = url;
@@ -370,6 +421,30 @@ void RunRepThread(Registry::Impl& impl) {
 // 定义见本文件末尾：定期从主实例重新对账 Watch 的键。
 void ReconcileWatches(Registry::Impl& impl);
 
+// 解析一条广播："A|kind|name|address[|id|backend]"。字段按 EscapeField 转义，
+// 旧版主实例如只发 4 个字段则按无 id/backend 的兼容路径处理。返回 false 表示
+// 帧非法（字段不足、kind 未知、name 为空）：调用方丢弃该帧继续循环，解析异常
+// 不会终止发现线程。
+bool ParseBroadcastNote(const std::string& line, EndpointRecord* rec,
+                        bool* added) {
+  const std::vector<std::string> fields = SplitEscaped(line);
+  if (fields.size() < 4 || fields[2].empty()) return false;
+  Kind k;
+  if (!KindFromString(fields[1], &k)) return false;
+  rec->kind = k;
+  rec->name = fields[2];
+  rec->address = fields[3];
+  rec->id = 0;
+  const std::string id_text = fields.size() > 4 ? fields[4] : std::string();
+  if (!ParseIdField(id_text, &rec->id)) {
+    rec->id = LegacyId(k, rec->name, rec->address);
+  }
+  rec->backend = (fields.size() > 5 && !fields[5].empty()) ? fields[5]
+                                                          : kDefaultBackend;
+  *added = fields[0] == "A";
+  return true;
+}
+
 void RunSubLoop(Registry::Impl& impl) {
   FY_INFO("registry: follower on %s", impl.rep_url.c_str());
   auto next_reconcile = std::chrono::steady_clock::now() + kReconcileInterval;
@@ -381,25 +456,16 @@ void RunSubLoop(Registry::Impl& impl) {
     }
     std::string line = RecvToString(impl.sub_sock_);
     if (line.empty()) continue;
-    std::istringstream in(line);
-    std::string tag, kind, name, address, id_text, backend;
-    std::getline(in, tag, '|');
-    std::getline(in, kind, '|');
-    std::getline(in, name, '|');
-    std::getline(in, address, '|');
-    std::getline(in, id_text, '|');
-    std::getline(in, backend, '|');
-    Kind k;
-    if (!KindFromString(kind, &k)) continue;
     EndpointRecord rec;
-    rec.kind = k;
-    rec.name = name;
-    rec.address = address;
-    rec.id = id_text.empty() ? LegacyId(k, name, address)
-                             : std::stoull(id_text);
-    rec.backend = backend.empty() ? kDefaultBackend : backend;
-    const bool added = tag == "A";
-    {
+    bool added = false;
+    if (!ParseBroadcastNote(line, &rec, &added)) {
+      // 非法帧只丢这一条：线程内的静默终止会让 Follower 从此不再更新。
+      FY_WARN("registry: dropped malformed broadcast note");
+      continue;
+    }
+    const Kind k = rec.kind;
+    const std::string name = rec.name;
+    try {
       std::lock_guard<std::mutex> dispatch(impl.dispatch_mutex_);
       bool changed = false;
       {
@@ -422,6 +488,10 @@ void RunSubLoop(Registry::Impl& impl) {
         }
       }
       if (changed) DispatchLocked(impl, k, name);
+    } catch (const std::exception& e) {
+      FY_ERROR("registry: apply broadcast failed: %s", e.what());
+    } catch (...) {
+      FY_ERROR("registry: apply broadcast failed");
     }
   }
   FY_INFO("registry: follower loop exit");
@@ -459,7 +529,10 @@ bool ParseRecords(const std::string& resp, Kind kind, const std::string& name,
     std::getline(fields, id_text, '\t');
     std::getline(fields, rec.backend, '\t');
     std::getline(fields, rec.address, '\t');
-    rec.id = id_text.empty() ? 0 : std::stoull(id_text);
+    // id 非法（旧版或被截断）时留 0，由 MergeSnapshotLocked 跳过该行，
+    // 而不是让 std::stoull 抛出后终止调用线程。
+    rec.id = 0;
+    ParseIdField(id_text, &rec.id);
     out->push_back(std::move(rec));
   }
   return true;
@@ -681,8 +754,19 @@ bool Registry::Start() {
       return false;
     }
     impl_->primary = true;
-    impl_->rep_thread_ = std::thread(&RunRepThread, std::ref(*impl_));
+    // 先置 running_ 再起线程：线程循环以 running_ 为条件，反序时线程可能
+    // 在 store(true) 之前就看到 false 并立即退出，而 Start() 仍返回成功。
     impl_->running_.store(true);
+    try {
+      impl_->rep_thread_ = std::thread(&RunRepThread, std::ref(*impl_));
+    } catch (const std::exception& e) {
+      FY_ERROR("registry: rep thread start failed: %s", e.what());
+      impl_->running_.store(false);
+      impl_->primary = false;
+      CloseSocket(impl_->rep_sock_);
+      CloseSocket(impl_->pub_sock_);
+      return false;
+    }
     FY_INFO("registry: acting as primary");
     return true;
   }
@@ -728,8 +812,17 @@ bool Registry::Start() {
   }
 
   impl_->primary = false;
-  impl_->sub_thread_ = std::thread(&RunSubLoop, std::ref(*impl_));
+  // 与主实例分支同理：先置 running_ 再起线程。
   impl_->running_.store(true);
+  try {
+    impl_->sub_thread_ = std::thread(&RunSubLoop, std::ref(*impl_));
+  } catch (const std::exception& e) {
+    FY_ERROR("registry: sub thread start failed: %s", e.what());
+    impl_->running_.store(false);
+    CloseSocket(impl_->req_sock_);
+    CloseSocket(impl_->sub_sock_);
+    return false;
+  }
   FY_INFO("registry: acting as follower");
   return true;
 }

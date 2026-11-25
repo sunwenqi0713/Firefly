@@ -82,7 +82,7 @@ int main() {
     node->DeleteClient("timeout_slow_svc");
   }
 
-  // ---------- 3. Client::Shutdown 阻塞至在途请求兑现/取消 ----------
+  // ---------- 3. Client::Shutdown 立即兑现并释放在途 I/O ----------
   {
     auto svc = node->CreateService<CalcRequest, CalcResponse>(
         "shutdown_slow_svc",
@@ -99,9 +99,10 @@ int main() {
     // 确保请求已到达服务端并开始处理（sleep 500ms）
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     const auto t0 = std::chrono::steady_clock::now();
-    client->Shutdown();  // 应阻塞：取消在途并等待工作线程从同步请求返回
+    client->Shutdown();  // 关闭适配器唤醒在途 I/O，不再等它自然到期
     const auto elapsed = std::chrono::steady_clock::now() - t0;
-    if (int e = Check(elapsed >= std::chrono::milliseconds(200), 41)) return e;
+    // 服务端还在 500ms 的 sleep 中；关停必须在预算内返回。
+    if (int e = Check(elapsed < std::chrono::milliseconds(300), 41)) return e;
     // 在途请求应以 kCancelled 兑现（Shutdown 取消语义）
     bool threw = false;
     try {

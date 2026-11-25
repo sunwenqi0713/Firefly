@@ -55,15 +55,21 @@ class Client : public ClientBase {
   /**
    * @brief 可取消的异步请求句柄。
    *
-   * future 保证在截止时间内兑现：成功时兑现 Response，失败时由 get() 抛出
-   * FireflyException，不存在永不完成的情况。句柄可以复制和跨线程传递；
-   * 它只弱引用内部实现，Client 析构后 Cancel() 返回 false 而不是访问悬空指针。
+   * future 保证按 deadline 兑现：成功时兑现 Response，失败时由 get() 抛出
+   * FireflyException，不存在永不完成的情况。排队到期由独立的到期线程在
+   * 截止时间点兑现，不会因为前一条请求占住 I/O 执行者而延后。句柄可以复制
+   * 和跨线程传递；它只弱引用内部实现，Client 析构后 Cancel() 返回 false
+   * 而不是访问悬空指针。
    */
   struct RequestHandle {
     std::uint64_t id = 0;   ///< 请求标识，仅在同一个 Client 内唯一。
     SharedFuture future;    ///< 结果通道；未成功提交时已带异常。
 
     /// @brief 请求取消。
+    ///
+    /// 提交点之前的取消保证请求不会进入传输层（服务端执行次数为 0）；提交点
+    /// 之后的取消只结束本地等待，远端是否执行未知，迟到结果被丢弃。
+    ///
     /// @return 已取消且 future 将以 kCancelled 兑现时返回 true；请求已完成、
     ///         已兑现、已被取消过、Client 已 Shutdown 或已重新 Init() 时返回 false。
     bool Cancel() { return cancel_fn_ ? cancel_fn_(id) : false; }
@@ -117,8 +123,9 @@ class Client : public ClientBase {
   /**
    * @brief 关闭客户端。
    *
-   * 依次停止接纳新请求、以 kCancelled 兑现全部在途请求、等待 I/O 执行者退出，
-   * 最后释放内部句柄。
+   * 依次停止接纳新请求、以 kCancelled 兑现全部排队与在途请求、关闭适配器以
+   * 唤醒仍在 Exchange 里的 I/O、等待执行者退出，最后释放内部句柄。关停不等待
+   * 在途请求自然到期。
    *
    * @post 本 Client 不可再用；此前发出的 RequestHandle::Cancel() 恒返回 false。
    * @warning 不得在任意回调内调用，也不得与 SendRequest()/AsyncSendRequest() 并发。
@@ -137,13 +144,14 @@ class Client : public ClientBase {
    * @param[in] request 请求消息。
    * @param[in] timeout 端到端预算，从入队时刻起算；排队、服务查询、连接、发送、
    *                    接收共用同一绝对截止时间，任一步耗尽即以 kTimeout 失败。
+   *                    排队到期由独立机制兑现，不需要等前一条请求完成。
    * @return 调用结果；失败原因见 code，不会出现"所有失败都是空指针"的情形。
    * @retval kOk              response 非空，正常结果。
    * @retval kNotReady        客户端未初始化或已 Shutdown。
    * @retval kSerialization   请求序列化失败，或响应帧非法、反序列化失败。
    * @retval kServiceNotFound 服务发现中无该服务或没有可连接端点，请求未提交。
    * @retval kQueueFull       本地请求队列已满，请求未提交。
-   * @retval kTimeout         已提交但未在截止时间前收到响应；对端是否执行未知。
+   * @retval kTimeout         排队到期或已提交但未在截止时间前收到响应；对端是否执行未知。
    * @retval kServiceFailed   服务端业务失败，具体码由响应帧带回。
    * @retval kTransport       其他传输层失败。
    * @retval kCancelled       Client 被 Shutdown 时在途请求统一以此码结束。

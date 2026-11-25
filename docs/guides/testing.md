@@ -6,7 +6,7 @@
 
 | 路径 | 内容 |
 | --- | --- |
-| `tests/contract/` | 行为契约。`backend_contract_test.cpp` 是唯一跨后端共享的契约测试；`concurrency_contract_test`（生命周期/RPC 队列）、`registry_contract_test`（发现记录模型）、`follower_reconcile_test`（Follower 对账删除/查询失败）、`fake_transport_test`（角色状态映射）、`creation_failure_test`、`endpoint_lifecycle_test` |
+| `tests/contract/` | 行为契约。`backend_contract_test.cpp` 是唯一跨后端共享的契约测试；`concurrency_contract_test`（生命周期/RPC 队列）、`registry_contract_test`（发现记录模型）、`follower_reconcile_test`（Follower 对账删除/查询失败/广播字段转义）、`rpc_timing_test`（排队到期/提交点取消/关停唤醒，可控替身固定时序）、`fake_transport_test`（角色状态映射）、`creation_failure_test`、`endpoint_lifecycle_test` |
 | `tests/integration/` | 端到端与跨进程。`e2e_test`、`reader_test`、`client_test`、`discovery_test`、`interop_helper.cpp` + `run_interop_pair.py` |
 | `tests/support/` | `test_messages.proto` 等共享消息定义 |
 | `tests/`（根） | 单点语义：`error_code`、`write_status`、`message_traits`、`callback_context`、`callback_contract`、`stats`、`shutdown`、`clear_wait`、`duplicate`、`empty_message`、`request_cancel`、`rpc_error`、`deprecated_compat`、`header_check`、`review_regression` |
@@ -38,7 +38,7 @@ ctest --test-dir build -R '^cross_'
 | `core-tests` | 两种开关 | 不直接依赖 NNG；OFF 时默认注入为内存后端 |
 | `nng-tests` | 仅 ON | `discovery_test`、`interop_helper`、共享契约的 NNG 实例 |
 | `shared-backend-contract` | 内存实例始终；NNG 实例仅 ON | `backend_contract_memory` / `backend_contract_nng` 两份实例 |
-| `cross-process` | 仅 ON | 4 个两进程用例 |
+| `cross-process` | 仅 ON | 7 个两进程用例 |
 
 `registry_contract_test` 两种开关都构建，NNG 相关部分用 `FIREFLY_WITH_NNG` 条件编译。
 
@@ -58,8 +58,11 @@ ctest --test-dir build -R '^cross_'
 | `cross_pubsub_new_to_legacy` | 新发布 → 旧订阅 | 37503 / 37504 |
 | `cross_rpc_legacy_to_new` | 旧应答 → 新请求 | 37505 / 37506 |
 | `cross_rpc_new_to_legacy` | 新应答 → 旧请求 | 37507 / 37508 |
+| `cross_registry_legacy_follower_new_primary` | 旧 Follower → 新主实例 | 37509 / 37510 |
+| `cross_registry_new_follower_legacy_primary` | 新 Follower → 旧主实例 | 37511 / 37512 |
+| `cross_pubsub_writer_first_reader_late` | 先起 Writer、后起 Reader | 37513 / 37514 |
 
-各对端口互不重叠，因此不加共享锁；`interop_helper` 提供 8 个模式供用例组合调用。
+各对端口互不重叠，因此不加共享锁；`interop_helper` 提供 8 个模式供用例组合调用。用例总数由 `scripts/verify.sh` 从 CTest 注册表读取（`-N -R '^cross_'`），新增用例不需要改脚本。
 
 **失败处置**：`cross_pubsub_legacy_to_new` 在并行高负载下可能因 follower registry REQ 3 秒超时而缺 `LEGACY_PUB_OK`（见 [known-gaps.md](../architecture/known-gaps.md) EV1）。`verify.sh` 只对这类失败做最多 3 次有限重试并留日志。**不得**通过放宽断言、加大超时或删除用例让流水变绿。
 
